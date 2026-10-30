@@ -367,7 +367,6 @@ def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
                         out=out,
                         fn=fn,
                         partials=partials,
-                        split_fp32_fn=query.lagged_mix,
                         **_projection_options(config),
                     )
                 else:
@@ -422,7 +421,6 @@ def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
                     out=out,
                     fn=fn,
                     partials=partials,
-                    split_fp32_fn=True,
                     **_projection_options(config),
                 )
             elif query.operation == "pre":
@@ -548,7 +546,6 @@ def _post_pre_primary(query, config, native, programs):
             project = partial(
                 kernels._run_mhc_prefill_tf32_project_launch,
                 _prepared=programs["project"],
-                split_fp32_fn=query.lagged_mix,
                 **_projection_options(config),
             )
 
@@ -641,7 +638,6 @@ def _launchers(query, config, native, programs):
             project = partial(
                 kernels._run_mhc_prefill_tf32_project_launch,
                 _prepared=programs["project"],
-                split_fp32_fn=True,
                 **_projection_options(config),
             )
 

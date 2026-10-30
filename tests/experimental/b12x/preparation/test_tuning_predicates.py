@@ -251,7 +251,6 @@ def test_mhc_tf32_rejects_short_weight_rows(tile_k, operation):
             num_m_warps=1,
             num_n_warps=1,
             k_splits=2,
-            split_fp32_fn=True,
         )
     space.validate({**choice, "projection_tile_k": 32})
 

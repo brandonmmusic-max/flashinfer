@@ -2568,7 +2568,16 @@ class MHCPrefillBf16ProjectTmaKernel:
 
 
 class MHCPrefillTf32ProjectTmaKernel:
-    """TMA-fed TF32 tensor-core projection for compact mHC prefill partials."""
+    """TMA-fed TF32 tensor-core projection for compact mHC prefill partials.
+
+    The BF16 stream operand is TF32-exact, so only the FP32 mixing weights need
+    the second term: each weight enters the tensor core as a rounded TF32 high
+    part plus a TF32 low part, and the two accumulations are added through FP32
+    ALU sums every four MMA steps. Without that split the projection carries a
+    systematic truncation bias of up to 2^-11 of each weight, which is three
+    orders of magnitude coarser than the FP32 reference the mixing coefficients
+    are defined by.
+    """
 
     num_threads = _PREFILL_TF32_TMA_THREADS
     num_m_warps = _PREFILL_TF32_TMA_M_WARPS
@@ -2595,10 +2604,8 @@ class MHCPrefillTf32ProjectTmaKernel:
         k_splits: int | None = None,
         chunk_geometry: bool = False,
         long_geometry: bool = False,
-        split_fp32_fn: bool = False,
     ):
         self.hidden_size = int(hidden_size)
-        self.split_fp32_fn = bool(split_fp32_fn)
         use_4096_chunk_geometry = chunk_geometry and self.hidden_size == _HIDDEN
         use_4096_long_geometry = long_geometry and self.hidden_size == _HIDDEN
         explicit_geometry = (
@@ -2913,17 +2920,16 @@ class MHCPrefillTf32ProjectTmaKernel:
                 Float32,
             )
             acc.fill(0.0)
-            if const_expr(self.split_fp32_fn):
-                acc_low = cute.make_rmem_tensor(
-                    cute.make_layout((self.n_mma_tiles_per_warp, 4), stride=(4, 1)),
-                    Float32,
-                )
-                acc_low.fill(0.0)
-                acc_sum = cute.make_rmem_tensor(
-                    cute.make_layout((self.n_mma_tiles_per_warp, 4), stride=(4, 1)),
-                    Float32,
-                )
-                acc_sum.fill(0.0)
+            acc_low = cute.make_rmem_tensor(
+                cute.make_layout((self.n_mma_tiles_per_warp, 4), stride=(4, 1)),
+                Float32,
+            )
+            acc_low.fill(0.0)
+            acc_sum = cute.make_rmem_tensor(
+                cute.make_layout((self.n_mma_tiles_per_warp, 4), stride=(4, 1)),
+                Float32,
+            )
+            acc_sum.fill(0.0)
             consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
                 self.num_stages,
@@ -2958,30 +2964,27 @@ class MHCPrefillTf32ProjectTmaKernel:
                         # TMA likewise zero-fills a partial final N tile.
                         b0_f = Float32(sB[b_mix_local, a_k0, consumer_state.index])
                         b1_f = Float32(sB[b_mix_local, a_k1, consumer_state.index])
-                        b0_tf32 = f32_to_raw_bits(b0_f)
-                        b1_tf32 = f32_to_raw_bits(b1_f)
-                        if const_expr(self.split_fp32_fn):
-                            # BF16 A is TF32-exact. Splitting only FP32 B into
-                            # high + low terms retains its projection precision
-                            # without an extra residual traversal or scratch.
-                            b0_tf32 = f32_to_tf32_bits(b0_f)
-                            b1_tf32 = f32_to_tf32_bits(b1_f)
-                            l0, l1, l2, l3 = tf32_mma_m16n8k8_f32(
-                                acc_low[warp_mma_n, 0],
-                                acc_low[warp_mma_n, 1],
-                                acc_low[warp_mma_n, 2],
-                                acc_low[warp_mma_n, 3],
-                                a0_tf32,
-                                a1_tf32,
-                                a2_tf32,
-                                a3_tf32,
-                                _tf32_residual_bits(b0_f, b0_tf32),
-                                _tf32_residual_bits(b1_f, b1_tf32),
-                            )
-                            acc_low[warp_mma_n, 0] = l0
-                            acc_low[warp_mma_n, 1] = l1
-                            acc_low[warp_mma_n, 2] = l2
-                            acc_low[warp_mma_n, 3] = l3
+                        # BF16 A is TF32-exact. Splitting only FP32 B into
+                        # high + low terms retains its projection precision
+                        # without an extra residual traversal or scratch.
+                        b0_tf32 = f32_to_tf32_bits(b0_f)
+                        b1_tf32 = f32_to_tf32_bits(b1_f)
+                        l0, l1, l2, l3 = tf32_mma_m16n8k8_f32(
+                            acc_low[warp_mma_n, 0],
+                            acc_low[warp_mma_n, 1],
+                            acc_low[warp_mma_n, 2],
+                            acc_low[warp_mma_n, 3],
+                            a0_tf32,
+                            a1_tf32,
+                            a2_tf32,
+                            a3_tf32,
+                            _tf32_residual_bits(b0_f, b0_tf32),
+                            _tf32_residual_bits(b1_f, b1_tf32),
+                        )
+                        acc_low[warp_mma_n, 0] = l0
+                        acc_low[warp_mma_n, 1] = l1
+                        acc_low[warp_mma_n, 2] = l2
+                        acc_low[warp_mma_n, 3] = l3
 
                         d0, d1, d2, d3 = tf32_mma_m16n8k8_f32(
                             acc[warp_mma_n, 0],
@@ -2999,7 +3002,7 @@ class MHCPrefillTf32ProjectTmaKernel:
                         acc[warp_mma_n, 1] = d1
                         acc[warp_mma_n, 2] = d2
                         acc[warp_mma_n, 3] = d3
-                        if const_expr(self.split_fp32_fn and kk % 4 == 3):
+                        if const_expr(kk % 4 == 3):
                             # Bound tensor-core accumulation length, then add
                             # the high/low projection through FP32 ALU sums.
                             for column in cutlass.range_constexpr(4):
@@ -3013,13 +3016,12 @@ class MHCPrefillTf32ProjectTmaKernel:
                 consumer_state.advance()
 
             for warp_mma_n in cutlass.range_constexpr(self.n_mma_tiles_per_warp):
-                if const_expr(self.split_fp32_fn):
-                    for column in cutlass.range_constexpr(4):
-                        acc[warp_mma_n, column] = (
-                            acc_sum[warp_mma_n, column]
-                            + acc[warp_mma_n, column]
-                            + acc_low[warp_mma_n, column]
-                        )
+                for column in cutlass.range_constexpr(4):
+                    acc[warp_mma_n, column] = (
+                        acc_sum[warp_mma_n, column]
+                        + acc[warp_mma_n, column]
+                        + acc_low[warp_mma_n, column]
+                    )
                 mma_n = Int32(warp_mma_n * self.num_n_warps) + warp_n
                 mix0 = n_tile * Int32(self.tile_n) + Int32(mma_n * 8) + lane_pair_base
                 mix1 = mix0 + Int32(1)
@@ -4257,7 +4259,6 @@ def _prefill_tf32_project_kernel(
     num_m_warps: int,
     num_n_warps: int,
     k_splits: int,
-    split_fp32_fn: bool = False,
 ) -> MHCPrefillTf32ProjectTmaKernel:
     return MHCPrefillTf32ProjectTmaKernel(
         hidden_size=hidden_size,
@@ -4269,7 +4270,6 @@ def _prefill_tf32_project_kernel(
         num_m_warps=num_m_warps,
         num_n_warps=num_n_warps,
         k_splits=k_splits,
-        split_fp32_fn=split_fp32_fn,
     )
 
 
@@ -5072,7 +5072,6 @@ def _run_mhc_prefill_tf32_project_launch(
     num_m_warps: int,
     num_n_warps: int,
     k_splits: int,
-    split_fp32_fn: bool = False,
     _prepared=None,
 ) -> None:
     tokens = int(out.shape[0])
@@ -5117,7 +5116,6 @@ def _run_mhc_prefill_tf32_project_launch(
         int(num_m_warps),
         int(num_n_warps),
         int(k_splits),
-        bool(split_fp32_fn),
     )
     cache_key = (
         tensor_key(
@@ -5158,17 +5156,16 @@ def _run_mhc_prefill_tf32_project_launch(
         ("num_compute_warps", kernel.num_compute_warps),
         ("threads", kernel.num_threads),
         ("k_splits", kernel.k_splits),
-        ("split_fp32_fn", bool(split_fp32_fn)),
         ("pdl", _MHC_PDL),
         (
             "operand_layout",
-            "tma_swizzled_branchless_a_bf16_b_f32_rawtf32_m16n8k8_v7",
+            "tma_swizzled_branchless_a_bf16_b_f32_split_tf32_m16n8k8_v8",
         ),
         cache_key,
     )
     return _compile_mhc_entry(
         kernel,
-        compile_spec=KernelCompileSpec.from_key(compile_name, 8, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 9, compile_key),
         compile_args=args,
         runtime_args=args,
     )
