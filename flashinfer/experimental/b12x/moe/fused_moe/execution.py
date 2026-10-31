@@ -70,11 +70,28 @@ def plan_execution(
     invocation: FrozenMapping = FrozenMapping(),
     override=None,
     scale_expansion=None,
+    smallm_max_tokens: int | None = None,
 ):
-    """Return a composite declaration, never an executable plan or warmup handle."""
+    """Return a composite declaration, never an executable plan or warmup handle.
+
+    ``smallm_max_tokens`` declares how much of the small-M arm's 1..16 token
+    range a ``source_format="trellismx"`` plan serves (``None``: the arm's
+    whole range, 16; ``0``: the grouped arm serves every token count). The
+    choice is validated, recorded in the plan's controls and tuning query, and
+    compiled for; it is not a process-wide setting.
+    """
     if experts.plan.activation.outer_scale == "token":
+        if smallm_max_tokens is not None:
+            raise ValueError(
+                "smallm_max_tokens applies to the expert-outer MoE plan; the "
+                "token-outer plan has no TrellisMX arm"
+            )
         from ._token_outer import plan
+
+        # The token-outer plan has no small-M arm, so it takes no such argument.
+        branch_kwargs = {}
     else:
+        branch_kwargs = {"smallm_max_tokens": smallm_max_tokens}
         if (
             capacity.output_layout == "routes"
             and experts.plan._impl.quant_modes != frozenset({"nvfp4"})
@@ -102,6 +119,7 @@ def plan_execution(
         invocation=invocation,
         override=override,
         scale_expansion=scale_expansion,
+        **branch_kwargs,
     )
 
 

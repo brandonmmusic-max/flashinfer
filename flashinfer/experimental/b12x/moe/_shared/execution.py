@@ -35,8 +35,15 @@ from .trellis_codebooks import (
     CODEBOOKS as _TRELLIS_CODEBOOKS,
     MCG as _TRELLIS_MCG,
     LUT_E4M3 as _TRELLIS_LUT_E4M3,
+    PROCEDURAL_NPK as _TRELLIS_PROCEDURAL_NPK,
     validate_codebook_bits as _validate_trellis_codebook_bits,
 )
+
+#: The ``trellismx`` container's decode law and coupled-boundary blocks.  Its
+#: codebook is a W4A8 trellis-arm selection rather than a checkpoint-declarable
+#: W4A16 payload, so it is accepted here only for that source format.
+_TRELLISMX_SOURCE_FORMAT = "trellismx"
+_TRELLISMX_BLOCKS = (128, 128)
 
 
 class _StringEnum(str, Enum):
@@ -178,16 +185,20 @@ _SOURCE_FORMATS = {
     "mxfp6_e2m3",
     "mxfp8_e8m0_k32",
     "b12x_trellis",
+    "trellismx",
     "iq2_xs",
     "iq2_xxs",
     "q8_0",
     "exl3",
 }
-_TRELLIS_SOURCE_FORMATS = frozenset({"b12x_trellis", "exl3"})
+# ``trellismx`` is a trellis container like ``b12x_trellis``/``exl3``, but its
+# prepared layout carries real UE8M0 K32 weight scales, so it lowers only onto
+# the W4A8 trellis recipe.
+_TRELLIS_SOURCE_FORMATS = frozenset({"b12x_trellis", "exl3", "trellismx"})
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_nvfp4": frozenset({"modelopt_nvfp4"}),
-    "w4a8_mx": frozenset({"fp4_e8m0_k32", "exl3"}),
+    "w4a8_mx": frozenset({"fp4_e8m0_k32", "exl3", "trellismx"}),
     # The packed MX-FP6 source is exclusive to the w6a8_mx recipe.
     "w4a16": frozenset(
         {
@@ -349,11 +360,21 @@ class MoEWeightPreparationPlan:
                 if self.trellis_codebook is None
                 else str(self.trellis_codebook).lower()
             )
-            if codebook not in _TRELLIS_CODEBOOKS:
+            trellismx = self.source_format == _TRELLISMX_SOURCE_FORMAT
+            allowed = set(_TRELLIS_CODEBOOKS)
+            if trellismx:
+                # The procedural NPK law is the W4A8 trellis arm's own
+                # selection, not a checkpoint-declarable W4A16 payload.
+                allowed.add(_TRELLIS_PROCEDURAL_NPK)
+            if codebook not in allowed:
                 raise ValueError(
                     "Trellis weights require trellis_codebook in "
-                    f"{sorted(_TRELLIS_CODEBOOKS)}; got "
+                    f"{sorted(allowed)}; got "
                     f"{self.trellis_codebook!r}"
+                )
+            if trellismx and codebook != _TRELLIS_PROCEDURAL_NPK:
+                raise ValueError(
+                    f"trellismx declares the procedural NPK codebook; got {codebook!r}"
                 )
             _validate_trellis_codebook_bits(codebook, bits)
             if codebook == "mcg" and bits == 2:
@@ -440,18 +461,37 @@ class MoEWeightPreparationPlan:
                 else tuple(int(value) for value in self.intermediate_hadamard_blocks)
             )
             if self.intermediate_hadamard:
-                if self.trellis_codebook != _TRELLIS_LUT_E4M3:
-                    raise ValueError(
-                        "intermediate-Hadamard trellis execution is qualified only"
-                        " for the lut_e4m3 codebook"
-                    )
-                if blocks is None:
-                    blocks = (512, 128)
-                if blocks != (512, 128):
-                    raise ValueError(
-                        "intermediate-Hadamard trellis execution implements "
-                        f"blocks (512, 128); got {blocks}"
-                    )
+                if trellismx:
+                    # The coupled boundary applies its H128 stage per expert
+                    # on the intermediate axis, before and after the per-expert
+                    # suh/svh vectors; the outer H512 stage lives on the
+                    # projection (hidden) axis.
+                    if codebook != _TRELLIS_PROCEDURAL_NPK:
+                        raise ValueError(
+                            "trellismx intermediate-Hadamard execution requires "
+                            f"the {_TRELLIS_PROCEDURAL_NPK!r} codebook; got "
+                            f"{codebook!r}"
+                        )
+                    if blocks is None:
+                        blocks = _TRELLISMX_BLOCKS
+                    if blocks != _TRELLISMX_BLOCKS:
+                        raise ValueError(
+                            "trellismx coupled-boundary expert blocks are "
+                            f"{_TRELLISMX_BLOCKS}; got {blocks}"
+                        )
+                else:
+                    if self.trellis_codebook != _TRELLIS_LUT_E4M3:
+                        raise ValueError(
+                            "intermediate-Hadamard trellis execution is qualified only"
+                            " for the lut_e4m3 codebook"
+                        )
+                    if blocks is None:
+                        blocks = (512, 128)
+                    if blocks != (512, 128):
+                        raise ValueError(
+                            "intermediate-Hadamard trellis execution implements "
+                            f"blocks (512, 128); got {blocks}"
+                        )
             elif blocks is not None:
                 raise ValueError(
                     "intermediate_hadamard_blocks require intermediate_hadamard"
@@ -724,6 +764,10 @@ def make_moe_spec(
 
     if source_format in BLOCK_CODECS:
         source_scale = ScaleEncoding(source_format)
+    elif source_format == _TRELLISMX_SOURCE_FORMAT:
+        # TrellisMX carries real UE8M0 K32 weight scales next to the codes;
+        # the W4A16-only trellis dummy does not apply.
+        source_scale = ScaleEncoding.E8M0_K32
     elif source_format in _TRELLIS_SOURCE_FORMATS:
         # Trellis stores codebook indices without a per-weight scale grid. The
         # W4A16 ABI still carries a four-byte dummy E4M3 K/32 scale pointer.
@@ -871,16 +915,23 @@ def plan_moe_weight_preparation(
             if spec.activation not in {"silu", "situ"}:
                 raise ValueError("W4A8-MX preparation currently requires silu or situ")
             if source_format in _TRELLIS_SOURCE_FORMATS:
-                # Trellis payloads stay source-native (fully scaled E4M3
-                # after in-kernel decode; identity weight block scales).
-                # The w4a8 trellis kernels window K and I in 16s and run
-                # the 128-wide activation boundary per intermediate chunk.
+                # Trellis payloads stay source-native. ``b12x_trellis``/``exl3``
+                # decode to fully scaled E4M3 with identity weight block
+                # scales; ``trellismx`` decodes to the E4M3 significand and
+                # consumes its released UE8M0 K32 scales.  The w4a8 trellis
+                # kernels window K and I in 16s and run the 128-wide
+                # activation boundary per intermediate chunk.
+                trellismx = source_format == _TRELLISMX_SOURCE_FORMAT
+                expected_codebook = (
+                    _TRELLIS_PROCEDURAL_NPK if trellismx else _TRELLIS_LUT_E4M3
+                )
                 if (
                     trellis_codebook is not None
-                    and str(trellis_codebook).lower() != "lut_e4m3"
+                    and str(trellis_codebook).lower() != expected_codebook
                 ):
                     raise ValueError(
-                        "W4A8-MX Trellis execution requires the lut_e4m3 codebook"
+                        f"W4A8-MX {source_format} execution requires the "
+                        f"{expected_codebook} codebook"
                     )
                 if (
                     trellis_rate_granularity is not None

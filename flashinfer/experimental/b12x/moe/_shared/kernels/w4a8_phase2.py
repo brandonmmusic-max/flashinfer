@@ -39,6 +39,11 @@ from b12x.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_trellis_lane_geom,
     _w4a8_trellis_pair_words_both,
 )
+from b12x.moe._shared.trellis_codebooks import (
+    LUT_E4M3,
+    PROCEDURAL_NPK,
+    normalize_w4a8_arm_codebook,
+)
 
 
 class W4A8MaterializedPhase2Kernel:
@@ -67,6 +72,21 @@ class W4A8MaterializedPhase2Kernel:
     shared_bytes = sfb_storage_offset + stages * sfb_stage_bytes
     shared_words = (shared_bytes + 3) // 4
 
+    # Specializations that set their geometry as class attributes instead of
+    # calling __init__ (the P8 arms do) inherit these option defaults.
+    n64_repacked = False
+    n64_tail = False
+    direct_routes = False
+    fused_topk = 0
+    fused_groups = 1
+    _route_buffer_slots = 1
+    csf_inline = False
+    transpose_direct = False
+    trellis_codebook = LUT_E4M3
+    trellis_scaled = False
+    trellis_identity_boundary = False
+    w4a8_trellis_lut = False
+
     def __init__(
         self,
         *,
@@ -74,6 +94,9 @@ class W4A8MaterializedPhase2Kernel:
         deterministic_output: bool = False,
         trellis_bits: int | None = None,
         trellis_direct_lut: bool = False,
+        trellis_codebook: str = LUT_E4M3,
+        trellis_scaled: bool = False,
+        trellis_identity_boundary: bool = False,
         n64_repacked: bool = False,
         n64_tail: bool = False,
         direct_routes: bool = False,
@@ -130,15 +153,74 @@ class W4A8MaterializedPhase2Kernel:
         # global table instead of reading a 4 KiB shared value table; the
         # shared region is then not allocated.
         self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
+        self.trellis_codebook = normalize_w4a8_arm_codebook(trellis_codebook)
+        if self.trellis_codebook != LUT_E4M3 and not self.w4a8_trellis:
+            raise ValueError(
+                f"trellis_codebook={self.trellis_codebook!r} requires a trellis payload"
+            )
+        if self.trellis_codebook == PROCEDURAL_NPK and self.trellis_direct_lut:
+            raise ValueError(
+                "trellis_direct_lut precomposes the lut_e4m3 value table; it "
+                "does not apply to trellis_codebook='procedural_npk'"
+            )
+        if (
+            self.trellis_codebook == PROCEDURAL_NPK
+            and type(self)._trellis_pair_words
+            is W4A8MaterializedPhase2Kernel._trellis_pair_words
+        ):
+            raise ValueError(
+                "trellis_codebook='procedural_npk' is decoded by the P8 phase "
+                "kernels (b12x.moe._shared.p8.kernels), which override "
+                "_trellis_pair_words"
+            )
+        # A scaled trellis arm reads the released UE8M0/K32 weight-scale plane
+        # instead of the identity scale word. Only ``procedural_npk`` carries
+        # that plane; ``lut_e4m3`` decodes to a fully-scaled E4M3 alphabet.
+        self.trellis_scaled = bool(trellis_scaled)
+        if self.trellis_scaled and not self.w4a8_trellis:
+            raise ValueError("trellis_scaled requires a trellis payload")
+        self.trellis_identity_boundary = bool(trellis_identity_boundary)
+        if self.trellis_identity_boundary and not self.w4a8_trellis:
+            raise ValueError("trellis_identity_boundary requires a trellis payload")
+        # Only the lut_e4m3 arm reads the 4 KiB value table; procedural_npk
+        # decodes in registers, so its specialization neither stages the table
+        # nor reserves the shared-memory region for it.
+        self.w4a8_trellis_lut = (
+            self.w4a8_trellis
+            and self.trellis_codebook == LUT_E4M3
+            and not self.trellis_direct_lut
+        )
         if self.w4a8_trellis:
             self.trellis_lut_offset = self.shared_bytes
-            if not self.trellis_direct_lut:
+            if self.w4a8_trellis_lut:
                 self.shared_words = (self.shared_bytes + 4096 + 3) // 4
 
     @property
     def _region_words(self):
         # Each warp reconstructs its scale rows outside the compressed pipeline slots.
         return self.shared_words + (128 if self.csf_inline else 0)
+
+    @cute.jit
+    def _trellis_pair_words(self, smem_base, lane, base0, base1, ia, ib, s2, lut_addr):
+        """Decode the two N16 windows of one K32 step from the staged B ring.
+
+        This is the value-table law. A codebook with its own decoder overrides
+        the hook (``procedural_npk`` decodes in registers and lives in the P8
+        package); ``__init__`` refuses that id here.
+        """
+        return _w4a8_trellis_pair_words_both(
+            smem_base,
+            lane,
+            base0,
+            base1,
+            ia,
+            ib,
+            s2,
+            self.trellis_bits,
+            lut_addr,
+            not self.trellis_direct_lut,
+            self.trellis_direct_lut,
+        )
 
     @cute.jit
     def __call__(
@@ -443,10 +525,54 @@ class W4A8MaterializedPhase2Kernel:
                             get_ptr_as_int64(intermediate_u32, sf_src),
                         )
 
+            if cutlass.const_expr(getattr(self, "p8_down_remainder", False)):
+                # D-x2: stage the lo plane (hi layout, offset by the whole hi
+                # region) so the FC2 owner can issue the residual MMA.
+                dx2_off = rows_capacity * (words_per_row + intermediate_tiles)
+                dx2_a_base = (
+                    smem_base
+                    + Int32(self.dx2_a_offset)
+                    + stage * Int32(self.a_stage_bytes)
+                )
+                dx2_sfa_base = dx2_a_base + Int32(self.a_payload_bytes)
+                for i in cutlass.range_constexpr(
+                    (self.tile_m * 8 + self.threads_per_cta - 1) // self.threads_per_cta
+                ):
+                    idx = tid + Int32(i * self.threads_per_cta)
+                    if idx < Int32(self.tile_m * 8):
+                        row = idx >> Int32(3)
+                        vec = idx & Int32(7)
+                        physical_vec = vec ^ (row & Int32(7))
+                        src_word = (
+                            dx2_off
+                            + (physical_row_base + row) * words_per_row
+                            + intermediate_slice * Int32(32)
+                            + (vec << Int32(2))
+                        )
+                        cp_async4_shared_global(
+                            dx2_a_base
+                            + row * Int32(self.tile_k)
+                            + (physical_vec << Int32(4)),
+                            get_ptr_as_int64(intermediate_u32, src_word),
+                        )
+                if tid < Int32(self.tile_m):
+                    dx2_sf_src = (
+                        dx2_off
+                        + rows_capacity * words_per_row
+                        + intermediate_slice * rows_capacity
+                        + physical_row_base
+                        + tid
+                    )
+                    cp_async_u32_shared_global(
+                        dx2_sfa_base + (tid << Int32(2)),
+                        get_ptr_as_int64(intermediate_u32, dx2_sf_src),
+                    )
+
             if cutlass.const_expr(self.w4a8_trellis):
                 # Expert-major [E][K16][N16] trellis windows over the down
                 # projection (K = intermediate, N = hidden); stage the slice's
-                # eight K16 rows for this N128 output tile. SFB stays unstaged.
+                # eight K16 rows for this N128 output tile. SFB stays unstaged
+                # unless the arm reads the released scale plane.
                 tr_n16_cnt = packed_output_tiles * Int32(16)
                 tr_k16_stride = tr_n16_cnt * Int32(8 * self.trellis_bits)
                 tr_eu = Int64(intermediate_tiles * Int32(8)) * Int64(tr_k16_stride)
@@ -465,6 +591,28 @@ class W4A8MaterializedPhase2Kernel:
                     self.threads_per_cta,
                     8,
                 )
+                if cutlass.const_expr(self.trellis_scaled):
+                    # The released payload carries one UE8M0 word per K32 of
+                    # each N16 window; stage this N128 tile's 16 windows.
+                    packed_tile = output_tile >> Int32(1)
+                    packed_half = output_tile & Int32(1)
+                    b_tile = (
+                        expert_idx * packed_output_tiles + packed_tile
+                    ) * intermediate_tiles + intermediate_slice
+                    sfb_word_base = Int64(b_tile) * Int64(256)
+                    for i in cutlass.range_constexpr(
+                        ((16 * 8) // 4 + self.threads_per_cta - 1)
+                        // self.threads_per_cta
+                    ):
+                        idx = tid + Int32(i * self.threads_per_cta)
+                        if idx < Int32((16 * 8) // 4):
+                            src_word = sfb_word_base + Int64(
+                                packed_half * Int32(16 * 8) + idx * 4
+                            )
+                            cp_async4_shared_global(
+                                sfb_base + (idx << Int32(4)),
+                                get_ptr_as_int64(down_sfb_rp, src_word),
+                            )
             elif cutlass.const_expr(self.n64_repacked):
                 if cutlass.const_expr(not (self.direct_routes and self.csf_inline)):
                     total_output_tiles = packed_output_tiles * Int32(2)
@@ -720,7 +868,7 @@ class W4A8MaterializedPhase2Kernel:
                             tr_b0 = (Int32(kb * 16) + tr_n16) * Int32(
                                 8 * self.trellis_bits
                             )
-                            d_lo0, d_lo1, d_hi0, d_hi1 = _w4a8_trellis_pair_words_both(
+                            d_lo0, d_lo1, d_hi0, d_hi1 = self._trellis_pair_words(
                                 b_base,
                                 lane,
                                 tr_b0,
@@ -728,10 +876,7 @@ class W4A8MaterializedPhase2Kernel:
                                 tr_ia,
                                 tr_ib,
                                 tr_s2,
-                                self.trellis_bits,
                                 trellis_lut_addr,
-                                not self.trellis_direct_lut,
-                                self.trellis_direct_lut,
                             )
                             dn_b0[th * 2] = d_lo0
                             dn_b1[th * 2] = d_lo1
@@ -767,7 +912,9 @@ class W4A8MaterializedPhase2Kernel:
                             b2 = dn_b1[nt * 2]
                             b3 = dn_b1[nt * 2 + 1]
                         sfb_word = Uint32(0x7F7F7F7F)
-                        if cutlass.const_expr(not self.w4a8_trellis):
+                        if cutlass.const_expr(
+                            not self.w4a8_trellis or self.trellis_scaled
+                        ):
                             sfb_word = ld_shared_u32(
                                 sfb_words + ((n8 * Int32(8) + q) << Int32(2))
                             )
@@ -1055,7 +1202,7 @@ class W4A8MaterializedPhase2Kernel:
 
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
-        if cutlass.const_expr(self.w4a8_trellis and not self.trellis_direct_lut):
+        if cutlass.const_expr(self.w4a8_trellis_lut):
             trellis_lut_u32 = cute.recast_tensor(trellis_lut, cutlass.Uint32)
             lut_copy_i = Int32(tidx)
             while lut_copy_i < Int32(1024):

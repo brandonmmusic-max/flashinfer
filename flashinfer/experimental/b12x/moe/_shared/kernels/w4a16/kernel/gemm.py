@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from b12x._lib.quant.block_codec import BLOCK_CODECS
+from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Int32
 from cutlass.cutlass_dsl import Int64
+from cutlass.cutlass_dsl import T, dsl_user_op
 from b12x.moe._shared.trellis_codebooks import LUT_E4M3
 from b12x.moe._shared.trellis_codebooks import LUT_FP16
 from cutlass.cutlass_dsl import Uint32
@@ -80,7 +82,9 @@ from b12x._lib.intrinsics.atomics import st_shared_v4_f32
 from b12x._lib.intrinsics.memory import st_shared_v4_u32
 import torch
 from b12x._lib.intrinsics.trellis import trellis_align_stream_u32x2
+from b12x.moe._shared.trellis_codebooks import PROCEDURAL_NPK
 from b12x.moe._shared.trellis_codebooks import validate_codebook_bits
+from b12x.moe._shared.kernels.w4a8_npk_decode import packed_decode_npk_to_e4m3x8
 from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _ALLOWED_ROUTED_SIZES,
     _DEFAULT_MAX_SHARED_MEM,
@@ -93,6 +97,7 @@ from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _TRELLIS256_BITS,
     _TRELLIS256_CODEBOOKS,
     _TRELLIS256_W13_LAYOUTS,
+    TRELLIS256_BLOCK_SCALE_CODEBOOKS,
     _WEIGHT_LAYOUTS,
     _covering_count,
     _dequant_native_fp4_word,
@@ -109,6 +114,41 @@ from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _w4a16_pipeline_stages,
     _w4a16_small_m_splitk_enabled,
 )
+
+
+@dsl_user_op
+def _ue8m0_byte_to_half2(byte: Int32, *, loc=None, ip=None) -> Uint32:
+    """The fp16 bit pattern of ``2**(byte-127)``, broadcast into both lanes.
+
+    ``2**(b-127)`` as fp32 is the bit pattern ``b << 23``; the ``cvt.rn.f16x2``
+    of a power of two is exact whenever the value is fp16-representable, i.e.
+    for bytes 103..142 (``2**-24 .. 2**15``, subnormals included). Preparation
+    admits the narrower range 112..139, where the fp16 *product* of the scale
+    and a decoded weight is also exact
+    (``prepare.py``'s ``_validate_trellis256_block_scale``); widening it needs
+    the product bound rechecked, not just this conversion.
+    """
+
+    result = llvm.inline_asm(
+        T.i32(),
+        [Int32(byte).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 bits;
+            .reg .f32 s;
+            shl.b32 bits, $1, 23;
+            mov.b32 s, bits;
+            cvt.rn.f16x2.f32 $0, s, s;
+        }
+        """,
+        "=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Uint32(result)
 
 
 class W4A16GemmKernel:
@@ -132,6 +172,7 @@ class W4A16GemmKernel:
         w13_layout: str = "w13",
         trellis_bits: int = 3,
         trellis_codebook: str = LUT_E4M3,
+        trellis_weight_scale_row_rotation: int | None = None,
         trellis_pair_kind: str | None = None,
         trellis_rate_axis: str | None = None,
         source_n_rotation: int = 0,
@@ -182,6 +223,36 @@ class W4A16GemmKernel:
             if scale_format != "e4m3_k32":
                 raise ValueError(
                     "trellis_t256 W4A16 weights require scale_format='e4m3_k32'"
+                )
+            # procedural_npk carries the release's UE8M0/K32 weight-scale
+            # plane. It is applied to the decoded E4M3 codes (widened to fp16)
+            # of each K32 block, which is bitwise equal to the release's in-MMA
+            # block scale because 2**(b-127) is a power of two.
+            if trellis_codebook in TRELLIS256_BLOCK_SCALE_CODEBOOKS:
+                if trellis_weight_scale_row_rotation is None:
+                    raise ValueError(
+                        f"trellis_t256 codebook {trellis_codebook!r} carries a "
+                        "UE8M0/K32 weight-scale plane; "
+                        "trellis_weight_scale_row_rotation is required"
+                    )
+                if trellis_pair_kind is not None:
+                    raise NotImplementedError(
+                        "the procedural_npk weight block scale is implemented "
+                        "for uniform-rate tiles only (no trellis pair kinds)"
+                    )
+                if size_n % 256 or size_k % 128:
+                    raise ValueError(
+                        "the procedural_npk weight block scale requires N % 256 "
+                        f"== 0 and K % 128 == 0; got N={size_n}, K={size_k}"
+                    )
+                trellis_weight_scale_row_rotation = int(
+                    trellis_weight_scale_row_rotation
+                ) % int(size_n)
+            elif trellis_weight_scale_row_rotation is not None:
+                raise ValueError(
+                    "trellis_weight_scale_row_rotation is only defined for "
+                    f"codebooks {sorted(TRELLIS256_BLOCK_SCALE_CODEBOOKS)}; got "
+                    f"{trellis_codebook!r}"
                 )
         elif weight_layout in BLOCK_CODECS:
             if element_dtype != "bf16":
@@ -334,6 +405,19 @@ class W4A16GemmKernel:
         self.trellis_pair_low_bits, self.trellis_pair_high_bits = static_pair_rates.get(
             trellis_pair_kind, (3, 3)
         )
+        # UE8M0/K32 weight block scale (procedural_npk releases). ``None``
+        # keeps every other codebook on its existing no-block-scale decode.
+        self.trellis_weight_scale_row_rotation = (
+            None
+            if trellis_weight_scale_row_rotation is None
+            else int(trellis_weight_scale_row_rotation)
+        )
+        self.trellis_weight_block_scale = (
+            self.trellis_weight_scale_row_rotation is not None
+        )
+        if self.trellis_weight_block_scale:
+            self.trellis_weight_scale_n_tiles = int(size_n) // 256
+            self.trellis_weight_scale_k_tiles = int(size_k) // 128
         self.lut_e4m3_smem = False
         self.trellis_direct_lut = False
         # Large-M route blocks only issue the MMAs of 16-row blocks that hold
@@ -2127,6 +2211,9 @@ class W4A16GemmKernel:
                                     uses_m_block_8,
                                     dynamic_pair_override,
                                     live_m_blocks,
+                                    scales_i32_flat,
+                                    expert_idx,
+                                    output_n_tile,
                                 )
                             else:
                                 self._dequant_and_accumulate_bundle(
@@ -2146,6 +2233,9 @@ class W4A16GemmKernel:
                                     uses_m_block_8,
                                     0,
                                     live_m_blocks,
+                                    scales_i32_flat,
+                                    expert_idx,
+                                    output_n_tile,
                                 )
                         else:
                             self._dequant_and_accumulate_bundle(
@@ -2165,6 +2255,9 @@ class W4A16GemmKernel:
                                 uses_m_block_8,
                                 -1,
                                 live_m_blocks,
+                                scales_i32_flat,
+                                expert_idx,
+                                output_n_tile,
                             )
                         if cutlass.const_expr(
                             self.weight_layout_block and kk + 1 == self.b_sh_wr_iters
@@ -2249,7 +2342,12 @@ class W4A16GemmKernel:
         uses_m_block_8: cutlass.Constexpr[bool],
         dynamic_pair_override: cutlass.Constexpr[int],
         live_m_blocks: Int32,
+        weight_scale_flat: cute.Tensor,
+        expert_idx: Int32,
+        output_n_tile: Int32,
     ):
+        # ``weight_scale_flat`` is the kernel's ``scales_i32_flat``: for
+        # procedural_npk it holds the release's repacked UE8M0/K32 plane.
         if cutlass.const_expr(
             uses_m_block_8
             and self.weight_layout_trellis256_pair
@@ -2364,6 +2462,20 @@ class W4A16GemmKernel:
                         b_scale_cur[1, jj],
                         trellis_lut_addr,
                     )
+                    if cutlass.const_expr(self.trellis_weight_block_scale):
+                        # procedural_npk: the release's UE8M0/K32 weight scale
+                        # multiplies this fragment's decoded fp16 codes before
+                        # the MMA (bitwise equal to the release's in-MMA block scale).
+                        self._apply_trellis256_block_scale(
+                            b_frag,
+                            weight_scale_flat,
+                            expert_idx,
+                            output_n_tile,
+                            tid,
+                            tile_idx,
+                            kk,
+                            jj,
+                        )
             else:
                 q, s = self._select_b_scale_register(jj, b_scale_cur)
                 self._scaled_dequant_b_fragment(b_frag, q, s)
@@ -3335,6 +3447,21 @@ class W4A16GemmKernel:
                 o0, o1, o2, o3 = packed_dequant_trellis_to_bfloat2x4(
                     win_a, win_b, int(bits)
                 )
+        elif cutlass.const_expr(self.trellis_codebook == PROCEDURAL_NPK):
+            # TrellisMX release law: the same state arithmetic as ``mcg`` plus
+            # the alpha-2 compander, quantized to the released E4M3 alphabet
+            # (``packed_decode_npk_to_e4m3x8``; the reference decodes the
+            # same bytes and the captures pin it). The W4A16 GEMM then widens
+            # the E4M3 operand to fp16 -- exact -- and the release's UE8M0/K32
+            # weight scale is applied to the decoded block.
+            if cutlass.const_expr(not self.is_fp16):
+                raise NotImplementedError(
+                    "procedural_npk W4A16 decode produces fp16 operands; "
+                    f"element_dtype={self.element_dtype!r} is unsupported"
+                )
+            e_lo, e_hi = packed_decode_npk_to_e4m3x8(win_a, win_b, int(bits))
+            o0, o1 = fp8x4_e4m3_to_half2x2(e_lo)
+            o2, o3 = fp8x4_e4m3_to_half2x2(e_hi)
         elif cutlass.const_expr(self.trellis_codebook == LUT_FP16):
             if cutlass.const_expr(self.is_fp16):
                 o0, o1, o2, o3 = packed_decode_lut_fp16_to_half2x4(
@@ -3371,6 +3498,89 @@ class W4A16GemmKernel:
         frag[0, 1] = o1
         frag[1, 0] = o2
         frag[1, 1] = o3
+
+    @cute.jit
+    def _trellis256_block_scale_half2(
+        self,
+        plane: cute.Tensor,
+        expert_idx: Int32,
+        row: Int32,
+        k32: Int32,
+    ):
+        """``2**(byte-127)`` of the release's UE8M0/K32 weight plane, packed.
+
+        The plane is the W4A8 sfb layout the prepared bundle already holds
+        (``[E, n_tile, k_tile, 32, 8]`` int32, a pure permutation of the
+        logical ``[rows, K/32]`` byte grid). No copy is made: the byte is
+        addressed arithmetically. ``row`` is the kernel's N row after the
+        up-gate/gate-up rotation; the result is a packed f16x2 of the exact
+        power of two (normal or subnormal, see the prepare-time range check).
+        """
+
+        n_tile = row >> Int32(8)
+        n32 = (row >> Int32(3)) & Int32(31)
+        row8 = row & Int32(7)
+        k_tile = k32 >> Int32(2)
+        kb = k32 & Int32(3)
+        expert_words = Int32(
+            self.trellis_weight_scale_n_tiles * self.trellis_weight_scale_k_tiles * 256
+        )
+        word_index = (
+            expert_idx * expert_words
+            + (
+                (n_tile * Int32(self.trellis_weight_scale_k_tiles) + k_tile) * Int32(32)
+                + n32
+            )
+            * Int32(8)
+            + row8
+        )
+        byte = Int32(plane[word_index] >> (Int32(8) * kb)) & Int32(0xFF)
+        return _ue8m0_byte_to_half2(byte)
+
+    @cute.jit
+    def _apply_trellis256_block_scale(
+        self,
+        frag: cute.Tensor,
+        plane: cute.Tensor,
+        expert_idx: Int32,
+        output_n_tile: Int32,
+        tid: Int32,
+        tile_idx: Int32,
+        kk: Int32,
+        jj: cutlass.Constexpr[int],
+    ):
+        """Scale one decoded 8-code B fragment by its K32 weight scale.
+
+        Within one 16x16 tile the 16 K codes of a fragment span one K32 block,
+        so the scale depends only on the output row: the first four codes
+        (``frag[0, 0]``/``frag[0, 1]``) are tile row ``n0`` and the last four
+        (``frag[1, 0]``/``frag[1, 1]``) are row ``n0 + 8``.
+        """
+
+        lane = tid & Int32(31)
+        warp_id = tid >> Int32(5)
+        warp_row = warp_id // Int32(self.tb_n_warps)
+        w_n = warp_id % Int32(self.tb_n_warps)
+        kt_local = Int32(self.b_sh_wr_iters) * warp_row + kk
+        n16 = output_n_tile * Int32(self.cta_n_blocks) + Int32(4) * w_n + Int32(jj)
+        n0 = Int32(2) * (lane // Int32(8)) + ((lane >> Int32(2)) & Int32(1))
+        row_a = n16 * Int32(16) + n0
+        row_b = row_a + Int32(8)
+        k32 = (tile_idx * Int32(self.cta_k_blocks) + kt_local) >> Int32(1)
+        rotation = Int32(self.trellis_weight_scale_row_rotation)
+        if cutlass.const_expr(self.trellis_weight_scale_row_rotation != 0):
+            row_a = row_a + rotation
+            row_b = row_b + rotation
+            if row_a >= Int32(self.size_n):
+                row_a = row_a - Int32(self.size_n)
+            if row_b >= Int32(self.size_n):
+                row_b = row_b - Int32(self.size_n)
+        scale_a = self._trellis256_block_scale_half2(plane, expert_idx, row_a, k32)
+        scale_b = self._trellis256_block_scale_half2(plane, expert_idx, row_b, k32)
+        frag[0, 0] = half2_mul(frag[0, 0], scale_a)
+        frag[0, 1] = half2_mul(frag[0, 1], scale_a)
+        frag[1, 0] = half2_mul(frag[1, 0], scale_b)
+        frag[1, 1] = half2_mul(frag[1, 1], scale_b)
 
     @cute.jit
     def _scaled_dequant_b_fragment_trellis256(

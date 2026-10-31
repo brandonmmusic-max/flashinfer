@@ -191,3 +191,137 @@ PYTHONPATH="$PWD:$PWD/flashinfer/experimental/b12x/_compat" \
 The two-device ownership check requires two visible SM120 GPUs. These checks
 verify the specified lossy arithmetic and replay behavior; they do not measure
 model accuracy or serving throughput.
+
+# TrellisMX weights and the external P8 runtime
+
+`source_format="trellismx"` reads a released procedural-NPK TrellisMX sidecar
+(`fused_moe.trellismx.prepare_trellismx_experts`) onto the W4A8 trellis recipe.
+Preparation accepts only what every TrellisMX path executes: BF16 activations
+and GLM-5.3's `silu-cap10`, `silu(min(gate, 10)) * clamp(up, -10, 10)` with the
+clamp before SiLU. Other dtypes, limits or clamp placements, router weighting on
+the input, activation-amax collection, expert maps and A4 prefill are rejected
+while planning. `plan_execution(..., smallm_max_tokens=N)` declares how much of
+the small-M arm's 1..16 token range the plan serves: at most `N` tokens, the
+default 16, or `0` to send every token count to the grouped arm. The value is
+validated (an integer in 0..16), recorded in the plan's controls and tuning
+query, and compiled for; no environment variable selects it. Calls with at most
+`N` tokens take a small-M arm with 16-bit activations when every UE8M0
+weight-scale byte lies in 112..139, the range in which its fp16 weight-scale
+product is exact, and the call allows fast math; otherwise the grouped arm
+serves every token count. The plan resolves that choice once, keeps it in its
+identity, compiles for it, and stamps it on every binding it makes; dispatch
+follows the binding. Preparation also builds the arm's plan and programs for
+every planned token count the arm serves, so plan, bind and capture need no
+eager call, and capture allocates and compiles nothing.
+
+The arm's activation, route and output buffers are caller-owned scratch. Its
+plan declares them (`smallm_scratch_layout`: one 16-byte-aligned region per
+buffer), the variant's arena reserves them after the grouped arm's regions, and
+`bind` carves one set per binding out of the buffer it was given. A call with a
+bound caller-owned output writes only its binding's views and allocates nothing,
+which is the only form capture accepts; an eager call whose binding carries no
+output allocates the BF16 tensor it returns. A missing or short arena is
+rejected at bind, and dispatch refuses a binding that carries no carved
+buffers. Two bindings of one prepared layer therefore hold distinct storage and
+may be captured, replayed and run without serializing against each other; only
+the compiled programs are shared, and those are read-only.
+
+`fused_moe.trellismx_p8.attach_trellismx_p8_runtime(experts, runtime,
+backend=TrellisMxP8Backend(...), options=None)` returns a copy of the prepared
+experts that owns an external P8 runtime and runs every call through it. The
+backend declaration pins the runtime's source files by SHA-256, hashed again on
+every attach. Attachment verifies them; the geometry, bitrate, SwiGLU limit and
+reducer configuration against the prepared record and the experts' plan; that
+every tensor the runtime passes its kernels as a raw pointer is contiguous,
+16-byte aligned and exactly as long as expected; that the runtime reads the
+experts' own carriers and scale planes in place; and that its repacked scales
+and coupled-boundary vectors are byte-equal to the experts'. The runtime's
+resolved behavior settings (`P8_OPTION_ATTRIBUTES`: RP2 row packing, direct
+kernel limit and tile, FC1 schedule, grid policy and the rest) are recorded and
+are part of the attachment identity and of the plan query; file hashes alone do
+not identify them. `options` may name settings the runtime must have resolved.
+`plan_execution` on attached experts races the runtime's launch configuration
+per capacity, as it does for any b12x component. b12x preparation rejects a
+call that launches a b12x-compiled program its plan did not declare, so the
+runtime states a `program_declaration` (a compile-job factory from its pinned
+backend and the metadata it compiles from); each capacity of the plan carries
+one compile job per raced configuration, and each call launches only declared
+programs. The plan also sizes every capacity's caller-owned scratch from that
+metadata, so a runtime without a declaration cannot be planned: preparation
+would not know how much arena its calls need. Keep the attached experts, or a
+binding or plan made from them, alive while a captured graph that uses them can
+replay.
+
+While attached, nothing the attachment verified may change. Replacing a
+verified tensor, record field or plan field with `dataclasses.replace` drops
+nothing silently: it raises. Planning, binding and dispatch reject a runtime
+whose tensor handles or settings changed (host-side checks, no device
+synchronization). In-place writes to tensor contents cannot be seen without
+reading device memory; `verify_trellismx_p8_attachment(experts)` re-checks
+them on request, outside capture. To change weights, scales or boundary
+vectors, detach the runtime, prepare the experts again, attach again, and
+recapture every graph made from the old experts: replays of graphs captured
+earlier bypass every check.
+
+b12x ships one such runtime: `fused_moe.trellismx_p8_runtime.P8NativeTPMoE`,
+Brandon M. Music's P8 kernels from local-inference-lab/b12x#342, in
+`moe/_shared/p8`. Its behavior settings are one `P8RuntimeOptions` passed at
+construction; the defaults are the GLM-5.3 Flash serving configuration and
+nothing is read from the environment. `in_tree_p8_backend()` is its
+`TrellisMxP8Backend` declaration, pinning every file of that package. It
+compiles through b12x's compiler and declares its programs with
+`compile_p8_programs`, which builds each arm and the reducer from the
+runtime's `P8ProgramSpec` with the runtime's own code.
+
+A call takes its whole arena from the caller and writes a caller-owned output.
+`P8NativeTPMoE.scratch_specs` reports the bytes a capacity's calls need, the
+plan declares exactly that much in `MemoryRequirements.scratch`, and the runtime
+carves every buffer (route carrier, activation scales, task queues and the FP32
+per-route partial sum) out of the bound buffer. Nothing is allocated during a
+call, so a captured graph holds no graph-private pool memory and a missing,
+too-small or 16-byte misaligned buffer raises instead of allocating. The result
+is not part of the arena: `P8NativeTPMoE.__call__` requires `out=`, so a call
+never hands back scratch that the next call would overwrite. A fused-MoE
+binding without an output gets one allocated on the eager path and must carry
+one under capture.
+
+The launch geometry is not an option. One `P8LaunchConfig` (the direct and
+grouped tile M, the direct carrier stride, the direct arm's FC1 pipeline depth
+and warp count, and the resident-grid cap) is a candidate of the component's
+tuning contract: preparation races the configurations that can change the
+capacity's own call, compiles one set of programs per configuration, and fixes
+the winner in the prepared state. The serving configuration is one of the
+candidates, and it is also what a runtime uses when a call names no
+configuration. A `P8LaunchConfig` passed to `plan_execution` pins the choice
+and skips the race. The resident-grid cap has one owner per value: a cap
+configuration `0` selects the runtime's `grid_policy`, and a runtime built with
+`mac_override` pins its cap, which wins over any raced cap (the race then keeps
+the cap axis at `0` and rejects a configuration that names another).
+
+Each capacity declares the arms its calls reach: three for the serving tile
+policy, because 1 and 2 tokens take the same direct arm (`select_tile(1)[0]`
+tiles every row count up to the direct limit) and 17 and 129 take the grouped
+arms of their tile bands. Compile every declared arm before capture; a compile
+after kernel resolution is frozen raises.
+`examples/experimental/b12x_trellismx_p8_runtime.py` prepares a released layer,
+attaches the runtime and checks it against the reference.
+
+The runtime never leaves its process. Pickling or deep-copying attached
+experts, or a binding or prepared plan state that holds them, produces a
+`TrellisMxP8Descriptor` in the attachment's place. It keeps the backend
+declaration, contract, options, identity and program declaration, owns no
+runtime and no programs, plans the same fixed-backend plan with the same
+compile jobs, binds, and raises
+`TrellisMxP8Unavailable` on any launch instead of falling back to this package's
+arms. Attaching a runtime to experts that carry a descriptor rebinds them and
+requires the same identity.
+
+CPU contract checks:
+
+```sh
+PYTHONPATH="$PWD:$PWD/flashinfer/experimental/b12x/_compat" \
+  .venv/bin/python -m pytest \
+  tests/experimental/b12x/moe/test_trellismx_p8_attachment.py \
+  tests/experimental/b12x/moe/test_trellismx_p8_runtime.py \
+  tests/experimental/b12x/moe/test_trellismx_source.py -v
+```

@@ -311,6 +311,8 @@ def _symmetric_bits(
         allowed = (3, 4, 5)
     elif config.codebook is TrellisCodebook.LUT_E4M3:
         allowed = (3,)
+    elif config.codebook is TrellisCodebook.PROCEDURAL_NPK:
+        allowed = (2, 3, 4)
     else:
         raise NotImplementedError(
             "lut_fp16 is represented by the v2 format but is not implemented "
@@ -744,8 +746,23 @@ def prepare_trellis_weights(
             "codes first dimension must equal intermediate_size/32: "
             f"got {int(codes.shape[0])} rows for I={intermediate_size}"
         )
-    if config.transform.projection.kind != "scaled_hadamard" or (
-        config.transform.projection.block_size != 128
+    # `block_size` is a preparation-time gate only: it has no other use in this
+    # module, and the W4A16 kernels take the hidden-axis rotation as an
+    # already-applied A operand rather than rotating inside the GEMM.
+    #
+    # TrellisMX's outer block is 512 and its boundary is EXTERNAL: the caller's
+    # boundary kernel applies bf16 -> fp16 -> H512 -> *gate_up_suh -> H128
+    # before the GEMM (and H128 -> *down_svh after), so the GEMM must see an
+    # identity projection. Accept that container, gated on the source format,
+    # instead of accepting 512 as a generic scaled_hadamard block.
+    external_boundary = bool(
+        str(getattr(source, "source_format", "")).lower() == "trellismx"
+        and config.transform.projection.kind == "scaled_hadamard"
+        and int(config.transform.projection.block_size) == 512
+    )
+    if not external_boundary and (
+        config.transform.projection.kind != "scaled_hadamard"
+        or config.transform.projection.block_size != 128
     ):
         raise NotImplementedError(
             "fused MoE trellis preparation implements scaled_hadamard(128)"

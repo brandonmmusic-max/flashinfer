@@ -74,6 +74,9 @@ class TrellisExtent:
         return 32 * self.slot_count
 
 
+TRELLIS_SOURCE_FORMATS: tuple[str, ...] = ("b12x_trellis", "trellismx")
+
+
 @dataclass(frozen=True, kw_only=True)
 class TrellisSource:
     """Container-independent trellis encoding and optional global coordinates.
@@ -81,15 +84,39 @@ class TrellisSource:
     ``uniform_bits`` declares the scalar rate before weights are transferred;
     preparation verifies it against the rate tensor. Omitting it retains the
     native config's K3 LUT or K3/K4/K5 projection-tiered MCG contract.
+
+    ``source_format`` names the *container* the tensors come from. Both values
+    describe the same v2 config contract; they select the prepared layout:
+    ``b12x_trellis`` produces the W4A16 trellis-native bundle, ``trellismx``
+    produces the W4A8 trellis bundle with real UE8M0 K32 weight scales.
     """
 
     config: TrellisConfig
     uniform_bits: int | None = None
     extent: TrellisExtent | None = None
+    source_format: str = "b12x_trellis"
 
     def __post_init__(self) -> None:
         if not isinstance(self.config, TrellisConfig):
             raise TypeError("TrellisSource.config must be a TrellisConfig")
+        object.__setattr__(self, "source_format", str(self.source_format).lower())
+        if self.source_format not in TRELLIS_SOURCE_FORMATS:
+            raise ValueError(
+                "TrellisSource.source_format must be one of "
+                f"{list(TRELLIS_SOURCE_FORMATS)}; got {self.source_format!r}"
+            )
+        if self.source_format == "trellismx":
+            # TrellisMX is a uniform-rate, explicit-K container with the
+            # procedural NPK codebook; anything else is a different release.
+            if self.config.codebook.value != "procedural_npk":
+                raise ValueError(
+                    "trellismx requires codebook 'procedural_npk'; got "
+                    f"{self.config.codebook.value!r}"
+                )
+            if self.uniform_bits is None:
+                raise ValueError("trellismx requires an explicit uniform_bits")
+            if self.config.rate.granularity is not RateGranularity.UNIFORM:
+                raise ValueError("trellismx requires uniform rate granularity")
         if self.uniform_bits is not None:
             if type(self.uniform_bits) is not int or self.uniform_bits not in (
                 2,
@@ -112,6 +139,7 @@ WeightSource: TypeAlias = PackedSource | TrellisConfig | TrellisSource
 
 
 __all__ = [
+    "TRELLIS_SOURCE_FORMATS",
     "TrellisExtent",
     "TrellisSource",
     "PackedSource",

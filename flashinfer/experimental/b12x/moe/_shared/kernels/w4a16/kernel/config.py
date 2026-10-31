@@ -6,6 +6,7 @@ from b12x._lib.quant.block_codec import BLOCK_CODECS
 from b12x.moe._shared.trellis_codebooks import LUT_E4M3
 from b12x.moe._shared.trellis_codebooks import LUT_FP16
 from b12x.moe._shared.trellis_codebooks import MCG
+from b12x.moe._shared.trellis_codebooks import PROCEDURAL_NPK
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import Uint32
 from b12x.moe._shared.kernels.w4a16.host import _W4A16_ALLOWED_ROUTED_SIZES
@@ -152,7 +153,17 @@ _TRELLIS256_W13_LAYOUTS = {"packed", "trellis_t256_proj"}
 # bitrate. Their exact storage is [16*bits] int16 == [8*bits] uint32 per tile.
 _TRELLIS256_BITS = (2, 3, 4, 5, 6)
 
-_TRELLIS256_CODEBOOKS = {MCG, LUT_E4M3, LUT_FP16}
+# ``procedural_npk`` is the TrellisMX release law. It decodes through the
+# released E4M3 alphabet (the same law as ``mcg`` plus the alpha-2 compander,
+# quantized to E4M3) and, unlike every other W4A16 codebook, the released
+# container also carries a UE8M0/K32 weight-scale plane. The W4A16 decode
+# widens the E4M3 codes to fp16 and applies that plane per K32 block
+# (``TRELLIS256_BLOCK_SCALE_CODEBOOKS``); the other ids keep their existing
+# no-block-scale arithmetic.
+_TRELLIS256_CODEBOOKS = {MCG, LUT_E4M3, LUT_FP16, PROCEDURAL_NPK}
+
+#: Codebooks whose released weights carry a UE8M0/K32 block-scale plane.
+TRELLIS256_BLOCK_SCALE_CODEBOOKS = frozenset({PROCEDURAL_NPK})
 
 _LUT_E4M3_VALUE_TABLE_ENTRIES = 1 << 12
 

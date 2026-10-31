@@ -16,6 +16,7 @@ from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
 from b12x._lib.intrinsics.memory import cp_async4_shared_global, get_ptr_as_int64
 from b12x._lib.intrinsics.atomics import ld_shared_u32
+from b12x._lib.intrinsics.math import div_rn_f32
 from b12x._lib.intrinsics.trellis import (
     packed_decode_lut_e4m3_to_e4m3x8,
     packed_decode_lut_e4m3_direct_to_e4m3x8,
@@ -114,17 +115,17 @@ def _w4a8_trellis_permute_k32(values: cute.Tensor) -> cute.Tensor:
 
 
 @cute.jit
-def _w4a8_had128_quad(
+def _w4a8_had128_quad_unnormalized(
     v0: cutlass.Float32,
     v1: cutlass.Float32,
     v2: cutlass.Float32,
     v3: cutlass.Float32,
     lane: Int32,
 ):
-    """Normalized Sylvester H128 over one warp; lane holds columns lane*4..+3.
+    """Sylvester H128 over one warp without the 1/sqrt(128) normalization.
 
     Intra-lane H4 on the four consecutive values, then five butterfly rounds
-    across the warp. Natural-order in and out; scale 1/sqrt(128).
+    across the warp. Natural-order in and out.
     """
 
     s0 = v0 + v1
@@ -151,8 +152,74 @@ def _w4a8_had128_quad(
             h1 = p1 + h1
             h2 = p2 + h2
             h3 = p3 + h3
+    return h0, h1, h2, h3
+
+
+@cute.jit
+def _w4a8_had128_quad(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    lane: Int32,
+):
+    """Normalized Sylvester H128 over one warp; lane holds columns lane*4..+3.
+
+    Natural-order in and out; terminal multiply by the fp32 reciprocal of
+    sqrt(128). This is the QSRT form and is bit-unchanged.
+    """
+
+    h0, h1, h2, h3 = _w4a8_had128_quad_unnormalized(v0, v1, v2, v3, lane)
     scale = cutlass.Float32(0.088388347648)
     return h0 * scale, h1 * scale, h2 * scale, h3 * scale
+
+
+@cute.jit
+def _w4a8_had128_quad_exact(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    lane: Int32,
+):
+    """Normalized Sylvester H128 with the terminal ``div.rn.f32``.
+
+    Multiplying by a rounded reciprocal instead is algebraically equivalent
+    but can move an E4M3 tie by one code, so the order that declares a
+    correctly-rounded division (TrellisMX's coupled boundary) must divide.
+    ``11.313708305358887`` is fp32 sqrt(128) (0x413504f3).
+    """
+
+    h0, h1, h2, h3 = _w4a8_had128_quad_unnormalized(v0, v1, v2, v3, lane)
+    divisor = cutlass.Float32(11.313708305358887)
+    return (
+        div_rn_f32(h0, divisor),
+        div_rn_f32(h1, divisor),
+        div_rn_f32(h2, divisor),
+        div_rn_f32(h3, divisor),
+    )
+
+
+@cute.jit
+def _w4a8_had128_quad_dispatch(
+    exact: cutlass.Constexpr,
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    lane: Int32,
+):
+    """Select the H128 normalization at compile time.
+
+    ``exact=False`` keeps the reciprocal multiply (QSRT, unchanged bytes);
+    ``exact=True`` divides (TrellisMX's declared terminal order).
+    """
+
+    if cutlass.const_expr(exact):
+        h0, h1, h2, h3 = _w4a8_had128_quad_exact(v0, v1, v2, v3, lane)
+    else:
+        h0, h1, h2, h3 = _w4a8_had128_quad(v0, v1, v2, v3, lane)
+    return h0, h1, h2, h3
 
 
 @cute.jit
@@ -170,6 +237,32 @@ def _w4a8_trellis_lane_geom(lane: Int32, bits: cutlass.Constexpr):
 
 
 @cute.jit
+def _w4a8_trellis_window_words(
+    smem_base: Int32,
+    base_u32: Int32,
+    ia: Int32,
+    ib: Int32,
+    s2: Int32,
+    bits: cutlass.Constexpr,
+):
+    """The lane's two 32-bit funnel windows over the staged t256 ring.
+
+    ``ia``/``ib``/``s2`` come from ``_w4a8_trellis_lane_geom``. The merged
+    read is the two ring words the lane's eight-window span touches, shifted
+    so ``win_a`` starts at the final window and ``win_b`` four windows
+    earlier. Every codebook arm decodes the same pair of windows; only the
+    law that turns a 16-bit window into an operand byte differs.
+    """
+
+    a = Uint32(ld_shared_u32(smem_base + ((base_u32 + ia) << Int32(2))))
+    b = Uint32(ld_shared_u32(smem_base + ((base_u32 + ib) << Int32(2))))
+    merged = (Int64(a) << Int64(32)) | Int64(b)
+    win_a = Uint32(merged >> Int64(s2))
+    win_b = Uint32(merged >> Int64(s2 + Int32(4 * int(bits))))
+    return win_a, win_b
+
+
+@cute.jit
 def _w4a8_trellis_decode_half(
     smem_base: Int32,
     base_u32: Int32,
@@ -183,11 +276,7 @@ def _w4a8_trellis_decode_half(
 ) -> Uint32:
     """Decode one K16 window's E4M3x4 word for one n8 half of an N16 tile."""
 
-    a = Uint32(ld_shared_u32(smem_base + ((base_u32 + ia) << Int32(2))))
-    b = Uint32(ld_shared_u32(smem_base + ((base_u32 + ib) << Int32(2))))
-    merged = (Int64(a) << Int64(32)) | Int64(b)
-    win_a = Uint32(merged >> Int64(s2))
-    win_b = Uint32(merged >> Int64(s2 + Int32(4 * int(bits))))
+    win_a, win_b = _w4a8_trellis_window_words(smem_base, base_u32, ia, ib, s2, bits)
     if cutlass.const_expr(direct_lut):
         lo, hi = packed_decode_lut_e4m3_direct_to_e4m3x8(
             win_a,
@@ -262,11 +351,7 @@ def _w4a8_trellis_decode_both(
 ):
     """Decode one K16 window's E4M3x4 words for both n8 halves."""
 
-    a = Uint32(ld_shared_u32(smem_base + ((base_u32 + ia) << Int32(2))))
-    b = Uint32(ld_shared_u32(smem_base + ((base_u32 + ib) << Int32(2))))
-    merged = (Int64(a) << Int64(32)) | Int64(b)
-    win_a = Uint32(merged >> Int64(s2))
-    win_b = Uint32(merged >> Int64(s2 + Int32(4 * int(bits))))
+    win_a, win_b = _w4a8_trellis_window_words(smem_base, base_u32, ia, ib, s2, bits)
     if cutlass.const_expr(direct_lut):
         lo, hi = packed_decode_lut_e4m3_direct_to_e4m3x8(
             win_a,

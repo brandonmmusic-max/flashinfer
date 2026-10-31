@@ -6,6 +6,7 @@ from typing import Tuple
 
 from b12x.moe._shared.kernels.dynamic.kernel import MoEDynamicKernelBackend
 from b12x.moe._shared.kernels.micro.kernel import MoEMicroKernelBackend
+from b12x.moe._shared.trellis_codebooks import LUT_E4M3
 from b12x.moe._shared.kernels.activations import (
     SWIGLUOAI_UNINTERLEAVE,
     normalize_swiglu_alpha_for_activation,
@@ -89,6 +90,11 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         w4a8_n64_tail: bool = False,
         trellis_bits: int | None = None,
         trellis_intermediate_hadamard: bool = False,
+        trellis_exact_hadamard: bool = False,
+        trellis_fp32_boundary: bool = False,
+        trellis_direct_lut: bool = False,
+        trellis_codebook: str = LUT_E4M3,
+        trellis_pre_quantized_a: bool = False,
         direct_routing: bool = False,
         external_route_plan: bool = False,
         work_source: str = "materialized_queue",
@@ -122,6 +128,11 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             w4a8_n64_tail=w4a8_n64_tail,
             trellis_bits=trellis_bits,
             trellis_intermediate_hadamard=trellis_intermediate_hadamard,
+            trellis_exact_hadamard=trellis_exact_hadamard,
+            trellis_fp32_boundary=trellis_fp32_boundary,
+            trellis_direct_lut=trellis_direct_lut,
+            trellis_codebook=trellis_codebook,
+            trellis_pre_quantized_a=trellis_pre_quantized_a,
             direct_routing=direct_routing,
             external_route_plan=external_route_plan,
             work_source=work_source,

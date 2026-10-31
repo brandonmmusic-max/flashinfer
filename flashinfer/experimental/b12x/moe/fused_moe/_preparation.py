@@ -30,6 +30,7 @@ from ._impl import (
     tp_moe_required_nbytes,
 )
 from ._tuning import FC2_TUNING, ROUTE_TUNING, MoeDecodeConfig, MoeDecodeQuery, TUNING
+from b12x.moe._shared.trellis_codebooks import LUT_E4M3, PROCEDURAL_NPK
 from .planning import _packed_recipe
 from .weights import PreparedExperts
 from .execution import ExecutionCapacity, RoutingSpec
@@ -383,6 +384,9 @@ def _lower_caps(
             query.controls.get("w4a16_skip_empty_m_blocks", True)
         ),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
+        smallm_tokens=(
+            _query_smallm_capacity(query) if query.source_format == "trellismx" else 0
+        ),
     )
 
 
@@ -960,6 +964,47 @@ def _compact_launches(plan, caps):
     )
 
 
+def _trellis_kernel_options(plan) -> tuple[str | None, bool, bool]:
+    """Codebook and coupled-boundary flags the routed kernel must be built with.
+
+    ``plan.trellis_codebook`` is validated against the source format when the
+    plan is built, but nothing used to hand it to a kernel constructor, so a
+    ``trellismx`` plan compiled a kernel whose ``trellis_codebook`` was the
+    default ``lut_e4m3``: the procedural-NPK payload was then decoded through
+    the LUT table, which is a silent wrong answer, not a crash.
+
+    The two coupled-boundary flags follow the same source format, because
+    ``coupled-h512-h128-suh-svh-v1`` is what ``trellismx`` means: the
+    intermediate-axis Hadamards must normalize with a correctly-rounded
+    ``div.rn.f32`` (``trellis_exact_hadamard``) and the staging between the last
+    H128 and the E4M3 quantizer must stay FP32 (``trellis_fp32_boundary``).
+
+    Returns ``(codebook, exact_hadamard, fp32_boundary)``.  A ``trellismx``
+    plan that declares any other codebook raises here rather than compiling a
+    kernel that would decode the wrong way.
+    """
+
+    codebook = getattr(plan, "trellis_codebook", None)
+    source_format = str(getattr(plan, "source_format", "") or "").lower()
+    if not source_format:
+        # The dynamic branch receives a ``TPMoEPlan`` (the execution plan), which
+        # carries no source format of its own: it is on the ``MoESpec`` it was
+        # lowered from. Without this the trellismx codebook never reaches the
+        # kernel constructor, procedural_npk takes the m<=16 materialized
+        # branch of _w4a8_dynamic_materialized_enabled and the M=1 plan cannot
+        # be built at all.
+        spec = getattr(plan, "spec", None)
+        source_format = str(getattr(spec, "source_format", "") or "").lower()
+    if source_format != "trellismx":
+        return codebook, False, False
+    if codebook not in (None, PROCEDURAL_NPK):
+        raise ValueError(
+            "trellismx requires trellis_codebook="
+            f"{PROCEDURAL_NPK!r}; the plan declares {codebook!r}"
+        )
+    return PROCEDURAL_NPK, True, True
+
+
 def _program_carriers(
     scratch,
     caps,
@@ -983,6 +1028,17 @@ def _program_carriers(
             (w4a16_launches or _w4a16_primary_launches(scratch, caps)).carriers()
         )
     elif plan.implementation == "micro":
+        # The micro backend has neither a procedural-NPK arm nor a coupled
+        # boundary, so it must never serve a trellismx plan: it would run
+        # the payload through the default decode and return a silent wrong
+        # answer. Refuse before compiling anything.
+        micro_codebook, micro_exact, micro_fp32 = _trellis_kernel_options(plan)
+        if micro_exact or micro_fp32 or micro_codebook == PROCEDURAL_NPK:
+            raise ValueError(
+                "the micro backend cannot serve a trellismx plan: it has no "
+                "procedural_npk decode arm and no coupled "
+                "h512/h128/suh/svh boundary. Select backend='dynamic'."
+            )
         compact = compact_launches
         if compact is not None:
             launches.append(compact)
@@ -1056,6 +1112,18 @@ def _program_carriers(
     elif plan.implementation == "dynamic":
         exact_m = plan.routed_rows // plan.num_topk
         dynamic = _dynamic_program_arguments(plan, caps)
+        trellis_codebook, exact_hadamard, fp32_boundary = _trellis_kernel_options(plan)
+        trellis_options = {}
+        if trellis_codebook is not None:
+            trellis_options["trellis_codebook"] = trellis_codebook
+        if exact_hadamard:
+            trellis_options["trellis_exact_hadamard"] = True
+        if fp32_boundary:
+            trellis_options["trellis_fp32_boundary"] = True
+        if trellis_codebook == PROCEDURAL_NPK and _impl._TRELLISMX_PRE_QUANTIZED_A:
+            # The A operands come from the fused boundary, not from the
+            # kernel its run launches.
+            trellis_options["trellis_pre_quantized_a"] = True
         for dtype in (torch.int32, torch.int64):
             launch, _ = _impl._get_dynamic_kernel(
                 plan.weight_E,
@@ -1099,6 +1167,7 @@ def _program_carriers(
                 planned_tile_m=dynamic["planned_tile_m"],
                 mma_warps=dynamic["mma_warps"],
                 materialized_fc1_cta_budget=dynamic["materialized_fc1_cta_budget"],
+                **trellis_options,
             )
             launches.append(launch)
         if caps.output_layout == "routes":
@@ -1136,6 +1205,10 @@ class _FusedMoePrograms:
     w4a16: _W4A16PrimaryLaunches | None
     compact: object | None
     launchers: tuple
+    # TrellisMX: the small-M arm's program carriers, which belong to the arm's
+    # own plan rather than to the grouped scratch. Preparation loads them so
+    # the arm's first launch may be inside a capture.
+    trellismx: tuple = ()
 
 
 @program_cache(scope="preparation")
@@ -1156,6 +1229,111 @@ def compile_nvfp4_csf_programs(payload, ordinal):
         )
 
 
+def _query_smallm_tokens(query) -> int:
+    """The largest m a TrellisMX query sends to the small-M arm (0: none)."""
+
+    controls = query.controls
+    if not {"trellismx_smallm", "trellismx_smallm_limit"} <= set(controls):
+        raise ValueError(
+            "a TrellisMX query must carry the small-M policy plan_execution resolves"
+        )
+    from ._impl import _trellismx_smallm_tokens
+
+    return _trellismx_smallm_tokens(
+        (bool(controls["trellismx_smallm"]), int(controls["trellismx_smallm_limit"]))
+    )
+
+
+def _query_smallm_capacity(query) -> int:
+    """The small-M arm's token limit when this query's count uses the arm, else 0.
+
+    The arena reserves the arm's caller-owned buffers only for a variant the
+    arm serves: a larger variant never launches it, and reserving them there
+    would be unreachable scratch.
+    """
+
+    limit = _query_smallm_tokens(query)
+    return limit if 0 < int(query.num_tokens) <= limit else 0
+
+
+def _trellismx_smallm_arm(experts, query) -> object | None:
+    """The small-M arm this variant's token count serves, built by preparation.
+
+    Preparation resolves the arm's programs here with the rest of the plan
+    instead of on the first eager call, and the variant's arena reserves the
+    arm's caller-owned buffers (``_query_smallm_capacity``). A variant whose
+    token count the arm does not serve (above the limit, or the limit is 0)
+    gets none: its calls never reach it, and planning it would resolve programs
+    that no call launches. The plan is cached on the bundle, so the variants of
+    one composite plan share it; its programs are read-only and each binding
+    carves its own buffers.
+    """
+
+    if query.source_format != "trellismx":
+        return None
+    limit = _query_smallm_tokens(query)
+    if not 0 < int(query.num_tokens) <= limit:
+        return None
+    from ._impl import _trellismx_smallm_plan
+
+    return _trellismx_smallm_plan(experts, top_k=int(query.top_k), max_tokens=limit)
+
+
+@program_cache(scope="preparation")
+def _precompile_trellismx_programs(query, weight_plan, ordinal):
+    """Declare the programs a TrellisMX shape's calls launch outside the grouped
+    arm. A shape above the small-M limit runs the grouped arm only, so its input
+    and output stages are declared here; otherwise every call runs the small-M
+    arm wrapped by the fused input boundary (E4M3 mode) and fused output stage.
+    An export that freezes kernel resolution
+    rejects, so discovery compiles exactly the ones this shape's calls use.
+    Returns their program carriers, which compile_fused_moe returns with its
+    own: a compile factory must return every program it compiles.
+    """
+
+    from b12x.moe._shared.kernels.trellismx_boundary_fused import (
+        _compile_input,
+        _compile_output,
+    )
+
+    hidden = int(query.hidden_size)
+    bits = int(weight_plan.trellis_bits or 0)
+    # Compile for the device this job runs on: the job binds its device ordinal
+    # to the caller's selected device before the factory runs.
+    device = torch.device("cuda", int(ordinal))
+    # The arm decision the plan resolved (_impl._trellismx_smallm_policy); the
+    # prepared state stamps the same value on every binding and dispatch
+    # consumes it from there.
+    tokens = _query_smallm_tokens(query)
+    limit = int(query.controls["trellismx_smallm_limit"])
+    with torch.cuda.device(device):
+        if tokens and int(query.num_tokens) <= limit:
+            from b12x.moe._shared.kernels.trellismx_smallm import (
+                compile_smallm_programs,
+            )
+
+            return (
+                compile_smallm_programs(
+                    hidden_size=hidden,
+                    intermediate_size=int(query.intermediate_size),
+                    num_experts=int(query.num_experts),
+                    top_k=int(query.top_k),
+                    bits=int(bits),
+                    device=device,
+                    max_tokens=limit,
+                ),
+            )
+        return (
+            # The grouped arm's own input stage and output stage, at the token
+            # count this shape serves.
+            _compile_input(hidden, "e4m3", int(query.num_tokens), device),
+            *(
+                _compile_output(hidden, int(query.num_tokens), device, dtype)
+                for dtype in (torch.bfloat16, torch.float16, torch.float32)
+            ),
+        )
+
+
 @program_cache(scope="preparation")
 def compile_fused_moe(
     query_payload, config_payload, weight_payload, scale_counts, ordinal
@@ -1169,6 +1347,11 @@ def compile_fused_moe(
     )
     weight_plan = plan_b12x_fp4_moe_weights(**weight_args)
     caps = _lower_caps(query, config, weight_plan, torch.device("cuda", ordinal))
+    trellismx = (
+        _precompile_trellismx_programs(query, weight_plan, ordinal)
+        if query.source_format == "trellismx"
+        else ()
+    )
     scratch = plan_tp_moe_scratch(caps, prewarm_launches=True)
     w4a16 = (
         _w4a16_primary_launches(scratch, caps)
@@ -1193,9 +1376,11 @@ def compile_fused_moe(
             w4a16,
             compact,
             launchers,
+            trellismx=trellismx,
         ),
         *launchers,
         compact,
+        *trellismx,
     )
 
 
@@ -1211,6 +1396,12 @@ class _FusedMoeState:
     compact_launches: _CompactLaunches | None = None
     execution_experts: object | None = None
     a4_prefill: bool | None = None
+    # TrellisMX: the small-M arm's token limit this plan resolved and compiled;
+    # every binding carries it to dispatch. None for other source formats.
+    trellismx_smallm_tokens: int | None = None
+    # TrellisMX: the arm's plan and buffers when this variant's token count is
+    # one the arm serves, built here so dispatch only looks it up.
+    trellismx_smallm_plan: object | None = None
 
     def _precision_choice(self, requested):
         if self.a4_prefill is None:
@@ -1271,6 +1462,18 @@ class _FusedMoeState:
         experts = kwargs.pop("experts", self.experts)
         if experts is not self.experts:
             raise ValueError("prepared experts differ from the plan declaration")
+        if self.trellismx_smallm_tokens is not None:
+            # TrellisMX boundary and small-M programs are compiled for one exact
+            # token count, so a TrellisMX variant serves only the count it planned.
+            a = kwargs.get("a")
+            tokens = int(a.shape[0]) if isinstance(a, torch.Tensor) else 0
+            planned = int(self.scratch.caps.max_tokens)
+            if 0 < tokens != planned:
+                raise ValueError(
+                    f"a TrellisMX plan prepared for {planned} tokens cannot serve "
+                    f"{tokens}: its boundary programs are compiled per token count; "
+                    "plan the count as max_tokens or a warmup token count"
+                )
         kwargs["a4_prefill"] = self._precision_choice(kwargs.get("a4_prefill"))
         if self.config.nvfp4_share_input and not self.experts._impl.can_share_input(
             input_scales_static=True
@@ -1295,6 +1498,8 @@ class _FusedMoeState:
             self.scratch.bind(**kwargs),
             compact_launches=self.compact_launches,
             output_layout=self.scratch.caps.output_layout,
+            trellismx_smallm_tokens=self.trellismx_smallm_tokens,
+            trellismx_smallm_plan=self.trellismx_smallm_plan,
         )
 
     def run(self, binding):
@@ -1413,6 +1618,22 @@ class _FusedMoeCapacityState:
         return binding.run()
 
 
+def _validate_trellismx_declaration(experts, capacity, routing, invocation) -> None:
+    """Reject, while planning, what no TrellisMX arm executes."""
+
+    if routing.apply_router_weight_on_input:
+        raise ValueError(
+            "TrellisMX applies router weights in its top-k reduction; "
+            "apply_router_weight_on_input is not supported"
+        )
+    if routing.collect_activation_amax:
+        raise ValueError("TrellisMX cannot collect activation amax")
+    if capacity.route_num_experts not in (None, 0, experts.num_experts):
+        raise ValueError("TrellisMX does not take expert route maps")
+    if invocation.get("a4_prefill") is True:
+        raise ValueError("TrellisMX has no A4 prefill precision")
+
+
 def plan(
     experts: PreparedExperts,
     *,
@@ -1421,6 +1642,7 @@ def plan(
     invocation: FrozenMapping = FrozenMapping(),
     override: MoeDecodeConfig | None = None,
     scale_expansion=None,
+    smallm_max_tokens: int | None = None,
 ):
     """Declare prefill capacity and exact planned variants without GPU work."""
     if not isinstance(experts, PreparedExperts):
@@ -1436,7 +1658,55 @@ def plan(
         and type(invocation["a4_prefill"]) is not bool
     ):
         raise TypeError("a4_prefill must be a boolean or None")
+    if smallm_max_tokens is not None:
+        # The declaration is this package's small-M arm, so it means nothing for
+        # another source format or for a bundle an attached P8 runtime serves.
+        if experts._impl.source_format != "trellismx":
+            raise ValueError(
+                "smallm_max_tokens applies to trellismx experts; "
+                f"got source_format={experts._impl.source_format!r}"
+            )
+        from .trellismx_p8 import trellismx_p8_attachment
+
+        if trellismx_p8_attachment(experts) is not None:
+            raise ValueError(
+                "an attached P8 runtime serves every call; smallm_max_tokens "
+                "does not apply to its plan"
+            )
+    if experts._impl.source_format == "trellismx":
+        from .trellismx_p8 import plan_p8_execution, trellismx_p8_attachment
+
+        if trellismx_p8_attachment(experts) is not None:
+            # The attached runtime executes every call: plan it, not this
+            # package's arms (no compile jobs and no tuning race of programs
+            # that would never run).
+            return plan_p8_execution(
+                experts,
+                capacity=capacity,
+                routing=routing,
+                invocation=invocation,
+                override=override,
+                scale_expansion=scale_expansion,
+            )
+        _validate_trellismx_declaration(experts, capacity, routing, invocation)
     controls = _control_snapshot()
+    if experts._impl.source_format == "trellismx":
+        from ._impl import _trellismx_smallm_policy
+
+        # The small-M dispatch decision is part of what the plan compiles and
+        # serves, so it is resolved once here and kept in the plan's identity.
+        smallm, limit = _trellismx_smallm_policy(
+            experts._impl,
+            fast_math=bool(invocation.get("fast_math", True)),
+            max_tokens=smallm_max_tokens,
+        )
+        controls = FrozenMapping(
+            {
+                **controls.to_dict(),
+                "trellismx_smallm": smallm,
+                "trellismx_smallm_limit": limit,
+            }
+        )
     cutoff = min(experts.plan.activation.a16_max_tokens, capacity.max_tokens)
     counts = tuple(
         sorted(
@@ -1590,6 +1860,17 @@ def plan(
             launchers = tuple(launchers)
             carrier_tree = attach_programs(scratch, *launchers)
             load_programs(carrier_tree)
+            # The small-M arm's programs hang off the compile factory's own
+            # tree, not the grouped scratch, so load them here: preparation
+            # loads every variant before capture, and the arm's first launch
+            # may be the captured one (its Triton route pack included).
+            for trellismx_programs in programs.trellismx:
+                load_programs(trellismx_programs)
+            execution_experts = (
+                replace(experts._impl, nvfp4_csf=scale_decoder)
+                if scale_decoder is not None
+                else experts._impl
+            )
             return _FusedMoeState(
                 experts,
                 scratch,
@@ -1599,10 +1880,12 @@ def plan(
                 route_launcher,
                 programs.w4a16,
                 programs.compact,
-                replace(experts._impl, nvfp4_csf=scale_decoder)
-                if scale_decoder is not None
-                else experts._impl,
+                execution_experts,
                 a4_prefill=query.a4_prefill,
+                trellismx_smallm_tokens=_query_smallm_tokens(query)
+                if query.source_format == "trellismx"
+                else None,
+                trellismx_smallm_plan=_trellismx_smallm_arm(execution_experts, query),
             )
 
         return Plan(

@@ -22,10 +22,14 @@ from b12x.moe._shared.kernels.w4a8_phase2 import W4A8MaterializedPhase2Kernel
 from b12x._lib.dense_gemm.config import _expand_packed_b_stage_smem
 from b12x._lib.dense_gemm.config import _reshape_acc_to_mn
 from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
+from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad_dispatch
 from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_stage_trellis_b_tile
 from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_trellis_lane_geom
-from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_trellis_pair_words
 from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_trellis_permute_k32
+from b12x.moe._shared.kernels.w4a8_npk_decode import _w4a8_trellis_pair_words_codebook
+from b12x.moe._shared.trellis_codebooks import LUT_E4M3
+from b12x.moe._shared.trellis_codebooks import PROCEDURAL_NPK
+from b12x.moe._shared.trellis_codebooks import normalize_w4a8_arm_codebook
 from b12x._lib.intrinsics.atomics import atomic_add_global_i32
 from b12x._lib.intrinsics.atomics import atomic_add_shared_i32
 from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled
@@ -127,6 +131,27 @@ from b12x.moe._shared.kernels.dynamic.types import DynamicLaunchParams
 from b12x.moe._shared.kernels.routing_ids import local_expert_id
 
 
+@cute.jit
+def route_expert_id(
+    raw_expert,
+    num_experts: Int32,
+    raw_form: cutlass.Constexpr = False,
+):
+    """Resolve one routed id under the caller's selected contract.
+
+    ``raw_form=False`` is the shared contract: ``local_expert_id`` folds the
+    range test into the value, and the caller's own test then rejects the -1
+    sentinel. ``raw_form=True`` is the P8 contract: the raw id reaches the
+    caller, which range-tests it itself. Both admit exactly the same ids; the
+    selection exists because the P8 programs were compiled against the raw form
+    and their bytes are pinned.
+    """
+
+    if cutlass.const_expr(raw_form):
+        return raw_expert.to(Int32)
+    return local_expert_id(raw_expert, num_experts)
+
+
 class MoEDynamicKernelBackend:
     """Fused route/pack + expert-compute kernel with a pluggable work source."""
 
@@ -164,7 +189,17 @@ class MoEDynamicKernelBackend:
         mxfp6_fmt_b: str | None = None,
         trellis_bits: int | None = None,
         trellis_intermediate_hadamard: bool = False,
+        trellis_exact_hadamard: bool = False,
+        trellis_fp32_boundary: bool = False,
+        trellis_pre_quantized_a: bool = False,
         trellis_direct_lut: bool = False,
+        trellis_codebook: str = LUT_E4M3,
+        trellis_scaled: bool | None = None,
+        trellis_identity_boundary: bool = False,
+        p8_small_m: bool = False,
+        p8_fc1_tile_n: int = 128,
+        p8_scale_sandwich: bool = False,
+        p8_full_coupled: bool = False,
     ):
         """Record the dynamic-kernel specialization and reject unsupported recipe
         combinations.
@@ -193,6 +228,9 @@ class MoEDynamicKernelBackend:
         swiglu_beta = normalize_swiglu_beta_for_activation(activation, swiglu_beta)
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
+        # The routed tile shape, recorded before the derived geometry so a
+        # subclass hook can select owners from it.
+        self.mma_tiler_mn = (int(mma_tiler_mn[0]), int(mma_tiler_mn[1]))
         self.sf_vec_size = sf_vec_size
         self.fast_math = fast_math
         self.activation = activation
@@ -310,16 +348,21 @@ class MoEDynamicKernelBackend:
         self.mxfp6_fmt_b = mxfp6_fmt_b
         self.is_w4a8 = quant_recipe in ("w4a8_mx", "w4a8_nvfp4", "w4a8_trellis")
         self.w4a8_residual = quant_recipe == "w4a8_nvfp4"
-        # w4a8_trellis: ``lut_e4m3`` trellis payload decoded to
-        # fully-scaled E4M3 in the MMA warps (identity UE8M0 SFB). It rides
-        # the repacked W4A8 pipeline shape: producer-staged B windows, named
-        # pipeline, no B TMA; only the B staging, expansion, and MMA operand
-        # format differ.
+        # w4a8_trellis: trellis payload decoded to fully-scaled E4M3 in the
+        # MMA warps (identity UE8M0 SFB). It rides the repacked W4A8 pipeline
+        # shape: producer-staged B windows, named pipeline, no B TMA; only the
+        # B staging, expansion, and MMA operand format differ.
+        # ``trellis_codebook`` selects the decode law: ``lut_e4m3`` gathers a
+        # 4 KiB value table staged in shared memory, ``procedural_npk``
+        # computes each E4M3 byte from its 16-bit window with no table at all.
         self.w4a8_trellis = quant_recipe == "w4a8_trellis"
         if self.w4a8_trellis:
-            if trellis_bits not in (2, 3, 4):
+            # K5 is the P8 rate: its eight-window span needs the third ring
+            # word, which only the procedural-NPK decoder reads (the value
+            # table is rate-indexed up to K4).
+            if trellis_bits not in (2, 3, 4, 5):
                 raise ValueError(
-                    "w4a8_trellis requires trellis_bits in {2, 3, 4}, "
+                    "w4a8_trellis requires trellis_bits in {2, 3, 4, 5}, "
                     f"got {trellis_bits!r}"
                 )
             if not w4a8_repacked:
@@ -348,7 +391,90 @@ class MoEDynamicKernelBackend:
                 "trellis_intermediate_hadamard requires quant_recipe='w4a8_trellis'"
             )
         self.trellis_intermediate_hadamard = bool(trellis_intermediate_hadamard)
+        # The coupled intermediate boundary ends each in-kernel H128 with a
+        # normalization. The default keeps QSRT's terminal multiply by the
+        # rounded reciprocal; ``trellis_exact_hadamard`` divides instead
+        # (div.rn.f32), which is the order TrellisMX declares, because a
+        # reciprocal multiply can move an E4M3 tie by one code.
+        self.trellis_exact_hadamard = bool(trellis_exact_hadamard)
+        if self.trellis_exact_hadamard and not (
+            self.w4a8_trellis and self.trellis_intermediate_hadamard
+        ):
+            raise ValueError(
+                "trellis_exact_hadamard requires quant_recipe='w4a8_trellis' "
+                "with trellis_intermediate_hadamard=True; it selects the "
+                "normalization form of the coupled intermediate boundary"
+            )
+        # The coupled boundary's output feeds the E4M3 K32 quantizer. The
+        # default stages it through the BF16 sC tile (one rounding); the
+        # release keeps FP32 continuity up to the quantizer and stages it in
+        # its own FP32 region. Opt-in because it changes the shared-memory
+        # budget by epi_tile[0]*tile_n*4 bytes.
+        self.trellis_fp32_boundary = bool(trellis_fp32_boundary)
+        if self.trellis_fp32_boundary and not (
+            self.w4a8_trellis and self.trellis_intermediate_hadamard
+        ):
+            raise ValueError(
+                "trellis_fp32_boundary requires quant_recipe='w4a8_trellis' "
+                "with trellis_intermediate_hadamard=True; it selects the "
+                "staging dtype of the coupled intermediate boundary"
+            )
+        self.trellis_codebook = normalize_w4a8_arm_codebook(trellis_codebook)
+        if self.trellis_codebook != LUT_E4M3 and not self.w4a8_trellis:
+            raise ValueError(
+                f"trellis_codebook={self.trellis_codebook!r} requires "
+                "quant_recipe='w4a8_trellis'"
+            )
+        if trellis_direct_lut and self.trellis_codebook == PROCEDURAL_NPK:
+            raise ValueError(
+                "trellis_direct_lut precomposes the lut_e4m3 value table; it "
+                "does not apply to trellis_codebook='procedural_npk'"
+            )
         self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
+        if trellis_bits == 5 and self.trellis_codebook != PROCEDURAL_NPK:
+            raise ValueError(
+                "K5 needs the procedural_npk decode law; the lut_e4m3 value "
+                "table is rate-indexed up to K4"
+            )
+        # Only the lut_e4m3 arm reads the 4 KiB value table; procedural_npk
+        # decodes in registers, so its specialization neither stages the table
+        # nor reserves the shared-memory region for it.
+        self.w4a8_trellis_lut = self.w4a8_trellis and self.trellis_codebook == LUT_E4M3
+        # A scaled trellis arm consumes the released UE8M0/K32 weight plane
+        # through the logical ``sfb_*_mx`` operands instead of the identity
+        # word, exactly as the release's monolithic arm does. The default keeps
+        # the procedural_npk pairing (only that law carries the plane; the
+        # lut_e4m3 arm decodes to a fully-scaled E4M3 alphabet and keeps the
+        # identity word bit for bit); an explicit ``trellis_scaled`` overrides
+        # it for a caller that names the plane itself.
+        if trellis_scaled is None:
+            self.trellis_scaled = (
+                self.w4a8_trellis and self.trellis_codebook == PROCEDURAL_NPK
+            )
+        else:
+            self.trellis_scaled = self.w4a8_trellis and bool(trellis_scaled)
+        # ``trellis_identity_boundary``: the FC1 epilogue applies the ordinary
+        # gated activation to the two raw projections and leaves the H128
+        # transform to the materialized phases, instead of rotating the gate
+        # and up slices in the dynamic kernel. Mutually exclusive with the
+        # coupled boundary (the shared ``trellis_intermediate_hadamard``).
+        if trellis_identity_boundary and not self.w4a8_trellis:
+            raise ValueError(
+                "trellis_identity_boundary requires quant_recipe='w4a8_trellis'"
+            )
+        if trellis_identity_boundary and self.trellis_intermediate_hadamard:
+            raise ValueError("identity and coupled trellis boundaries are exclusive")
+        self.trellis_identity_boundary = bool(trellis_identity_boundary)
+        # ``trellis_pre_quantized_a``: the caller supplies FC1's A operand
+        # already quantized (E4M3 payload [T, H] in the native K32
+        # permutation + UE8M0 scales [T, H/32], one byte per K32 block), so
+        # the kernel runs no activation producer for FC1 and gathers both
+        # operands through ``token_map`` by token row. It exists because the
+        # TrellisMX input boundary (bf16 -> fp16 -> H512 -> gate_up_suh ->
+        # H128 -> E4M3/UE8M0-k32) must not be applied twice: the kernel's own
+        # producer would add a second H128. The FC2 intermediate producer and
+        # its K32 permutation are untouched.
+        self.trellis_pre_quantized_a = bool(trellis_pre_quantized_a)
         self.w4a8_repacked = bool(w4a8_repacked)
         self.w4a8_n64_repacked = bool(w4a8_n64_repacked)
         self.w4a8_n64_tail = bool(w4a8_n64_tail)
@@ -359,11 +485,84 @@ class MoEDynamicKernelBackend:
         self.direct_routing = bool(direct_routing)
         self.external_route_plan = bool(external_route_plan)
         self.materialize_intermediate = bool(materialize_intermediate)
+        # --- P8 owners ------------------------------------------------------
+        # The P8 arms (TrellisMX procedural-NPK on SM120) run this same body:
+        # an exact input boundary, a set of external phase-1/phase-2 owners,
+        # and the identity or coupled activation boundary. Each flag below
+        # defaults off, and the code each one selects is the code the shared
+        # recipes already trace; ``_owner_phase_kernels`` (a hook with no base
+        # implementation) installs the P8 owners.
+        self.p8_small_m = bool(p8_small_m)
+        self.p8_fc1_tile_n = int(p8_fc1_tile_n)
+        self.p8_scale_sandwich = bool(p8_scale_sandwich)
+        self.p8_full_coupled = bool(p8_full_coupled)
+        self.p8_grouped_m32 = bool(
+            self.p8_full_coupled
+            and self.materialize_intermediate
+            and not self.direct_routing
+            and mma_tiler_mn == (32, 128)
+            and share_input_across_experts
+            and deterministic_output
+            and quant_recipe == "w4a8_trellis"
+            and self.trellis_codebook == PROCEDURAL_NPK
+            and self.trellis_scaled
+            and self.w4a8_repacked
+        )
+        # Routing-id and producer-split selections: class attributes a P8
+        # subclass turns on, so the base class keeps the shared forms.
+        self.p8_route_ids = bool(getattr(self, "p8_route_ids", False))
+        self.p8_producer_split = bool(getattr(self, "p8_producer_split", False))
+        # Opt-in closure diagnostic only. The P8 wrapper may enable this on a
+        # dedicated compiled arm and provide a 512-byte carrier through the
+        # otherwise compile-time-dead NPK trellis_lut operand. The ordinary
+        # serving specialization leaves it false and emits no trace stores.
+        self.p8_input_prequant_diagnostic = False
+        if self.p8_full_coupled and not self.p8_scale_sandwich:
+            raise ValueError("full-coupled P8 requires the scale sandwich")
+        if self.p8_full_coupled and self.trellis_identity_boundary:
+            raise ValueError("full-coupled P8 cannot advertise identity boundary")
+        if self.p8_fc1_tile_n not in (32, 64, 128):
+            raise ValueError("P8 FC1 N must be 32, 64, or 128")
+        if self.p8_fc1_tile_n != 128 and not self.p8_small_m:
+            raise ValueError("Narrow FC1 requires P8 small-M")
+        if self.p8_scale_sandwich and not (
+            (self.p8_small_m and self.p8_fc1_tile_n == 128)
+            or (
+                self.p8_full_coupled
+                and self.materialize_intermediate
+                and (mma_tiler_mn == (64, 128) or self.p8_grouped_m32)
+                and share_input_across_experts
+                and deterministic_output
+                and not self.direct_routing
+            )
+        ):
+            raise ValueError(
+                "P8 scale sandwich requires exact M1 or full-coupled "
+                "M32-or-M64/N128 ownership"
+            )
+        if self.p8_small_m and not (
+            quant_recipe == "w4a8_trellis"
+            and self.trellis_codebook == PROCEDURAL_NPK
+            and trellis_bits in (3, 4, 5)
+            and self.trellis_scaled
+            and (self.trellis_identity_boundary or self.p8_full_coupled)
+            and deterministic_output
+            and self.w4a8_repacked
+            and self.direct_routing
+            and self.materialize_intermediate
+            and share_input_across_experts
+            and mma_tiler_mn in {(16, 128), (32, 128)}
+            and activation == "silu"
+            and num_topk == 8
+            and not self.trellis_intermediate_hadamard
+            and not self.trellis_direct_lut
+        ):
+            raise ValueError("P8 small-M requires the frozen M1 scaled-NPK contract")
         self.w4a8_m1_materialized = bool(
             self.w4a8_repacked
             and self.direct_routing
             and self.materialize_intermediate
-            and mma_tiler_mn == (16, 128)
+            and mma_tiler_mn in {(16, 128), (32, 128)}
         )
         self.w4a8_m16_materialized = bool(
             self.w4a8_repacked
@@ -385,7 +584,55 @@ class MoEDynamicKernelBackend:
             self.w4a8_m16_materialized
             or self.w4a8_m64_materialized
             or self.w4a8_m128_materialized
+            or self.p8_grouped_m32
         )
+        if self.trellis_pre_quantized_a and not (
+            self.w4a8_trellis
+            and self.trellis_codebook == PROCEDURAL_NPK
+            and not self.materialize_intermediate
+            and not self.w4a8_n64_repacked
+            and not self.direct_routing
+            # The caller's operand buffers are indexed by TOKEN row, which is
+            # what token_map holds when the scatter stores token indices.
+            # deterministic_output stores routed-pair indices instead and the
+            # gather's /num_topk recovery does not reproduce the token row in
+            # this arm (measured: mixed M=8, cos -0.015 vs 0.9996), so refuse
+            # it rather than run it wrong.
+            and not deterministic_output
+        ):
+            raise ValueError(
+                "trellis_pre_quantized_a requires quant_recipe='w4a8_trellis', "
+                "trellis_codebook='procedural_npk', "
+                "materialize_intermediate=False, w4a8_n64_repacked=False and "
+                "direct_routing=False and deterministic_output=False (the "
+                "monolithic arm that gathers FC1 A through token_map)"
+            )
+        # Which phase kernels a P8 owner replaces. When both are owned, the
+        # procedural-NPK split materialization is decoded by the P8 phase
+        # subclasses; otherwise the shared phase kernels must carry the law
+        # themselves, which they do not.
+        self._p8_owns_phase1 = bool(
+            self.p8_grouped_m32
+            or (self.p8_full_coupled and self.w4a8_m64_materialized)
+            or self.p8_scale_sandwich
+            or self.p8_fc1_tile_n != 128
+        )
+        self._p8_owns_phase2 = bool(
+            self.p8_grouped_m32
+            or (self.p8_full_coupled and self.w4a8_m64_materialized)
+            or self.p8_small_m
+        )
+        if (
+            self.w4a8_split_materialized
+            and self.trellis_codebook == PROCEDURAL_NPK
+            and not (self._p8_owns_phase1 and self._p8_owns_phase2)
+        ):
+            raise NotImplementedError(
+                "trellis_codebook='procedural_npk' is implemented for the "
+                "monolithic w4a8_trellis kernels and the P8 phase owners only; "
+                "the shared split-materialized phase kernels (w4a8_phase1.py, "
+                "w4a8_phase2.py) have no codebook selection yet"
+            )
         # NVFP4 split-materialized (large-M prefill): the cooperative kernel
         # keeps only the routing/input-quantization front-end (it publishes
         # the expert-major packed-A + swizzled-SFA domain and the deferred
@@ -407,9 +654,20 @@ class MoEDynamicKernelBackend:
         # sources; NVFP4 uses M128. They consume caller-owned workspace on the
         # routing/input-quantization launch's CUDA stream.
         self.external_materialized_fc1 = bool(
-            self.w4a8_split_materialized or self.nvfp4_split_materialized
+            self.w4a8_split_materialized
+            or self.nvfp4_split_materialized
+            or self.p8_fc1_tile_n != 128
+            # The N128 M1 scale-sandwich/full-coupled boundary is implemented
+            # only by the P8 H128 FC1 owner. Leaving it in the monolithic
+            # consumer silently skips H128/svh and makes that owner (and its
+            # diagnostic subclass) dead code.
+            or (self.p8_small_m and self.p8_scale_sandwich)
         )
-        self.external_materialized_fc2 = self.external_materialized_fc1
+        self.external_materialized_fc2 = bool(
+            self.w4a8_split_materialized
+            or self.nvfp4_split_materialized
+            or self.p8_small_m
+        )
         if type(
             materialized_fc1_cta_budget
         ) is not int or materialized_fc1_cta_budget not in (2, 3):
@@ -431,6 +689,37 @@ class MoEDynamicKernelBackend:
             if (self.w4a8_split_materialized or self.nvfp4_split_materialized)
             else 128
         )
+        if self.p8_grouped_m32:
+            # Inert upstream placeholders require M64/M128. Both are replaced
+            # by the M16 P8 owners before any launch.
+            materialized_source_tile_m = 64
+        # The shared W4A8 phase kernels accept rates 2-4 only; K5 lives in the
+        # P8 phase subclasses. A base kernel built here is replaced by a P8
+        # owner whenever that owner is active, and the discarded instance is
+        # never launched, so at K5 it is built inert (no trellis) rather than
+        # with a rate the parent cannot express. If no P8 owner would replace
+        # it, the rate is passed through unchanged and the parent's own
+        # validation rejects K5, which is the correct outcome.
+        _base_bits_unsupported = trellis_bits is not None and int(trellis_bits) not in (
+            2,
+            3,
+            4,
+        )
+        # An inert base kernel must be inert in every trellis argument, not only
+        # the rate: the parent rejects trellis_scaled/coupled/identity without a
+        # payload. Treating the discarded instance as non-split reproduces the
+        # documented inert specialization.
+        _p1_split = self.w4a8_split_materialized and not (
+            _base_bits_unsupported and self._p8_owns_phase1
+        )
+        _p2_split = self.w4a8_split_materialized and not (
+            _base_bits_unsupported and self._p8_owns_phase2
+        )
+        # The shared phase kernels only carry a trellis specialization when no
+        # P8 owner replaces them: they cannot decode procedural NPK, and a
+        # discarded instance is built inert in every trellis argument.
+        _p1_shared = _p1_split and not self._p8_owns_phase1
+        _p2_shared = _p2_split and not self._p8_owns_phase2
         if self.nvfp4_split_materialized:
             # NVFP4 split: the phase kernels consume the ORIGINAL swizzled
             # FP4 weights and the expert-major packed-A/SFA domain the
@@ -463,24 +752,23 @@ class MoEDynamicKernelBackend:
                 n64_repacked=self.w4a8_n64_repacked,
                 n64_tail=self.w4a8_n64_tail,
                 trellis_bits=(
-                    trellis_bits
-                    if self.w4a8_trellis and self.w4a8_split_materialized
-                    else None
+                    trellis_bits if self.w4a8_trellis and _p1_shared else None
                 ),
                 trellis_intermediate_hadamard=(
-                    self.trellis_intermediate_hadamard and self.w4a8_split_materialized
+                    self.trellis_intermediate_hadamard and _p1_shared
                 ),
-                trellis_direct_lut=(
-                    self.trellis_direct_lut and self.w4a8_split_materialized
+                trellis_direct_lut=(self.trellis_direct_lut and _p1_shared),
+                trellis_codebook=(self.trellis_codebook if _p1_shared else LUT_E4M3),
+                trellis_scaled=(self.trellis_scaled and _p1_shared),
+                trellis_identity_boundary=(
+                    self.trellis_identity_boundary and _p1_shared
                 ),
                 # This helper is gated-only and is never launched unless the
                 # split materialized path is active.  Use a valid inert
                 # specialization for non-split activations (notably ReLU2)
                 # instead of rejecting them during otherwise valid
                 # monolithic-kernel construction.
-                activation=(
-                    self.activation if self.w4a8_split_materialized else "silu"
-                ),
+                activation=(self.activation if _p1_shared else "silu"),
             )
             self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
                 source_tile_m=materialized_source_tile_m,
@@ -488,14 +776,24 @@ class MoEDynamicKernelBackend:
                 n64_repacked=self.w4a8_n64_repacked,
                 n64_tail=self.w4a8_n64_tail,
                 trellis_bits=(
-                    trellis_bits
-                    if self.w4a8_trellis and self.w4a8_split_materialized
-                    else None
+                    trellis_bits if self.w4a8_trellis and _p2_shared else None
                 ),
-                trellis_direct_lut=(
-                    self.trellis_direct_lut and self.w4a8_split_materialized
+                trellis_direct_lut=(self.trellis_direct_lut and _p2_shared),
+                trellis_codebook=(self.trellis_codebook if _p2_shared else LUT_E4M3),
+                trellis_scaled=(self.trellis_scaled and _p2_shared),
+                trellis_identity_boundary=(
+                    self.trellis_identity_boundary and _p2_shared
                 ),
             )
+        owner = self._owner_phase_kernels(
+            materialized_source_tile_m,
+            trellis_bits,
+            bool(deterministic_output),
+            _p1_split,
+            _p2_split,
+        )
+        if owner is not None:
+            self.materialized_phase1_kernel, self.materialized_phase2_kernel = owner
         if self.w4a8_repacked and quant_recipe not in ("w4a8_mx", "w4a8_trellis"):
             raise ValueError(
                 "repacked W4A8 weights are only valid for w4a8_mx or w4a8_trellis"
@@ -549,7 +847,11 @@ class MoEDynamicKernelBackend:
                     quant_recipe == "w4a8_mx"
                     or (
                         quant_recipe == "w4a8_trellis"
-                        and mma_tiler_mn in {(64, 128), (128, 128)}
+                        and (
+                            mma_tiler_mn in {(64, 128), (128, 128)}
+                            or self.p8_small_m
+                            or self.p8_grouped_m32
+                        )
                     )
                 )
                 and mma_tiler_mn in {(16, 128), (32, 128), (64, 128), (128, 128)}
@@ -566,14 +868,15 @@ class MoEDynamicKernelBackend:
             (
                 quant_recipe == "nvfp4"
                 or (self.w4a8_repacked and quant_recipe == "w4a8_mx")
+                or self.p8_small_m
             )
             and work_source != _WORK_SOURCE_READY_QUEUE
             and (
                 not self.materialize_intermediate
                 or (
                     self.w4a8_repacked
-                    and quant_recipe == "w4a8_mx"
-                    and mma_tiler_mn == (16, 128)
+                    and (quant_recipe == "w4a8_mx" or self.p8_small_m)
+                    and mma_tiler_mn in {(16, 128), (32, 128)}
                 )
             )
         ):
@@ -710,7 +1013,14 @@ class MoEDynamicKernelBackend:
             if share_input_across_experts and (self.is_w4a8 or mma_tiler_mn[0] == 16)
             else 1
         )
-        if (
+        if self.p8_producer_split:
+            # The P8 arms keep two input warps per shared-input token: every
+            # K/32 block is still quantized once, and the pair-owned producer
+            # keeps the per-token H512 unit inside one warp.
+            self.input_warps_per_token = (
+                2 if self.is_w4a8 and share_input_across_experts else 1
+            )
+        elif (
             share_input_across_experts
             and self.is_w4a8
             and self.external_materialized_fc1
@@ -783,6 +1093,25 @@ class MoEDynamicKernelBackend:
         )
         self.load_register_requirement = 64 if self.csf_inline_scales else 32
         self.mma_register_requirement = 232
+
+    def _owner_phase_kernels(
+        self,
+        materialized_source_tile_m,
+        trellis_bits,
+        deterministic_output,
+        phase1_split,
+        phase2_split,
+    ):
+        """Install recipe-specific phase-1/phase-2 owners, or keep the shared ones.
+
+        ``__init__`` builds the shared W4A8 phase kernels first and calls this
+        hook once. A subclass returns ``(phase1, phase2)`` to replace them; the
+        base returns ``None`` so every shared recipe keeps the kernels it just
+        built. The P8 specialization overrides it in its own module, which
+        keeps this module's import closure free of the P8 kernels.
+        """
+
+        return None
 
     def _thrfrg_SFA(self, sfa_tensor, tiled_mma):
         return self._dense_cls._thrfrg_SFA(self, sfa_tensor, tiled_mma)
@@ -2210,6 +2539,14 @@ class MoEDynamicKernelBackend:
             ] // 2 >= (self.tile_shape_mnk[0] * self.tile_shape_mnk[2]), (
                 "w4a8 needs ab_stage >= 2 to repurpose the sA staging region"
             )
+        if cutlass.const_expr(self.p8_scale_sandwich or self.p8_full_coupled):
+            assert trellis_rotations is not None, (
+                "P8 transforms require the explicit FP16 transform/scale carrier"
+            )
+        if cutlass.const_expr(self.w4a8_trellis and self.trellis_scaled):
+            assert w13_sfb_rp is not None and down_sfb_rp is not None, (
+                "scaled trellis requires explicit repacked UE8M0 scales"
+            )
         if cutlass.const_expr(sfb_w13_mx is None):
             sfb_w13_mx = row_counts  # unused placeholder under nvfp4
         if cutlass.const_expr(sfb_down_mx is None):
@@ -2381,6 +2718,13 @@ class MoEDynamicKernelBackend:
                     stream,
                 )
             else:
+                phase1_experts = task_expert
+                # Every direct M1 owner, including N128 full coupling, consumes
+                # original route ids. Phase 0 does not populate grouped
+                # task_expert on this path. Dense prefill still consumes
+                # grouped task metadata.
+                if cutlass.const_expr(self.p8_small_m or self.p8_fc1_tile_n != 128):
+                    phase1_experts = topk_ids
                 self.materialized_phase1_kernel(
                     packed_a_storage,
                     scale_storage,
@@ -2389,7 +2733,7 @@ class MoEDynamicKernelBackend:
                     intermediate_u32,
                     token_map,
                     token_weights,
-                    task_expert,
+                    phase1_experts,
                     task_valid_rows,
                     expert_tile_base,
                     alpha,
@@ -2421,25 +2765,55 @@ class MoEDynamicKernelBackend:
                     stream,
                 )
             else:
-                self.materialized_phase2_kernel(
-                    intermediate_u32,
-                    down_rp,
-                    down_sfb_rp,
-                    scatter_output,
-                    token_map,
-                    token_weights,
-                    task_expert,
-                    task_valid_rows,
-                    expert_tile_base,
-                    down_alpha,
-                    global_scale,
-                    trellis_lut,
-                    gate_tile_cnt,
-                    Int32(b_down.shape[0]) // Int32(256),
-                    max_active_clusters,
-                    Int32(0),
-                    stream,
-                )
+                # M1 consumes original route-order ids; dense FC2 consumes
+                # grouped task metadata. Neither path reads routing state back
+                # on the host.
+                phase2_experts = task_expert
+                if cutlass.const_expr(self.p8_small_m):
+                    phase2_experts = topk_ids
+                if cutlass.const_expr(self.p8_small_m or self.p8_full_coupled):
+                    self.materialized_phase2_kernel(
+                        intermediate_u32,
+                        down_rp,
+                        down_sfb_rp,
+                        scatter_output,
+                        token_map,
+                        token_weights,
+                        phase2_experts,
+                        task_valid_rows,
+                        expert_tile_base,
+                        down_alpha,
+                        global_scale,
+                        trellis_lut,
+                        trellis_rotations,
+                        gate_tile_cnt,
+                        Int32(b_down.shape[0]) // Int32(256),
+                        max_active_clusters,
+                        stream,
+                    )
+                else:
+                    self.materialized_phase2_kernel(
+                        intermediate_u32,
+                        down_rp,
+                        down_sfb_rp,
+                        scatter_output,
+                        token_map,
+                        token_weights,
+                        phase2_experts,
+                        task_valid_rows,
+                        expert_tile_base,
+                        down_alpha,
+                        global_scale,
+                        trellis_lut,
+                        gate_tile_cnt,
+                        Int32(b_down.shape[0]) // Int32(256),
+                        max_active_clusters,
+                        # The shared phase-2 launch takes the fused-route pair
+                        # count; this arm publishes grouped task metadata
+                        # instead.
+                        Int32(0),
+                        stream,
+                    )
 
     @cute.kernel
     def kernel(
@@ -2644,7 +3018,20 @@ class MoEDynamicKernelBackend:
                 self.sC_storage_align_bytes,
             ]
             trellis_lut_smem: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint8, 4096 if self.w4a8_trellis else 16],
+                cute.struct.MemRange[
+                    cutlass.Uint8, 4096 if self.w4a8_trellis_lut else 16
+                ],
+                16,
+            ]
+            trellis_f32_stage: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32,
+                    (
+                        self.epi_tile[0] * self.tile_shape_mnk[1]
+                        if self.trellis_fp32_boundary
+                        else 4
+                    ),
+                ],
                 16,
             ]
             reduce_scratch: cute.struct.MemRange[cutlass.Float32, 5]
@@ -2752,6 +3139,13 @@ class MoEDynamicKernelBackend:
                 epi_smem_staged.outer,
                 swizzle=epi_smem_staged.inner,
             )
+        if cutlass.const_expr(self.trellis_fp32_boundary):
+            # Unswizzled FP32 staging for the coupled boundary's output: the
+            # quantizer below reads exactly the values the boundary produced,
+            # with no BF16 round trip in between.
+            sTrellisF32 = storage.trellis_f32_stage.get_tensor(
+                cute.make_layout((self.epi_tile[0], self.epi_tile[1]))
+            )
         ctrl_base_addr = shared_ptr_to_u32(storage.ctrl.data_ptr())
         if cutlass.const_expr(self.w4a8_repacked):
             sC_base_addr = (
@@ -2761,10 +3155,11 @@ class MoEDynamicKernelBackend:
             )
         sfa_base_addr = ctrl_base_addr + Int32(Storage._offsets["sSFA"])
         reduce_scratch_addr = ctrl_base_addr + Int32(Storage._offsets["reduce_scratch"])
-        if cutlass.const_expr(self.w4a8_trellis):
+        if cutlass.const_expr(self.w4a8_trellis_lut):
             # Stage the 4 KiB value table once; every later decode gathers
             # from shared memory. The phase-0 grid barrier orders the copy
-            # ahead of any consumer decode.
+            # ahead of any consumer decode. procedural_npk decodes from the
+            # ring words in registers and skips this entirely.
             trellis_lut_smem_base = ctrl_base_addr + Int32(
                 Storage._offsets["trellis_lut_smem"]
             )
@@ -2817,6 +3212,13 @@ class MoEDynamicKernelBackend:
             # E4M3 payload: one byte per element; UE8M0 scales per 32 elements.
             output_bytes_per_row = cols
             mx_blocks_per_row = cols // Int32(32)
+            # Zero when the caller owns FC1's A operand: every producer loop
+            # below is then empty, so the kernel neither quantizes nor writes
+            # packed_a_storage / scale_storage, while the route/token_map
+            # publication that the gather needs still runs.
+            a_produce_blocks = mx_blocks_per_row
+            if cutlass.const_expr(self.trellis_pre_quantized_a):
+                a_produce_blocks = Int32(0)
         elif cutlass.const_expr(self.is_mxf8):
             output_bytes_per_row = cols
             mx_blocks_per_row = sf_blocks_per_row  # unused placeholder
@@ -2926,8 +3328,8 @@ class MoEDynamicKernelBackend:
             if m1_lane_id == Int32(0):
                 m1_route_idx = Int32(0)
                 while m1_route_idx < total_pairs:
-                    m1_route_expert_id = local_expert_id(
-                        topk_ids[m1_route_idx], num_experts
+                    m1_route_expert_id = route_expert_id(
+                        topk_ids[m1_route_idx], num_experts, self.p8_route_ids
                     )
                     if (
                         m1_route_expert_id >= Int32(0)
@@ -2940,44 +3342,85 @@ class MoEDynamicKernelBackend:
             m1_has_active_route = cute.arch.shuffle_sync(m1_has_active_route, Int32(0))
 
             if m1_has_active_route > Int32(0):
-                m1_blk_idx = flat_tid
-                while m1_blk_idx < mx_blocks_per_row:
-                    m1_block_start = m1_blk_idx * Int32(32)
-                    m1_values, m1_block_max = _load_bf16x32_to_f32(
+                if cutlass.const_expr(self.p8_full_coupled):
+                    self._store_p8_m1_full_coupled_input(
                         a_input,
-                        m1_block_start,
+                        packed_a_storage,
+                        scale_storage,
+                        trellis_rotations,
+                        trellis_lut,
+                        m1_lane_id,
+                        flat_tid,
+                        flat_stride,
+                        num_tokens,
+                        mx_blocks_per_row,
                     )
-                    if cutlass.const_expr(self.w4a8_trellis):
-                        m1_payload, m1_mx_scale_byte = self._quantize_mx(
-                            _w4a8_trellis_permute_k32(m1_values),
-                            m1_block_max,
+                elif cutlass.const_expr(self.p8_scale_sandwich):
+                    self._store_p8_m1_scaled_input(
+                        a_input,
+                        packed_a_storage,
+                        scale_storage,
+                        trellis_rotations,
+                        m1_lane_id,
+                        flat_tid,
+                        flat_stride,
+                        mx_blocks_per_row,
+                    )
+                else:
+                    m1_blk_idx = flat_tid
+                    while m1_blk_idx < a_produce_blocks:
+                        m1_block_start = m1_blk_idx * Int32(32)
+                        m1_values, m1_block_max = _load_bf16x32_to_f32(
+                            a_input,
+                            m1_block_start,
                         )
-                    else:
-                        m1_payload, m1_mx_scale_byte = self._quantize_mx(
-                            m1_values,
-                            m1_block_max,
+                        if cutlass.const_expr(self.w4a8_trellis):
+                            m1_payload, m1_mx_scale_byte = self._quantize_mx(
+                                _w4a8_trellis_permute_k32(m1_values),
+                                m1_block_max,
+                            )
+                        else:
+                            m1_payload, m1_mx_scale_byte = self._quantize_mx(
+                                m1_values,
+                                m1_block_max,
+                            )
+                        for m1_payload_pair in cutlass.range_constexpr(4):
+                            m1_packed64 = (
+                                Uint64(m1_payload[m1_payload_pair * 2 + 1])
+                                << Uint64(32)
+                            ) | Uint64(m1_payload[m1_payload_pair * 2])
+                            st_global_u64(
+                                get_ptr_as_int64(
+                                    packed_a_storage,
+                                    m1_block_start + Int32(m1_payload_pair * 8),
+                                ),
+                                m1_packed64,
+                            )
+                        scale_storage[m1_blk_idx] = Uint8(
+                            m1_mx_scale_byte & Uint32(0xFF)
                         )
-                    for m1_payload_pair in cutlass.range_constexpr(4):
-                        m1_packed64 = (
-                            Uint64(m1_payload[m1_payload_pair * 2 + 1]) << Uint64(32)
-                        ) | Uint64(m1_payload[m1_payload_pair * 2])
-                        st_global_u64(
-                            get_ptr_as_int64(
-                                packed_a_storage,
-                                m1_block_start + Int32(m1_payload_pair * 8),
-                            ),
-                            m1_packed64,
-                        )
-                    scale_storage[m1_blk_idx] = Uint8(m1_mx_scale_byte & Uint32(0xFF))
-                    m1_blk_idx += flat_stride
+                        m1_blk_idx += flat_stride
 
             if flat_tid < total_pairs:
-                m1_slot_expert_id = local_expert_id(topk_ids[flat_tid], num_experts)
+                m1_slot_expert_id = route_expert_id(
+                    topk_ids[flat_tid], num_experts, self.p8_route_ids
+                )
                 if m1_slot_expert_id >= Int32(0) and m1_slot_expert_id < num_experts:
                     m1_physical_row = flat_tid * Int32(self.tile_shape_mnk[0])
-                    token_map[m1_physical_row] = (
-                        flat_tid if cutlass.const_expr(self.raw_routes) else Int32(0)
-                    )
+                    if cutlass.const_expr(self.p8_route_ids):
+                        # P8: FC1 divides a route index by top-k to gather its
+                        # input token; FC2 needs distinct route output slots.
+                        # Storing the token here would divide twice at M>1.
+                        if cutlass.const_expr(self.deterministic_output):
+                            token_map[m1_physical_row] = flat_tid
+                        else:
+                            token_map[m1_physical_row] = flat_tid // num_topk
+                    else:
+                        token_map[m1_physical_row] = (
+                            flat_tid
+                            if cutlass.const_expr(self.raw_routes)
+                            else Int32(0)
+                        )
                     token_weights[m1_physical_row] = topk_weights[flat_tid].to(
                         cutlass.Float32
                     )
@@ -2999,7 +3442,9 @@ class MoEDynamicKernelBackend:
         if cutlass.const_expr(not self.direct_routing and not self.external_route_plan):
             hist_idx = flat_tid
             while hist_idx < total_pairs:
-                expert_id = local_expert_id(topk_ids[hist_idx], num_experts)
+                expert_id = route_expert_id(
+                    topk_ids[hist_idx], num_experts, self.p8_route_ids
+                )
                 # A route outside the local expert domain is inactive. vLLM
                 # uses -1 for scheduler padding, and expert-parallel callers
                 # may use the same contract for non-local routes.
@@ -3112,7 +3557,9 @@ class MoEDynamicKernelBackend:
                 if cutlass.const_expr(self.share_input_across_experts):
                     token_owner_warp = warp_idx
                     token_partition = Int32(0)
-                    if cutlass.const_expr(self.input_warps_per_token > 1):
+                    if cutlass.const_expr(
+                        self.input_warps_per_token > 1 or self.p8_producer_split
+                    ):
                         token_owner_warp = warp_idx // Int32(self.input_warps_per_token)
                         token_partition = warp_idx % Int32(self.input_warps_per_token)
                     token_idx = batch_base + token_owner_warp
@@ -3121,13 +3568,17 @@ class MoEDynamicKernelBackend:
                         if lane_id == Int32(0):
                             topk_slot = Int32(0)
                             topk_step = Int32(1)
-                            if cutlass.const_expr(self.input_warps_per_token > 1):
+                            if cutlass.const_expr(
+                                self.input_warps_per_token > 1 or self.p8_producer_split
+                            ):
                                 topk_slot = token_partition
                                 topk_step = Int32(self.input_warps_per_token)
                             while topk_slot < num_topk:
                                 pair_idx = token_idx * num_topk + topk_slot
-                                expert_id = local_expert_id(
-                                    topk_ids[pair_idx], num_experts
+                                expert_id = route_expert_id(
+                                    topk_ids[pair_idx],
+                                    num_experts,
+                                    self.p8_route_ids,
                                 )
                                 weight = topk_weights[pair_idx].to(cutlass.Float32)
                                 phys_row = Int32(-1)
@@ -3168,7 +3619,9 @@ class MoEDynamicKernelBackend:
                                     route_expert_ids_addr + slot * Int32(4), expert_id
                                 )
                                 topk_slot += topk_step
-                        if cutlass.const_expr(self.input_warps_per_token > 1):
+                        if cutlass.const_expr(
+                            self.input_warps_per_token > 1 or self.p8_producer_split
+                        ):
                             self._sync_input_warp_pair(token_owner_warp)
                         else:
                             cute.arch.sync_warp()
@@ -3197,7 +3650,18 @@ class MoEDynamicKernelBackend:
                                 # route-expanded path fans it out to each route.
                                 # That path keeps only physical rows in rmem here to
                                 # stay below the two-CTA register-residency limit.
-                                if num_topk == Int32(8):
+                                if cutlass.const_expr(self.p8_full_coupled):
+                                    self._store_p8_full_coupled_input_row(
+                                        a_input,
+                                        packed_a_storage,
+                                        scale_storage,
+                                        trellis_rotations,
+                                        token_idx,
+                                        token_partition,
+                                        lane_id,
+                                        mx_blocks_per_row,
+                                    )
+                                elif num_topk == Int32(8):
                                     for cache_slot in cutlass.range_constexpr(8):
                                         slot = route_slot_base + Int32(cache_slot)
                                         shared_route_phys_rows[cache_slot] = (
@@ -3207,7 +3671,7 @@ class MoEDynamicKernelBackend:
                                         )
 
                                     blk_idx = lane_id + token_partition * Int32(32)
-                                    while blk_idx < mx_blocks_per_row:
+                                    while blk_idx < a_produce_blocks:
                                         block_start = blk_idx * Int32(32)
                                         values, block_max = _load_bf16x32_to_f32(
                                             a_input,
@@ -3294,7 +3758,7 @@ class MoEDynamicKernelBackend:
                                         )
                                 else:
                                     blk_idx = lane_id + token_partition * Int32(32)
-                                    while blk_idx < mx_blocks_per_row:
+                                    while blk_idx < a_produce_blocks:
                                         block_start = blk_idx * Int32(32)
                                         values, block_max = _load_bf16x32_to_f32(
                                             a_input,
@@ -3540,7 +4004,10 @@ class MoEDynamicKernelBackend:
                                 cute.arch.sync_warp()
 
                                 publish_routes = Int32(1)
-                                if cutlass.const_expr(self.input_warps_per_token > 1):
+                                if cutlass.const_expr(
+                                    self.input_warps_per_token > 1
+                                    or self.p8_producer_split
+                                ):
                                     self._sync_input_warp_pair(token_owner_warp)
                                     publish_routes = Int32(1) - token_partition
 
@@ -3593,7 +4060,9 @@ class MoEDynamicKernelBackend:
                         phys_tile = Int32(0)
                         route_is_valid = Int32(0)
                         if pair_idx < total_pairs:
-                            expert_id = local_expert_id(topk_ids[pair_idx], num_experts)
+                            expert_id = route_expert_id(
+                                topk_ids[pair_idx], num_experts, self.p8_route_ids
+                            )
                             token_idx = pair_idx // num_topk
                             weight = topk_weights[pair_idx].to(cutlass.Float32)
                             if expert_id >= Int32(0) and expert_id < num_experts:
@@ -3648,7 +4117,7 @@ class MoEDynamicKernelBackend:
                                         self.tile_shape_mnk[0]
                                     ) + row % Int32(self.tile_shape_mnk[0])
                                     blk_idx = lane_id
-                                    while blk_idx < mx_blocks_per_row:
+                                    while blk_idx < a_produce_blocks:
                                         block_start = blk_idx * Int32(32)
                                         values = cute.make_rmem_tensor(
                                             (32,), cutlass.Float32
@@ -3880,8 +4349,8 @@ class MoEDynamicKernelBackend:
                 if cutlass.const_expr(self.direct_routing):
                     pair_flush = Int32(bidz)
                     while pair_flush < total_pairs:
-                        expert_flush = local_expert_id(
-                            topk_ids[pair_flush], num_experts
+                        expert_flush = route_expert_id(
+                            topk_ids[pair_flush], num_experts, self.p8_route_ids
                         )
                         valid_rows = Int32(0)
                         if expert_flush >= Int32(0) and expert_flush < num_experts:
@@ -4630,7 +5099,9 @@ class MoEDynamicKernelBackend:
                 if materialized_slot < materialized_tail:
                     route_idx = materialized_slot // route_gate_tile_cnt
                     route_slice = materialized_slot - route_idx * route_gate_tile_cnt
-                    route_expert = local_expert_id(topk_ids[route_idx], num_experts)
+                    route_expert = route_expert_id(
+                        topk_ids[route_idx], num_experts, self.p8_route_ids
+                    )
                     if route_expert >= Int32(0) and route_expert < num_experts:
                         work_item[_WORK_EXPERT] = route_expert
                         work_item[_WORK_M_TILE] = route_idx
@@ -5492,9 +5963,11 @@ class MoEDynamicKernelBackend:
                                     else:
                                         n_in = w4a8_n8_thread_base + Int32(_nt * 32)
                                     n_in_arr[_nt] = n_in
-                                    if cutlass.const_expr(self.w4a8_trellis):
-                                        # Trellis decode emits fully-scaled
-                                        # E4M3; UE8M0 identity word.
+                                    if cutlass.const_expr(
+                                        self.w4a8_trellis and not self.trellis_scaled
+                                    ):
+                                        # The lut_e4m3 decode emits
+                                        # fully-scaled E4M3: identity word.
                                         sfb_words[_nt] = Uint32(0x7F7F7F7F)
                                         if cutlass.const_expr(self.w4a8_fused):
                                             sfb_words_u[_nt] = Uint32(0x7F7F7F7F)
@@ -5564,30 +6037,12 @@ class MoEDynamicKernelBackend:
                                             tr_base0 = (
                                                 Int32(_kb * 16) + n16_local
                                             ) * Int32(8 * self.trellis_bits)
-                                            blo, bhi = _w4a8_trellis_pair_words(
-                                                b_buf,
-                                                Int32(lane_id),
-                                                tr_base0,
-                                                tr_base0
-                                                + Int32(64 * self.trellis_bits),
-                                                tr_ia,
-                                                tr_ib,
-                                                tr_s2,
-                                                tr_n_high,
-                                                self.trellis_bits,
-                                                trellis_lut_addr,
-                                            )
-                                            b_lo[_nt] = blo
-                                            b_hi[_nt] = bhi
-                                            if cutlass.const_expr(self.w4a8_fused):
-                                                tr_base0_u = tr_base0 + Int32(
-                                                    512 * self.trellis_bits
-                                                )
-                                                blo_u, bhi_u = _w4a8_trellis_pair_words(
+                                            blo, bhi = (
+                                                _w4a8_trellis_pair_words_codebook(
                                                     b_buf,
                                                     Int32(lane_id),
-                                                    tr_base0_u,
-                                                    tr_base0_u
+                                                    tr_base0,
+                                                    tr_base0
                                                     + Int32(64 * self.trellis_bits),
                                                     tr_ia,
                                                     tr_ib,
@@ -5595,6 +6050,30 @@ class MoEDynamicKernelBackend:
                                                     tr_n_high,
                                                     self.trellis_bits,
                                                     trellis_lut_addr,
+                                                    self.trellis_codebook,
+                                                )
+                                            )
+                                            b_lo[_nt] = blo
+                                            b_hi[_nt] = bhi
+                                            if cutlass.const_expr(self.w4a8_fused):
+                                                tr_base0_u = tr_base0 + Int32(
+                                                    512 * self.trellis_bits
+                                                )
+                                                blo_u, bhi_u = (
+                                                    _w4a8_trellis_pair_words_codebook(
+                                                        b_buf,
+                                                        Int32(lane_id),
+                                                        tr_base0_u,
+                                                        tr_base0_u
+                                                        + Int32(64 * self.trellis_bits),
+                                                        tr_ia,
+                                                        tr_ib,
+                                                        tr_s2,
+                                                        tr_n_high,
+                                                        self.trellis_bits,
+                                                        trellis_lut_addr,
+                                                        self.trellis_codebook,
+                                                    )
                                                 )
                                                 b_lo_u[_nt] = blo_u
                                                 b_hi_u[_nt] = bhi_u
@@ -5900,12 +6379,15 @@ class MoEDynamicKernelBackend:
                                             (None, mma_m_in_epi, mma_n_in_epi)
                                         ]
                                         gate_slice = tRS_rGate[(None, mma_m, mma_n)]
-                                        if cutlass.const_expr(self.w4a8_trellis):
-                                            # Trellis: stage the raw (alpha-
-                                            # scaled) gate slice; the rotation
-                                            # passes below apply H128, the
-                                            # per-expert rotations, and the
-                                            # activation from sC.
+                                        if cutlass.const_expr(
+                                            self.w4a8_trellis
+                                            and not self.trellis_identity_boundary
+                                        ):
+                                            # Rotated trellis boundaries stage
+                                            # the raw alpha-scaled gate. The
+                                            # identity boundary instead takes
+                                            # the ordinary gated-activation
+                                            # branch below.
                                             for elem_idx in cutlass.range_constexpr(
                                                 cute.size(tRS_rD_slice)
                                             ):
@@ -5951,6 +6433,7 @@ class MoEDynamicKernelBackend:
                                 epi_rows = Int32(0)
                             if cutlass.const_expr(
                                 self.w4a8_trellis
+                                and not self.trellis_identity_boundary
                                 and not self.trellis_intermediate_hadamard
                             ):
                                 # Trellis activation boundary through sC:
@@ -6108,9 +6591,11 @@ class MoEDynamicKernelBackend:
                                 cute.arch.fence_proxy("async.shared", space="cta")
                                 self.epilog_sync_barrier.arrive_and_wait()
                             if cutlass.const_expr(
-                                self.w4a8_trellis and self.trellis_intermediate_hadamard
+                                self.w4a8_trellis
+                                and not self.trellis_identity_boundary
+                                and self.trellis_intermediate_hadamard
                             ):
-                                # Intermediate-Hadamard activation boundary: the slice's raw
+                                # Coupled activation boundary: the slice's raw
                                 # gate sits in sC[epi_buffer]; restage raw up
                                 # into the next epilogue buffer, then per row
                                 # run the interleaved signed-Hadamard sandwich,
@@ -6223,8 +6708,13 @@ class MoEDynamicKernelBackend:
                                                         epi_buffer,
                                                     ]
                                                 )
-                                            h0, h1, h2, h3 = _w4a8_had128_quad(
-                                                p0, p1, p2, p3, tr_lane
+                                            h0, h1, h2, h3 = _w4a8_had128_quad_dispatch(
+                                                self.trellis_exact_hadamard,
+                                                p0,
+                                                p1,
+                                                p2,
+                                                p3,
+                                                tr_lane,
                                             )
                                             tr_coord = tr_slice_col + tr_ci
                                             tr_scale = (
@@ -6244,8 +6734,13 @@ class MoEDynamicKernelBackend:
                                             h3 = h3 * cutlass.Float32(
                                                 trellis_rotations[tr_scale + Int32(3)]
                                             )
-                                            h0, h1, h2, h3 = _w4a8_had128_quad(
-                                                h0, h1, h2, h3, tr_lane
+                                            h0, h1, h2, h3 = _w4a8_had128_quad_dispatch(
+                                                self.trellis_exact_hadamard,
+                                                h0,
+                                                h1,
+                                                h2,
+                                                h3,
+                                                tr_lane,
                                             )
                                             tr_sign = (
                                                 task_expert_idx * (Int32(6) * tr_isz)
@@ -6314,8 +6809,13 @@ class MoEDynamicKernelBackend:
                                         v3 = v3 * cutlass.Float32(
                                             trellis_rotations[tr_ub + Int32(3)]
                                         )
-                                        v0, v1, v2, v3 = _w4a8_had128_quad(
-                                            v0, v1, v2, v3, tr_lane
+                                        v0, v1, v2, v3 = _w4a8_had128_quad_dispatch(
+                                            self.trellis_exact_hadamard,
+                                            v0,
+                                            v1,
+                                            v2,
+                                            v3,
+                                            tr_lane,
                                         )
                                         tr_dn = (
                                             task_expert_idx * (Int32(6) * tr_isz)
@@ -6334,22 +6834,35 @@ class MoEDynamicKernelBackend:
                                         v3 = v3 * cutlass.Float32(
                                             trellis_rotations[tr_dn + Int32(3)]
                                         )
-                                        v0, v1, v2, v3 = _w4a8_had128_quad(
-                                            v0, v1, v2, v3, tr_lane
+                                        v0, v1, v2, v3 = _w4a8_had128_quad_dispatch(
+                                            self.trellis_exact_hadamard,
+                                            v0,
+                                            v1,
+                                            v2,
+                                            v3,
+                                            tr_lane,
                                         )
                                         tr_c4 = tr_lane * Int32(4)
-                                        sC[tr_row, tr_c4, epi_buffer] = (
-                                            cutlass.BFloat16(v0)
-                                        )
-                                        sC[tr_row, tr_c4 + Int32(1), epi_buffer] = (
-                                            cutlass.BFloat16(v1)
-                                        )
-                                        sC[tr_row, tr_c4 + Int32(2), epi_buffer] = (
-                                            cutlass.BFloat16(v2)
-                                        )
-                                        sC[tr_row, tr_c4 + Int32(3), epi_buffer] = (
-                                            cutlass.BFloat16(v3)
-                                        )
+                                        if cutlass.const_expr(
+                                            self.trellis_fp32_boundary
+                                        ):
+                                            sTrellisF32[tr_row, tr_c4] = v0
+                                            sTrellisF32[tr_row, tr_c4 + Int32(1)] = v1
+                                            sTrellisF32[tr_row, tr_c4 + Int32(2)] = v2
+                                            sTrellisF32[tr_row, tr_c4 + Int32(3)] = v3
+                                        else:
+                                            sC[tr_row, tr_c4, epi_buffer] = (
+                                                cutlass.BFloat16(v0)
+                                            )
+                                            sC[tr_row, tr_c4 + Int32(1), epi_buffer] = (
+                                                cutlass.BFloat16(v1)
+                                            )
+                                            sC[tr_row, tr_c4 + Int32(2), epi_buffer] = (
+                                                cutlass.BFloat16(v2)
+                                            )
+                                            sC[tr_row, tr_c4 + Int32(3), epi_buffer] = (
+                                                cutlass.BFloat16(v3)
+                                            )
                                 cute.arch.fence_proxy("async.shared", space="cta")
                                 self.epilog_sync_barrier.arrive_and_wait()
                             mx_blocks_tile = Int32(self.tile_shape_mnk[2] // 32)
@@ -6362,13 +6875,18 @@ class MoEDynamicKernelBackend:
                                 values = cute.make_rmem_tensor((32,), cutlass.Float32)
                                 block_max = cutlass.Float32(0.0)
                                 for elem_idx in cutlass.range_constexpr(32):
-                                    value = cutlass.Float32(
-                                        sC[
-                                            local_row,
-                                            block_start + elem_idx,
-                                            epi_buffer,
+                                    if cutlass.const_expr(self.trellis_fp32_boundary):
+                                        value = sTrellisF32[
+                                            local_row, block_start + elem_idx
                                         ]
-                                    )
+                                    else:
+                                        value = cutlass.Float32(
+                                            sC[
+                                                local_row,
+                                                block_start + elem_idx,
+                                                epi_buffer,
+                                            ]
+                                        )
                                     values[elem_idx] = value
                                     block_max = fmax_f32(block_max, fabs_f32(value))
                                 if cutlass.const_expr(self.w4a8_trellis):
@@ -7554,7 +8072,9 @@ class MoEDynamicKernelBackend:
                                 for _ot in cutlass.range_constexpr(
                                     self.w4a8_fc2_compute_width
                                 ):
-                                    if cutlass.const_expr(self.w4a8_trellis):
+                                    if cutlass.const_expr(
+                                        self.w4a8_trellis and not self.trellis_scaled
+                                    ):
                                         sfb_words2[_ot, _nt] = Uint32(0x7F7F7F7F)
                                     else:
                                         sfb_words2[_ot, _nt] = ld_shared_u32(
@@ -7597,18 +8117,21 @@ class MoEDynamicKernelBackend:
                                             ) + (Int32(_kb * 16) + n16_local2) * Int32(
                                                 8 * self.trellis_bits
                                             )
-                                            blo, bhi = _w4a8_trellis_pair_words(
-                                                b_buf,
-                                                Int32(lane_id),
-                                                tr2_base0,
-                                                tr2_base0
-                                                + Int32(64 * self.trellis_bits),
-                                                tr_ia,
-                                                tr_ib,
-                                                tr_s2,
-                                                tr_n_high2,
-                                                self.trellis_bits,
-                                                trellis_lut_addr,
+                                            blo, bhi = (
+                                                _w4a8_trellis_pair_words_codebook(
+                                                    b_buf,
+                                                    Int32(lane_id),
+                                                    tr2_base0,
+                                                    tr2_base0
+                                                    + Int32(64 * self.trellis_bits),
+                                                    tr_ia,
+                                                    tr_ib,
+                                                    tr_s2,
+                                                    tr_n_high2,
+                                                    self.trellis_bits,
+                                                    trellis_lut_addr,
+                                                    self.trellis_codebook,
+                                                )
                                             )
                                             b_lo[_ot, _nt] = blo
                                             b_hi[_ot, _nt] = bhi
@@ -8290,6 +8813,14 @@ class MoEDynamicKernelBackend:
                                 b_w13_u32.shape[0] * b_row_u32p
                             ) + Int64(n_base_p) * Int64(b_row_u32p)
                             sfb_row_p = sfb_w13_mx.shape[1]
+                            # The released w13 plane is consumed exactly as
+                            # stored: no gate/up row offset here. The B N axis
+                            # the gated pass stages is already up-first
+                            # (p_n_tile above), so the plane row of a staged
+                            # tile is its own n_base_p. Adding the offset
+                            # double-swaps the halves (measured: cosine 0.9708
+                            # with the plane as stored, 0.99896 only after a
+                            # host swap, so the kernel must not swap).
                             sfb_base_p = Int64(task_expert_idx) * Int64(
                                 sfb_w13_mx.shape[0] * sfb_row_p
                             ) + Int64(n_base_p) * Int64(sfb_row_p)
@@ -8556,8 +9087,11 @@ class MoEDynamicKernelBackend:
                                                 self.w4a8_b_pad,
                                             )
                                     if cutlass.const_expr(
-                                        self.materialize_intermediate
-                                        and self.share_input_across_experts
+                                        (
+                                            self.materialize_intermediate
+                                            and self.share_input_across_experts
+                                        )
+                                        or self.trellis_pre_quantized_a
                                     ):
                                         _w4a8_stage_a_tile_gather(
                                             pa_u32,
@@ -8644,7 +9178,9 @@ class MoEDynamicKernelBackend:
                                                 if self.csf_inline_scales
                                                 else None,
                                             )
-                                    elif cutlass.const_expr(not self.w4a8_trellis):
+                                    elif cutlass.const_expr(
+                                        (not self.w4a8_trellis) or self.trellis_scaled
+                                    ):
                                         _w4a8_stage_bytes4(
                                             sfb_w13_mx,
                                             w4a8_sfb_dst,
@@ -8699,8 +9235,11 @@ class MoEDynamicKernelBackend:
                                         else (sfa_base_addr + (par << Int32(9)))
                                     )
                                     if cutlass.const_expr(
-                                        self.materialize_intermediate
-                                        and self.share_input_across_experts
+                                        (
+                                            self.materialize_intermediate
+                                            and self.share_input_across_experts
+                                        )
+                                        or self.trellis_pre_quantized_a
                                     ):
                                         _w4a8_stage_scale_tile_gather(
                                             scale_storage,
@@ -9110,7 +9649,9 @@ class MoEDynamicKernelBackend:
                                         if self.csf_inline_scales
                                         else None,
                                     )
-                                elif cutlass.const_expr(not self.w4a8_trellis):
+                                elif cutlass.const_expr(
+                                    (not self.w4a8_trellis) or self.trellis_scaled
+                                ):
                                     _w4a8_stage_bytes4(
                                         sfb_down_mx,
                                         w4a8_sfb2_dst,
@@ -9569,8 +10110,8 @@ class MoEDynamicKernelBackend:
                     phase2_output_tile = (
                         phase2_slot - phase2_m_tile * phase2_task_output_tiles
                     )
-                    phase2_expert = local_expert_id(
-                        topk_ids[phase2_m_tile], num_experts
+                    phase2_expert = route_expert_id(
+                        topk_ids[phase2_m_tile], num_experts, self.p8_route_ids
                     )
                     if phase2_expert >= Int32(0) and phase2_expert < num_experts:
                         self._run_w4a8_materialized_fc2(

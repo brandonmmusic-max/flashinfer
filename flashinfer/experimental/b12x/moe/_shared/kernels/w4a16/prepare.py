@@ -10,6 +10,7 @@ import torch
 from b12x.moe._shared.trellis_codebooks import (
     MCG,
     LUT_E4M3,
+    PROCEDURAL_NPK,
     normalize_codebook,
     validate_codebook_bits,
 )
@@ -137,6 +138,12 @@ class TrellisWeightState:
 
     codebook: str
     bits: int
+    #: Set when the released container carries a UE8M0/K32 weight-scale plane
+    #: (``procedural_npk``). The FC1 payload's N axis is gate-up while the
+    #: stored plane is up-gate, so the FC1 lookup rotates the plane row by this
+    #: offset (``intermediate_size``); FC2 uses 0. ``None`` means the codebook
+    #: has no weight block scale (``mcg``/``lut_e4m3``/``lut_fp16``).
+    weight_block_scale_row_rotation: int | None = None
     fc1_pair_kind: str | None = None
     fc2_pair_kind: str | None = None
     fc1_pair_modes: torch.Tensor | None = None
@@ -224,6 +231,14 @@ class PreparedW4A16MoeWeights:
     @property
     def intermediate_hadamard(self) -> bool:
         return self.trellis is not None and self.trellis.intermediate_hadamard
+
+    @property
+    def weight_block_scale_row_rotation(self) -> int | None:
+        return (
+            None
+            if self.trellis is None
+            else self.trellis.weight_block_scale_row_rotation
+        )
 
     @property
     def tile_config(self) -> tuple[int, int, int, int] | None:
@@ -1367,6 +1382,12 @@ _TRELLIS256_W13_LAYOUTS = {"packed", "trellis_t256_proj"}
 
 
 def _normalize_trellis256_codebook(codebook: str | int) -> str:
+    # ``procedural_npk`` is accepted here (and only here): the W4A16 trellis
+    # decode has a 16-bit ``procedural_npk`` branch that applies the released
+    # UE8M0/K32 weight-scale plane. It is deliberately not added to the shared
+    # checkpoint-declared ``CODEBOOKS`` set, which the W4A8 arm owns.
+    if isinstance(codebook, str) and codebook.strip().lower() == PROCEDURAL_NPK:
+        return PROCEDURAL_NPK
     return normalize_codebook(codebook)
 
 
@@ -1452,6 +1473,70 @@ def _trellis256_flat_native_view(
     return tensor.view(torch.int32).reshape(-1)
 
 
+def _validate_trellis256_block_scale(
+    scale: torch.Tensor,
+    *,
+    name: str,
+    num_experts: int,
+    rows: int,
+    k_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Validate one repacked UE8M0/K32 weight-scale plane (zero-copy view).
+
+    The plane is the W4A8 sfb layout the bundle already holds:
+    ``[E, ceil(rows/256), ceil(k_dim/128), 32, 8]`` int32. Its byte order is
+    ``((n_tile * k_tiles + k_tile) * 32 + n32) * 32 + row8 * 4 + k32_in_128``,
+    a pure permutation of the logical ``[rows, k_dim // 32]`` byte grid; the
+    decode indexes it arithmetically, so no copy or re-permute is made.
+    """
+
+    if not isinstance(scale, torch.Tensor):
+        raise TypeError(f"trellis_t256 {name} must be a torch.Tensor")
+    if scale.dtype != torch.int32:
+        raise TypeError(f"trellis_t256 {name} must be int32, got {scale.dtype}")
+    if scale.device != device:
+        raise ValueError(f"trellis_t256 {name} must be on {device}, got {scale.device}")
+    if not scale.is_contiguous():
+        raise ValueError(f"trellis_t256 {name} must be contiguous")
+    if int(scale.data_ptr()) % 16 != 0:
+        raise ValueError(f"trellis_t256 {name} must be 16-byte aligned")
+    expected = (
+        int(num_experts),
+        -(-int(rows) // 256),
+        -(-int(k_dim) // 128),
+        32,
+        8,
+    )
+    if tuple(scale.shape) != expected:
+        raise ValueError(
+            f"trellis_t256 {name} must have the repacked sfb shape {expected}; "
+            f"got {tuple(scale.shape)}"
+        )
+    logical_bytes = int(num_experts) * int(rows) * (int(k_dim) // 32)
+    if scale.numel() * 4 != logical_bytes:
+        raise ValueError(
+            f"trellis_t256 {name} covers {scale.numel() * 4} bytes but the "
+            f"logical plane is {logical_bytes}; tail-tiled scale planes are not "
+            "supported by the procedural_npk weight-scale operand"
+        )
+    low = int(scale.view(torch.uint8).min())
+    high = int(scale.view(torch.uint8).max())
+    # The kernel multiplies the widened fp16 weight by 2**(b-127) in fp16, so
+    # the product, not just the scale, must be representable. Decoded
+    # procedural-NPK weights span 2**-9 .. 8 (E4M3, three mantissa bits): the
+    # product is exact iff 2**(s-9) >= 2**-24 and 8 * 2**s <= 65504, i.e.
+    # s = b - 127 in [-15, 12]. Bytes 103..111 underflow small weights and
+    # 140..142 overflow the largest ones.
+    if low < 112 or high > 139:
+        raise ValueError(
+            f"trellis_t256 {name} carries UE8M0 bytes {low}..{high}; the fp16 "
+            "weight-scale product is exact only for bytes 112..139 "
+            "(2**-15 .. 2**12)"
+        )
+    return scale
+
+
 def prepare_trellis256_moe_weights(
     w13: torch.Tensor | None = None,
     w2: torch.Tensor | None = None,
@@ -1469,6 +1554,8 @@ def prepare_trellis256_moe_weights(
     trellis_bits: int | None = None,
     dummy_scale: torch.Tensor | None = None,
     codebook: str | int = "mcg",
+    w13_block_scale: torch.Tensor | None = None,
+    w2_block_scale: torch.Tensor | None = None,
     gate_suh: torch.Tensor | None = None,
     up_suh: torch.Tensor | None = None,
     intermediate_rotations: torch.Tensor | None = None,
@@ -1824,6 +1911,38 @@ def prepare_trellis256_moe_weights(
                 "trellis_t256 dummy_scale must be at least 16-byte aligned"
             )
 
+    have_w13_block_scale = w13_block_scale is not None
+    have_w2_block_scale = w2_block_scale is not None
+    if have_w13_block_scale != have_w2_block_scale:
+        raise ValueError(
+            "trellis_t256 requires both w13_block_scale and w2_block_scale, or neither"
+        )
+    block_scale_row_rotation = None
+    if have_w13_block_scale:
+        if normalized_codebook != PROCEDURAL_NPK:
+            raise ValueError(
+                "trellis_t256 weight block scales belong to the procedural_npk "
+                f"release; codebook is {normalized_codebook!r}"
+            )
+        w13_block_scale = _validate_trellis256_block_scale(
+            w13_block_scale,
+            name="w13_block_scale",
+            num_experts=num_experts,
+            rows=2 * intermediate_size if is_gated else intermediate_size,
+            k_dim=hidden_size,
+            device=resolved_device,
+        )
+        w2_block_scale = _validate_trellis256_block_scale(
+            w2_block_scale,
+            name="w2_block_scale",
+            num_experts=num_experts,
+            rows=hidden_size,
+            k_dim=intermediate_size,
+            device=resolved_device,
+        )
+        # The FC1 payload's N axis is gate-up; the released plane is up-gate.
+        block_scale_row_rotation = intermediate_size if is_gated else 0
+
     global_scale = torch.ones(
         (num_experts,), dtype=torch.float32, device=resolved_device
     )
@@ -1833,10 +1952,10 @@ def prepare_trellis256_moe_weights(
         raise ValueError("trellis_t256 workspace must be int32 on the weight device")
     return PreparedW4A16MoeWeights(
         w13=packed_w13,
-        w13_scale=dummy_scale,
+        w13_scale=dummy_scale if w13_block_scale is None else w13_block_scale,
         w13_global_scale=global_scale,
         w2=packed_w2,
-        w2_scale=dummy_scale,
+        w2_scale=dummy_scale if w2_block_scale is None else w2_block_scale,
         w2_global_scale=global_scale,
         workspace=workspace,
         hidden_size=hidden_size,
@@ -1853,6 +1972,7 @@ def prepare_trellis256_moe_weights(
         trellis=TrellisWeightState(
             codebook=normalized_codebook,
             bits=resolved_trellis_bits,
+            weight_block_scale_row_rotation=block_scale_row_rotation,
             gate_suh=gate_suh,
             up_suh=up_suh,
             intermediate_rotations=intermediate_rotations,

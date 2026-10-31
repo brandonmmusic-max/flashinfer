@@ -84,6 +84,7 @@ def compile_w4a16_fused_moe(
     w13_layout: str = "w13",
     trellis_bits: int = 3,
     trellis_codebook: str = LUT_E4M3,
+    trellis_weight_scale_row_rotation: int | None = None,
     fc1_trellis_pair_kind: str | None = None,
     fc2_trellis_pair_kind: str | None = None,
     direct_topk_routes: bool = False,
@@ -96,6 +97,7 @@ def compile_w4a16_fused_moe(
     skip_empty_m_blocks: bool | None = None,
     intermediate_rotation: bool = False,
     full_rotation: bool = False,
+    external_input_boundary: bool = False,
     intermediate_hadamard: bool = False,
     rotation_input_dtype: str | None = None,
     broadcast_suh: bool = False,
@@ -499,6 +501,7 @@ def compile_w4a16_fused_moe(
         w13_layout=w13_layout,
         trellis_bits=trellis_bits,
         trellis_codebook=trellis_codebook,
+        trellis_weight_scale_row_rotation=trellis_weight_scale_row_rotation,
         fc1_trellis_pair_kind=fc1_trellis_pair_kind,
         fc2_trellis_pair_kind=fc2_trellis_pair_kind,
         direct_topk_routes=direct_topk_routes,
@@ -508,6 +511,7 @@ def compile_w4a16_fused_moe(
         collect_activation_amax=collect_activation_amax,
         intermediate_rotation=intermediate_rotation,
         full_rotation=full_rotation,
+        external_input_boundary=external_input_boundary,
         intermediate_hadamard=intermediate_hadamard,
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
@@ -865,9 +869,11 @@ def _w4a16_fused_moe_launch_flat(
     a_input_up: torch.Tensor | None = None,
     trellis_bits: int = 3,
     trellis_codebook: str = LUT_E4M3,
+    trellis_weight_scale_row_rotation: int | None = None,
     fc1_trellis_pair_kind: str | None = None,
     fc2_trellis_pair_kind: str | None = None,
     full_rotation: bool = False,
+    external_input_boundary: bool = False,
     intermediate_hadamard: bool = False,
     rotation_input: torch.Tensor | None = None,
     suh_gate_table: torch.Tensor | None = None,
@@ -878,6 +884,7 @@ def _w4a16_fused_moe_launch_flat(
     collect_activation_amax = bool(collect_activation_amax)
     intermediate_rotation = bool(intermediate_rotation)
     full_rotation = bool(full_rotation)
+    external_input_boundary = bool(external_input_boundary)
     intermediate_hadamard = bool(intermediate_hadamard)
     use_expert_map = expert_map is not None
     if use_expert_map:
@@ -902,12 +909,13 @@ def _w4a16_fused_moe_launch_flat(
         rot_scales_arg = rot_scales.view(-1)
     else:
         rot_scales_arg = _rot_scales_dummy(w13_global_scale.device)
-    if full_rotation and a_input_up is None:
+    if full_rotation and not external_input_boundary and a_input_up is None:
         raise ValueError("full_rotation launch requires a distinct up A scratch")
     if a_input_up is None:
         a_input_up = a_input
     if (
         full_rotation
+        and not external_input_boundary
         and not intermediate_hadamard
         and a_input_up.data_ptr() == a_input.data_ptr()
     ):
@@ -962,6 +970,7 @@ def _w4a16_fused_moe_launch_flat(
         w13_layout=w13_layout,
         trellis_bits=trellis_bits,
         trellis_codebook=trellis_codebook,
+        trellis_weight_scale_row_rotation=trellis_weight_scale_row_rotation,
         fc1_trellis_pair_kind=fc1_trellis_pair_kind,
         fc2_trellis_pair_kind=fc2_trellis_pair_kind,
         direct_topk_routes=bool(direct_topk_routes),
@@ -975,6 +984,7 @@ def _w4a16_fused_moe_launch_flat(
         force_tile_config=(fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n),
         intermediate_rotation=intermediate_rotation,
         full_rotation=full_rotation,
+        external_input_boundary=external_input_boundary,
         intermediate_hadamard=intermediate_hadamard,
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,

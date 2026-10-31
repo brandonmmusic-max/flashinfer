@@ -14,6 +14,10 @@ class ScratchBufferSpec:
     shape: tuple[int, ...]
     dtype: torch.dtype
     device: torch.device
+    #: Byte alignment of the buffer's start. A kernel that hands the buffer to a
+    #: vector load or a tensor-core descriptor with an assumed alignment needs
+    #: the caller's pointer to carry it; 1 accepts any address.
+    alignment: int = 1
 
     @property
     def nbytes(self) -> int:
@@ -28,12 +32,18 @@ def scratch_buffer_spec(
     *,
     nbytes: int,
     device: torch.device,
+    alignment: int = 1,
 ) -> ScratchBufferSpec:
+    if alignment < 1 or alignment & (alignment - 1):
+        raise ValueError(
+            f"{name} scratch alignment must be a positive power of two; got {alignment}"
+        )
     return ScratchBufferSpec(
         name=name,
         shape=(max(int(nbytes), 1),),
         dtype=torch.uint8,
         device=device,
+        alignment=int(alignment),
     )
 
 
@@ -74,6 +84,11 @@ def scratch_tensor(
         )
     if not tensor.is_contiguous():
         raise ValueError(f"{spec.name} scratch must be contiguous")
+    if spec.alignment > 1 and tensor.data_ptr() % spec.alignment:
+        raise ValueError(
+            f"{spec.name} scratch must start at a {spec.alignment}-byte aligned "
+            f"address; got {tensor.data_ptr()} (offset {tensor.data_ptr() % spec.alignment})"
+        )
     return tensor.reshape(-1)
 
 

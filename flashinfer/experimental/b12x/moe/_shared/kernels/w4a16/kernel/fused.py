@@ -92,6 +92,7 @@ class W4A16FusedMoeKernel:
         w13_layout: str = "w13",
         trellis_bits: int = 3,
         trellis_codebook: str = LUT_E4M3,
+        trellis_weight_scale_row_rotation: int | None = None,
         fc1_trellis_pair_kind: str | None = None,
         fc2_trellis_pair_kind: str | None = None,
         direct_topk_routes: bool = False,
@@ -103,6 +104,7 @@ class W4A16FusedMoeKernel:
         schedule_whole_tiles: bool = False,
         intermediate_rotation: bool = False,
         full_rotation: bool = False,
+        external_input_boundary: bool = False,
         intermediate_hadamard: bool = False,
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
@@ -224,6 +226,11 @@ class W4A16FusedMoeKernel:
         self.weight_layout = weight_layout
         self.trellis_bits = int(trellis_bits)
         self.trellis_codebook = str(trellis_codebook).lower()
+        self.trellis_weight_scale_row_rotation = (
+            None
+            if trellis_weight_scale_row_rotation is None
+            else int(trellis_weight_scale_row_rotation)
+        )
         if self.weight_layout == "trellis_t256":
             if self.trellis_codebook not in _TRELLIS256_CODEBOOKS:
                 raise ValueError(
@@ -280,21 +287,39 @@ class W4A16FusedMoeKernel:
             and not self.small_m_splitk
         )
         self.intermediate_rotation = bool(intermediate_rotation)
+        # ``external_input_boundary``: the caller has already applied the
+        # hidden-axis input stage (TrellisMX's external bf16 -> fp16 -> H512 ->
+        # suh -> H128) and hands the GEMM the fp16 A operand directly. The
+        # intermediate chain still runs inside the kernel; only the input
+        # rotation phase is skipped and A stays token-major.
+        self.external_input_boundary = bool(external_input_boundary)
         if self.intermediate_rotation:
             if weight_layout != "trellis_t256":
                 raise ValueError(
                     "intermediate_rotation is only supported for trellis_t256"
                 )
-            if not is_gated or self.activation_is_swigluoai or self.has_swiglu_limit:
+            # An external boundary owns the input stage, so the release's
+            # silu-cap10 limit applies to the intermediate activation instead
+            # of the (unclamped) input rotation path.
+            if (
+                not is_gated
+                or self.activation_is_swigluoai
+                or (self.has_swiglu_limit and not self.external_input_boundary)
+            ):
                 raise ValueError(
                     "intermediate_rotation requires unclamped gated silu or situ "
-                    "(no swiglu limit/oai)"
+                    "(no swiglu limit/oai) unless the input boundary is external"
                 )
             if int(intermediate_size) % 128 != 0:
                 raise ValueError(
                     "intermediate_rotation requires intermediate_size % 128 == 0"
                 )
         self.full_rotation = bool(full_rotation)
+        if self.external_input_boundary and not self.full_rotation:
+            raise ValueError(
+                "external_input_boundary requires full_rotation (the intermediate "
+                "chain still runs inside the kernel)"
+            )
         self.intermediate_hadamard = bool(intermediate_hadamard)
         # suh tables hold one row shared by every expert: index them with a
         # zero expert stride.
@@ -357,13 +382,14 @@ class W4A16FusedMoeKernel:
             w13_layout=w13_layout,
             trellis_bits=self.trellis_bits,
             trellis_codebook=self.trellis_codebook,
+            trellis_weight_scale_row_rotation=trellis_weight_scale_row_rotation,
             trellis_pair_kind=self.fc1_trellis_pair_kind,
             trellis_rate_axis=("n" if self.fc1_trellis_pair_kind is not None else None),
             source_n_rotation=fc1_source_n_rotation,
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
             dual_a=self.dual_a,
-            route_major_a=self.full_rotation,
+            route_major_a=self.full_rotation and not self.external_input_boundary,
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
             pipeline_stages=pipeline_stages,
@@ -405,6 +431,10 @@ class W4A16FusedMoeKernel:
             w13_layout=("packed" if weight_layout == "trellis_t256" else w13_layout),
             trellis_bits=self.trellis_bits,
             trellis_codebook=self.trellis_codebook,
+            # FC2's N axis is the hidden axis: no up-gate/gate-up rotation.
+            trellis_weight_scale_row_rotation=(
+                None if trellis_weight_scale_row_rotation is None else 0
+            ),
             trellis_pair_kind=self.fc2_trellis_pair_kind,
             trellis_rate_axis=("k" if self.fc2_trellis_pair_kind is not None else None),
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
@@ -546,6 +576,8 @@ class W4A16FusedMoeKernel:
             self.intermediate_rotation,
             self.dual_a,
             self.full_rotation,
+            self.external_input_boundary,
+            self.trellis_weight_scale_row_rotation,
             self.intermediate_hadamard,
             self.broadcast_suh,
             self.rotation_input_dtype,
@@ -807,16 +839,23 @@ class W4A16FusedMoeKernel:
             ),
         )
         a_rows = Int64(active_m)
-        if cutlass.const_expr(self.full_rotation):
+        if cutlass.const_expr(self.full_rotation and not self.external_input_boundary):
             a_rows = Int64(active_m) * Int64(self.top_k)
         a_bf16_flat = cute.make_tensor(
             a_bf16_ptr,
             layout=cute.make_layout((a_rows * Int64(self.hidden_size),), stride=(1,)),
         )
-        a_alt_bf16_flat = cute.make_tensor(
-            a_alt_bf16_ptr,
-            layout=cute.make_layout((a_rows * Int64(self.hidden_size),), stride=(1,)),
-        )
+        if cutlass.const_expr(self.external_input_boundary):
+            # The external boundary produces one token-major A operand; both
+            # FC1 projections read it (no per-projection rotation exists).
+            a_alt_bf16_flat = a_bf16_flat
+        else:
+            a_alt_bf16_flat = cute.make_tensor(
+                a_alt_bf16_ptr,
+                layout=cute.make_layout(
+                    (a_rows * Int64(self.hidden_size),), stride=(1,)
+                ),
+            )
         rotation_input_flat = cute.make_tensor(
             rotation_input_ptr,
             layout=cute.make_layout(
@@ -1133,7 +1172,7 @@ class W4A16FusedMoeKernel:
             table_addr = Int64(smem_base + Int32(self.lut_e4m3_smem_off))
             fc1_phase_lut = table_addr
             fc2_phase_lut = table_addr
-        if cutlass.const_expr(self.full_rotation):
+        if cutlass.const_expr(self.full_rotation and not self.external_input_boundary):
             if cutlass.const_expr(self.intermediate_hadamard):
                 self._run_input_rotation_intermediate_hadamard(
                     rotation_input_flat,
@@ -1842,10 +1881,18 @@ class W4A16FusedMoeKernel:
                         * cute.math.tanh(b3 / linear_beta, fastmath=self.fast_math)
                     )
                 else:
-                    aa0 = self._silu_f32(a0) * a1
-                    aa1 = self._silu_f32(a2) * a3
-                    bb0 = self._silu_f32(b0) * b1
-                    bb1 = self._silu_f32(b2) * b3
+                    # TrellisMX's ``silu-cap10`` is exactly the gated cap the
+                    # ordinary activation path already applies (gate capped at
+                    # +limit, up clamped to +-limit, before the sigmoid). With
+                    # no limit configured this is the previous plain silu.
+                    ag0, au0 = self._clamp_swiglu_inputs(a0, a1)
+                    ag1, au1 = self._clamp_swiglu_inputs(a2, a3)
+                    bg0, bu0 = self._clamp_swiglu_inputs(b0, b1)
+                    bg1, bu1 = self._clamp_swiglu_inputs(b2, b3)
+                    aa0 = self._silu_f32(ag0) * au0
+                    aa1 = self._silu_f32(ag1) * au1
+                    bb0 = self._silu_f32(bg0) * bu0
+                    bb1 = self._silu_f32(bg1) * bu1
 
                 source0 = (lane & Int32(15)) << Int32(1)
                 source1 = source0 + Int32(1)

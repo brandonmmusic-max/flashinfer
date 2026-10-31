@@ -1133,3 +1133,81 @@ def test_csf_fused_tasks_route_outputs_match_staged_chain(m, h, i, e, ids_dtype)
     test_caller_owned_route_output_matches_staged_chain(
         True, ids_dtype, m, h, i, e, fuse_tasks=True
     )
+
+
+# --------------------------------------------------------------------------- #
+# plan_execution's branch: the small-M declaration belongs to expert-outer only
+# --------------------------------------------------------------------------- #
+def _cpu_token_outer_bundle():
+    """A tiny NVFP4 token-outer bundle prepared on the CPU.
+
+    Planning a token-outer declaration touches no device, so the branch
+    ``plan_execution`` takes for it is checked without CUDA.
+    """
+
+    from b12x.moe import fused_moe as moe
+
+    e, h, i = 4, 128, 128
+    generator = torch.Generator().manual_seed(20261104)
+
+    def packed(n, k):
+        return (
+            torch.randint(
+                0, 256, (e, n, k // 2), generator=generator, dtype=torch.uint8
+            ),
+            torch.full((e, n, k // 16), 127, dtype=torch.uint8),
+        )
+
+    w1, s1 = packed(2 * i, h)
+    w2, s2 = packed(h, i)
+    plan = moe.plan_weights(
+        source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w31"),
+        activation=moe.ActivationSpec(
+            mode="a4",
+            nonlinearity="silu",
+            io_dtype=torch.bfloat16,
+            outer_scale="token",
+        ),
+        geometry=moe.MoEGeometry(num_experts=e, hidden_size=h, intermediate_size=i),
+    )
+    return moe.prepare_weights(
+        plan=plan,
+        weights=moe.PackedWeights(
+            w13=w1,
+            w2=w2,
+            w13_block_scales=s1,
+            w2_block_scales=s2,
+            w13_global_scales=torch.full((e,), 0.2),
+            w2_global_scales=torch.full((e,), 0.15),
+        ),
+    )
+
+
+def test_plan_execution_plans_token_outer_without_the_smallm_argument() -> None:
+    """An ordinary token-outer plan takes no small-M declaration.
+
+    ``plan_execution`` forwards ``smallm_max_tokens`` to the expert-outer plan,
+    which owns the TrellisMX arm. The token-outer plan has no such parameter,
+    so an omitted argument must not reach it.
+    """
+
+    from b12x.moe import fused_moe as moe
+
+    plan = moe.plan_execution(
+        experts=_cpu_token_outer_bundle(),
+        capacity=moe.ExecutionCapacity(max_tokens=8, top_k=2),
+    )
+    assert plan.query.outer_scale == "token"
+
+
+def test_plan_execution_rejects_a_smallm_declaration_on_token_outer() -> None:
+    """The declaration is refused, not silently dropped, on the token-outer plan."""
+
+    from b12x.moe import fused_moe as moe
+
+    with pytest.raises(ValueError, match="token-outer plan has no TrellisMX arm"):
+        moe.plan_execution(
+            experts=_cpu_token_outer_bundle(),
+            capacity=moe.ExecutionCapacity(max_tokens=8, top_k=2),
+            smallm_max_tokens=16,
+        )

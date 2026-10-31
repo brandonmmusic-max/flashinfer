@@ -339,6 +339,25 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
         "full",
     }:
         raise ValueError("trellis decode table must be auto, compact, or full")
+    # The small-M arm choice is a declared plan parameter; its resolved pair is
+    # part of the query identity, so a hand-built query cannot carry a value the
+    # arm has no programs for.
+    has_smallm = "trellismx_smallm" in query.controls
+    if has_smallm != ("trellismx_smallm_limit" in query.controls):
+        raise ValueError(
+            "TrellisMX small-M controls must declare the arm choice and its limit"
+        )
+    if has_smallm:
+        if type(query.controls["trellismx_smallm"]) is not bool:
+            raise TypeError("TrellisMX small-M arm choice must be boolean")
+        limit = query.controls["trellismx_smallm_limit"]
+        from b12x.moe._shared.kernels.trellismx_smallm import SMALLM_MAX_TOKENS
+
+        if type(limit) is not int or not 0 <= limit <= SMALLM_MAX_TOKENS:
+            raise ValueError(
+                "TrellisMX small-M limit must be an integer in "
+                f"0..{SMALLM_MAX_TOKENS}; got {limit!r}"
+            )
     if query.io_dtype not in {"bfloat16", "float16"}:
         raise TypeError("MoE I/O dtype must be bfloat16 or float16")
     if query.route_logits_dtype not in {None, "float16", "bfloat16", "float32"}:
@@ -699,6 +718,16 @@ def validate_moe_decode_config(
     if config.backend == "dynamic":
         if config.dynamic_tile_m not in {16, 32, 64, 128}:
             raise ValueError("dynamic_tile_m must be one of 16, 32, 64, 128")
+        if str(
+            query.source_format
+        ).lower() == "trellismx" and config.dynamic_tile_m not in {16, 32}:
+            # The w4a8_trellis kernel rejects M64/M128 outside the
+            # split-materialized phase kernels, which procedural NPK never takes; reject them here so
+            # program discovery skips the candidate instead of failing the export.
+            raise ValueError(
+                "TrellisMX dynamic execution supports dynamic_tile_m 16 or 32 "
+                "(procedural NPK has no split-materialized M64/M128 kernels)"
+            )
         if query.quant_mode in {"w6a8_mx", "w8a8_mx"} and config.dynamic_tile_m != 128:
             # The MX byte-container dynamic kernels build only the (128, 128)
             # MMA tile; a smaller declared tile could not be materialized.
@@ -707,6 +736,17 @@ def validate_moe_decode_config(
             )
         if config.dynamic_route_mode not in {"direct", "grouped"}:
             raise ValueError("dynamic_route_mode must be 'direct' or 'grouped'")
+        if (
+            str(query.source_format).lower() == "trellismx"
+            and config.dynamic_route_mode != "grouped"
+        ):
+            # The dynamic kernel builds direct routing only for NVFP4 and
+            # materialized W4A8, so a procedural-NPK candidate skips here
+            # instead of failing the export.
+            raise ValueError(
+                "TrellisMX dynamic execution requires dynamic_route_mode "
+                "'grouped' (procedural NPK has no direct-routing kernel)"
+            )
         if config.dynamic_route_mode == "direct" and query.deterministic_output:
             raise ValueError(
                 "dynamic direct routing does not support deterministic output"

@@ -1,10 +1,13 @@
 """Trellis weight-source parity for the dynamic W4A8 MoE kernel.
 
 Drives MoEDynamicKernelBackend(quant_recipe="w4a8_trellis") with a uniform
-K2 payload and compares against the route-major trellis W4A8 scaffold with
-identity Hadamard transforms. Both paths quantize activations to MXFP8 and
-decode the identical payload through the lut_e4m3 value table, so outputs agree to
-accumulation-order tolerance.
+K2/K3/K4 payload and compares against the route-major trellis W4A8 scaffold
+with identity Hadamard transforms. Both paths quantize activations to MXFP8
+and decode the identical payload through the same codebook, so outputs agree
+to accumulation-order tolerance. ``trellis_codebook`` is parametrized over
+``lut_e4m3`` (the value-table decode) and ``procedural_npk`` (the table-free
+decode); each row builds its payload and its reference weights with the same
+law, so the row fails if the kernel decodes with the other arm's law.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from b12x._lib.quant.lut_e4m3 import (
     lut_e4m3_direct_table_cpu,
     lut_e4m3_value_table_cpu,
 )
+from b12x.moe._shared.trellis_codebooks import LUT_E4M3, PROCEDURAL_NPK
 from b12x.testing.reference.trellis_moe import (
     build_trellis_weight,
     trellis_moe_reference,
@@ -63,9 +67,19 @@ def _run_trellis_dynamic(
     tile_m: int = _TILE_M,
     split_materialized: bool = False,
     intermediate_hadamard: bool = False,
+    exact_hadamard: bool = False,
+    fp32_boundary: bool = False,
     direct_lut: bool = False,
     direct: bool = False,
     topk_ids_override: torch.Tensor | None = None,
+    bits: int = _BITS,
+    codebook: str = LUT_E4M3,
+    scaled: bool = False,
+    plane_const: int | None = None,
+    plane_mode: str = "random",
+    plane_order: str = "up_gate",
+    pre_quantized_a: bool = False,
+    deterministic: bool | None = None,
 ):
     device = torch.device("cuda")
     torch.manual_seed(seed)
@@ -73,10 +87,59 @@ def _run_trellis_dynamic(
 
     x = (torch.randn(m, K, device=device) * 1.0e-2).to(torch.bfloat16)
     gen = torch.Generator(device="cpu").manual_seed(seed * 7 + 5)
-    gate_payload, gate_w = build_trellis_weight(gen, E, n, K, _BITS, device)
-    up_payload, up_w = build_trellis_weight(gen, E, n, K, _BITS, device)
-    down_payload, down_w = build_trellis_weight(gen, E, K, n, _BITS, device)
-    w13_i16 = torch.stack((gate_payload, up_payload), dim=0).contiguous()
+    # A non-trivial UE8M0/K32 weight plane (bytes near 127, i.e. scales near
+    # one) so the trellis arm's sfb operands carry real exponents. The kernel
+    # takes the w13 plane in the released up-gate row order while the payload
+    # and the reference weights are gate-up.
+    # Drawn from their own generator so the payload draws (and therefore the
+    # E4M3 codes) are identical whether or not the plane is scaled.
+    gate_plane = up_plane = down_plane = None
+    if scaled:
+        plane_gen = torch.Generator(device="cpu").manual_seed(seed * 13 + 7)
+
+        def draw(shape):
+            if plane_const is not None or plane_mode == "const":
+                value = 127 if plane_const is None else int(plane_const)
+                return torch.full(shape, value, dtype=torch.uint8, device=device)
+            if plane_mode == "rows":
+                rows = torch.arange(shape[1], device=device)[None, :, None]
+                return (126 + (rows % 2)).expand(shape).to(torch.uint8).contiguous()
+            if plane_mode == "blocks":
+                blocks = torch.arange(shape[2], device=device)[None, None, :]
+                return (126 + (blocks % 2)).expand(shape).to(torch.uint8).contiguous()
+            return torch.randint(126, 129, shape, generator=plane_gen).to(
+                device=device, dtype=torch.uint8
+            )
+
+        if plane_mode == "halves":
+            # Distinct constant per projection: identifies which matrix each
+            # staged scale half scales.
+            gate_plane = torch.full(
+                (E, n, K // 32), 126, dtype=torch.uint8, device=device
+            )
+            up_plane = torch.full(
+                (E, n, K // 32), 129, dtype=torch.uint8, device=device
+            )
+            down_plane = torch.full(
+                (E, K, n // 32), 128, dtype=torch.uint8, device=device
+            )
+        else:
+            gate_plane = draw((E, n, K // 32))
+            up_plane = draw((E, n, K // 32))
+            down_plane = draw((E, K, n // 32))
+    gate_payload, gate_w = build_trellis_weight(
+        gen, E, n, K, bits, device, codebook=codebook, scale_plane=gate_plane
+    )
+    up_payload, up_w = build_trellis_weight(
+        gen, E, n, K, bits, device, codebook=codebook, scale_plane=up_plane
+    )
+    down_payload, down_w = build_trellis_weight(
+        gen, E, K, n, bits, device, codebook=codebook, scale_plane=down_plane
+    )
+    if plane_mode == "payload_swapped":
+        w13_i16 = torch.stack((up_payload, gate_payload), dim=0).contiguous()
+    else:
+        w13_i16 = torch.stack((gate_payload, up_payload), dim=0).contiguous()
     w2_i16 = down_payload.contiguous()
     w13_ref = torch.stack((gate_w, up_w), dim=0)
     if topk_ids_override is None:
@@ -113,14 +176,37 @@ def _run_trellis_dynamic(
             .to(torch.float16)
         ).to(device)
         rotations[:, 3 * n :] = signs
+    # Caller-quantized A: the boundary produces the exact operand bytes
+    # (E4M3 in the native K32 permutation + UE8M0 per block). The reference
+    # then runs on the dequantized value in natural K order, which is the same
+    # arithmetic the kernel performs with its permuted operands.
+    a_payload = a_scales = None
+    x_for_reference = x.float()
+    if pre_quantized_a:
+        from b12x.moe._shared.kernels import trellismx_boundary as _tb
+
+        a_payload, a_scales = _tb.input_boundary_quantized(
+            x, torch.ones(K, dtype=torch.float16, device=device), hidden_size=K
+        )
+        # The permutation is within each K32 block; tile its inverse across
+        # the row.
+        inverse = (
+            torch.arange(K // 32, device=device)[:, None] * 32
+            + torch.argsort(_tb._k32_permutation(device))[None, :]
+        ).reshape(-1)
+        dequant = a_payload.view(torch.float8_e4m3fn).float() * (
+            2.0 ** (a_scales.float() - 127.0)
+        ).repeat_interleave(32, dim=-1)
+        x_for_reference = dequant.index_select(-1, inverse)
     oracle = trellis_moe_reference(
-        x.float(),
+        x_for_reference,
         w13_ref,
         down_w,
         rotations,
         reference_ids,
         reference_weights,
         intermediate_hadamard=intermediate_hadamard,
+        codebook=codebook,
     )
     torch.cuda.synchronize()
 
@@ -144,9 +230,44 @@ def _run_trellis_dynamic(
     # counts); never dereferenced by the trellis staging.
     w13_packed = torch.zeros(E, w1_n, K // 2, dtype=torch.uint8, device=device)
     w2_packed = torch.zeros(E, K, n // 2, dtype=torch.uint8, device=device)
+    if scaled:
+        # The arm reads the w13 plane through the logical sfb_w13_mx slot in
+        # the released up-gate row order, and the w2 plane in hidden-row order.
+        # The arm reads the w13 plane exactly as the release stores it, row
+        # for row against the staged B tile (no gate/up offset), so the harness
+        # supplies the released up-gate order.
+        if plane_order == "up_gate":
+            w13_mx_flat = torch.cat((up_plane, gate_plane), dim=1).reshape(-1)
+        elif plane_order == "gate_up":
+            w13_mx_flat = torch.cat((gate_plane, up_plane), dim=1).reshape(-1)
+        else:
+            raise ValueError(plane_order)
+        down_mx_flat = down_plane.reshape(-1)
+    elif codebook == PROCEDURAL_NPK:
+        # The procedural_npk arm always reads the logical plane, so an
+        # "unscaled" row means the identity plane (byte 127 = exponent 0), not
+        # a zero buffer: a zero byte is the 2^-127 scale, i.e. zero weights.
+        w13_mx_flat = torch.full(
+            (E * w1_n * (K // 32),), 127, dtype=torch.uint8, device=device
+        )
+        down_mx_flat = torch.full(
+            (E * K * (n // 32),), 127, dtype=torch.uint8, device=device
+        )
+    else:
+        # lut_e4m3 decodes to a fully-scaled alphabet and never reads the
+        # logical plane; keep a non-null ABI slot (a null scale read is an
+        # out-of-bounds access, not an identity scale).
+        w13_mx_flat = torch.zeros(
+            E * w1_n * (K // 32), dtype=torch.uint8, device=device
+        )
+        down_mx_flat = torch.zeros(E * K * (n // 32), dtype=torch.uint8, device=device)
     scale_flat = torch.zeros(
         (E + m * top_k + 1) * tile_m * (K // 8), dtype=torch.uint8, device=device
     )
+    if pre_quantized_a:
+        # Scales, [tokens, hidden//32], in the same token-indexed buffer the
+        # arm stages A scales from.
+        scale_flat[: m * (K // 32)] = a_scales.reshape(-1)
 
     phys_tiles = E + (m * top_k + tile_m - 1) // tile_m
     rows_padded = phys_tiles * tile_m
@@ -154,6 +275,10 @@ def _run_trellis_dynamic(
     max_tasks = phys_tiles * max(gate_tile_cnt, 1)
 
     packed_a = torch.zeros(rows_padded * K, dtype=torch.uint8, device=device)
+    if pre_quantized_a:
+        # Token-indexed, exactly the layout the kernel gathers through
+        # token_map: payload [tokens, hidden].
+        packed_a[: m * K] = a_payload.reshape(-1)
     intermediate_u32 = torch.zeros(
         rows_padded * (n + n // 32) // 4, dtype=torch.int32, device=device
     )
@@ -193,9 +318,14 @@ def _run_trellis_dynamic(
             quant_recipe="w4a8_trellis",
             w4a8_repacked=True,
             num_topk=top_k,
-            trellis_bits=_BITS,
+            trellis_bits=bits,
             trellis_intermediate_hadamard=intermediate_hadamard,
+            trellis_exact_hadamard=exact_hadamard,
+            trellis_fp32_boundary=fp32_boundary,
+            trellis_pre_quantized_a=pre_quantized_a,
+            deterministic_output=bool(deterministic),
             trellis_direct_lut=direct_lut,
+            trellis_codebook=codebook,
             direct_routing=_direct,
             materialize_intermediate=split_materialized or _direct,
             share_input_across_experts=_share,
@@ -311,11 +441,17 @@ def _run_trellis_dynamic(
             ("tile_m", tile_m),
             ("split", int(split_materialized)),
             ("intermediate_hadamard", int(intermediate_hadamard)),
+            ("exact_hadamard", int(exact_hadamard)),
+            ("fp32_boundary", int(fp32_boundary)),
+            ("pre_quantized_a", int(pre_quantized_a)),
+            ("deterministic", int(bool(deterministic))),
             ("direct", int(_direct)),
             ("direct_lut", int(direct_lut)),
             ("share", int(_share)),
             ("activation", activation),
-            ("bits", _BITS),
+            ("bits", bits),
+            ("codebook", codebook),
+            ("scaled", int(scaled)),
             ("experts", E),
             ("hidden", K),
             ("intermediate", n),
@@ -351,8 +487,8 @@ def _run_trellis_dynamic(
         _gptr(cutlass.Float8E4M3FN, scale_flat),
         w2_packed,
         _gptr(cutlass.Float8E4M3FN, scale_flat),
-        _gptr(cutlass.Uint8, scale_flat),
-        _gptr(cutlass.Uint8, scale_flat),
+        _gptr(cutlass.Uint8, w13_mx_flat),
+        _gptr(cutlass.Uint8, down_mx_flat),
         _gptr(cutlass.Uint8, scale_flat),
         _gptr(cutlass.Uint8, scale_flat),
         _gptr(cutlass.Uint32, w13_flat),
@@ -388,10 +524,22 @@ def _run_trellis_dynamic(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["situ"])
+@pytest.mark.parametrize("codebook", [LUT_E4M3, PROCEDURAL_NPK])
+@pytest.mark.parametrize("bits", [2, 3, 4])
 @pytest.mark.parametrize("m", [1, 3])
-def test_dynamic_trellis_matches_scaffold(activation: str, m: int) -> None:
+def test_dynamic_trellis_matches_scaffold(
+    activation: str, m: int, bits: int, codebook: str
+) -> None:
     got, want = _run_trellis_dynamic(
-        activation=activation, E=8, m=m, K=512, n=256, top_k=4, seed=20260811
+        activation=activation,
+        E=8,
+        m=m,
+        K=512,
+        n=256,
+        top_k=4,
+        seed=20260811,
+        bits=bits,
+        codebook=codebook,
     )
     assert torch.isfinite(got).all()
     assert torch.count_nonzero(got) > 0
@@ -508,8 +656,12 @@ def test_dynamic_trellis_intermediate_hadamard_split_matches_scaffold(m: int) ->
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("codebook", [LUT_E4M3, PROCEDURAL_NPK])
+@pytest.mark.parametrize("bits", [2, 3, 4])
 @pytest.mark.parametrize("m", [1, 3])
-def test_dynamic_trellis_intermediate_hadamard_matches_scaffold(m: int) -> None:
+def test_dynamic_trellis_intermediate_hadamard_matches_scaffold(
+    m: int, bits: int, codebook: str
+) -> None:
     got, want = _run_trellis_dynamic(
         activation="situ",
         E=8,
@@ -519,6 +671,8 @@ def test_dynamic_trellis_intermediate_hadamard_matches_scaffold(m: int) -> None:
         top_k=4,
         seed=20260813,
         intermediate_hadamard=True,
+        bits=bits,
+        codebook=codebook,
     )
     assert torch.isfinite(got).all()
     cosine = torch.nn.functional.cosine_similarity(
@@ -560,3 +714,181 @@ def test_dynamic_trellis_direct_table_matches_value_table(
         got_direct.reshape(1, -1), want.reshape(1, -1)
     ).item()
     assert cosine > 0.995, cosine
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dynamic_trellis_pre_quantized_a_matches_scaffold() -> None:
+    """FC1's A operand arrives quantized; the kernel runs no producer.
+
+    One expert, M=8, procedural_npk. The operand bytes come from
+    ``input_boundary_quantized`` (E4M3 in the native K32 permutation + UE8M0
+    per block) and the reference runs on their dequantized value in natural K
+    order, so a second quantization -- or a second H128 -- anywhere in the
+    kernel shows up as a mismatch. The same run in producer mode is the
+    counterfactual: it quantizes the boundary output again and must differ.
+    """
+
+    kwargs = dict(
+        activation="situ",
+        E=1,
+        m=8,
+        K=512,
+        n=256,
+        top_k=1,
+        seed=20260817,
+        bits=4,
+        codebook=PROCEDURAL_NPK,
+        scaled=True,
+    )
+    got, want = _run_trellis_dynamic(**kwargs, pre_quantized_a=True)
+    assert torch.isfinite(got).all()
+    cosine = torch.nn.functional.cosine_similarity(
+        got.reshape(1, -1), want.reshape(1, -1)
+    ).item()
+    assert cosine > 0.995, cosine
+    rel_l2 = ((got - want).norm() / want.norm().clamp_min(1e-9)).item()
+    assert rel_l2 < 0.12, rel_l2
+    # Counterfactual: the producer path on the same x (the double-quantize bug).
+    produced, _ = _run_trellis_dynamic(**kwargs, pre_quantized_a=False)
+    assert not torch.allclose(got, produced, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [1, 3])
+def test_dynamic_trellis_scaled_weights_match_scaffold(m: int) -> None:
+    """The released UE8M0/K32 weight plane scales the decoded E4M3 operands.
+
+    procedural_npk is the scaled arm: it reads the logical ``sfb_*_mx`` plane
+    (w13 in the released up-gate row order) instead of the identity word. The
+    reference multiplies the same plane per K32 block, so a wrong plane, a
+    wrong row order or a dropped scale shows up as a cosine collapse. The
+    second run keeps the identical payload and drops only the plane, which
+    must change the result -- that is the proof the plane is consumed.
+    """
+
+    kwargs = dict(
+        activation="situ",
+        E=8,
+        m=m,
+        K=512,
+        n=256,
+        top_k=4,
+        seed=20260816,
+        bits=4,
+        codebook=PROCEDURAL_NPK,
+    )
+    got, want = _run_trellis_dynamic(**kwargs, scaled=True)
+    assert torch.isfinite(got).all()
+    cosine = torch.nn.functional.cosine_similarity(
+        got.reshape(1, -1), want.reshape(1, -1)
+    ).item()
+    assert cosine > 0.995, cosine
+    rel_l2 = ((got - want).norm() / want.norm().clamp_min(1e-9)).item()
+    assert rel_l2 < 0.12, rel_l2
+    # Identity plane (all bytes 127) over the identical payload: the only
+    # difference is the plane, so a consumed plane must move the result.
+    identity, _ = _run_trellis_dynamic(**kwargs, scaled=True, plane_const=127)
+    assert not torch.allclose(got, identity, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("codebook", [LUT_E4M3, PROCEDURAL_NPK])
+@pytest.mark.parametrize(
+    "exact_hadamard,fp32_boundary",
+    [(True, False), (False, True), (True, True)],
+)
+def test_dynamic_trellis_release_boundary_matches_scaffold(
+    codebook: str, exact_hadamard: bool, fp32_boundary: bool
+) -> None:
+    """The TrellisMX-order boundary options compile and stay inside the bound.
+
+    ``exact_hadamard`` divides where the scaffold reference pre-scales by a
+    rounded reciprocal, and ``fp32_boundary`` stages the boundary output in
+    FP32 where the reference is FP32 throughout; both differ from the mirrored
+    path by at most one E4M3 tie per element, so the acceptance bounds are the
+    file's, unchanged.
+    """
+
+    got, want = _run_trellis_dynamic(
+        activation="situ",
+        E=8,
+        m=3,
+        K=512,
+        n=256,
+        top_k=4,
+        seed=20260813,
+        intermediate_hadamard=True,
+        exact_hadamard=exact_hadamard,
+        fp32_boundary=fp32_boundary,
+        bits=4,
+        codebook=codebook,
+    )
+    assert torch.isfinite(got).all()
+    cosine = torch.nn.functional.cosine_similarity(
+        got.reshape(1, -1), want.reshape(1, -1)
+    ).item()
+    assert cosine > 0.995, cosine
+    rel_l2 = ((got - want).norm() / want.norm().clamp_min(1e-9)).item()
+    assert rel_l2 < 0.12, rel_l2
+
+
+def _trellis_backend(**overrides) -> MoEDynamicKernelBackend:
+    kwargs = dict(
+        activation="situ",
+        quant_recipe="w4a8_trellis",
+        w4a8_repacked=True,
+        num_topk=4,
+        trellis_bits=2,
+    )
+    kwargs.update(overrides)
+    tile_m = kwargs.pop("tile_m", 16)
+    return MoEDynamicKernelBackend(16, (tile_m, _TILE_N), **kwargs)
+
+
+def test_dynamic_trellis_npk_rejects_direct_lut() -> None:
+    """procedural_npk decodes in registers; the direct LUT has no meaning."""
+
+    with pytest.raises(ValueError, match="trellis_direct_lut"):
+        _trellis_backend(trellis_direct_lut=True, trellis_codebook=PROCEDURAL_NPK)
+
+
+def test_dynamic_trellis_npk_rejects_split_materialized() -> None:
+    """The shared split phase kernels carry no codebook selection; fail loudly.
+
+    The P8 phase owners decode procedural NPK themselves, so the gate admits a
+    split only when both phase kernels are replaced by a P8 owner.
+    """
+
+    with pytest.raises(NotImplementedError, match="procedural_npk"):
+        _trellis_backend(
+            tile_m=64,
+            materialize_intermediate=True,
+            trellis_codebook=PROCEDURAL_NPK,
+        )
+
+
+@pytest.mark.parametrize("flag", ["trellis_exact_hadamard", "trellis_fp32_boundary"])
+def test_dynamic_trellis_boundary_options_require_coupled_boundary(
+    flag: str,
+) -> None:
+    with pytest.raises(ValueError, match=flag):
+        _trellis_backend(**{flag: True})
+
+
+@pytest.mark.parametrize("codebook", ["mcg", "lut_fp16", "procedural-mcg"])
+def test_dynamic_trellis_rejects_non_w4a8_codebook(codebook: str) -> None:
+    """W4A16 codebook ids name widening decoders, not this arm's E4M3 law."""
+
+    with pytest.raises(ValueError, match="trellis_codebook"):
+        _trellis_backend(trellis_codebook=codebook)
+
+
+def test_dynamic_trellis_codebook_requires_trellis_recipe() -> None:
+    with pytest.raises(ValueError, match="w4a8_trellis"):
+        MoEDynamicKernelBackend(
+            16,
+            (16, _TILE_N),
+            quant_recipe="w4a8_mx",
+            w4a8_repacked=True,
+            trellis_codebook=PROCEDURAL_NPK,
+        )

@@ -92,6 +92,7 @@ from b12x.moe._shared.execution import (
     _TRELLIS_SOURCE_FORMATS as _EXECUTION_TRELLIS_SOURCE_FORMATS,
 )
 from b12x.moe._shared.trellis_codebooks import LUT_E4M3
+from b12x.moe._shared.trellis_codebooks import PROCEDURAL_NPK
 from b12x.preparation import DeviceIdentity
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
@@ -452,6 +453,14 @@ class B12XFP4ExpertWeights:
     a4_prefill_scales: bool = False
     _uniform_a1_scale: bool = field(default=False, init=False, repr=False)
     _a1_scale_version: int | None = field(default=None, init=False, repr=False)
+    # TrellisMX small-M plans keyed by ``(top_k, max_tokens)``. A plan holds
+    # views of this bundle's tensors and read-only compiled programs, but no
+    # mutable call buffer: every binding carves its own scratch out of the
+    # caller's arena. The plans live and die with the bundle;
+    # dataclasses.replace() starts an empty cache.
+    _trellismx_smallm_plans: dict = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.plan, MoEWeightPreparationPlan):
@@ -566,6 +575,13 @@ class B12XFP4ExpertWeights:
                     "FC2 shape does not match the prepared plan: "
                     f"actual={actual_w2}, expected={expected_w2}"
                 )
+
+        if representation is not None:
+            # A representation that depends on how its owner is assembled
+            # (the TrellisMX record with an attached P8 runtime) checks it.
+            validate_owner = getattr(representation.value, "validate_owner", None)
+            if validate_owner is not None:
+                validate_owner(self)
 
         if (
             self.immutable_input_scales
@@ -789,6 +805,13 @@ class TPMoEArenaLayout:
     core_workspace_nbytes: int
     total_nbytes: int
     core_token_counts: tuple[int, ...] = ()
+    # TrellisMX: where the small-M arm's caller-owned buffers live in the arena
+    # and how many bytes they take (zero when the arm does not serve this
+    # variant). ``smallm_layout`` is the arm's buffer layout, kept so bind can
+    # carve exactly the views preparation sized.
+    smallm_workspace_offset: int = 0
+    smallm_workspace_nbytes: int = 0
+    smallm_layout: object | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -852,6 +875,11 @@ class TPMoEScratchCaps:
     w4a16_a4_prefill_enabled: bool = False
     w4a16_a4_prefill_terms: int = 1
     w4a16_a4_prefill_warps: int = 8
+    # TrellisMX: the largest m the small-M arm serves for this variant (0: the
+    # grouped arm serves every m). Its buffers are part of the arena when it
+    # does, bind carves them out of the caller's buffer, and the binding carries
+    # the value to dispatch, which follows it instead of the bundle's default.
+    smallm_tokens: int = 0
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -1050,6 +1078,22 @@ class TPMoEScratchPlan:
                 f"top-k={int(self.caps.num_topk)}"
             )
         scratch_storage = scratch_tensor(scratch, self._scratch_specs, owner="TP MoE")
+        # The TrellisMX small-M arm's buffers are the caller's too: carve this
+        # binding's views out of the region the layout reserved for them. Each
+        # binding gets its own views, so two bindings of one plan never write
+        # each other's storage, and bind allocates nothing.
+        smallm_scratch = None
+        smallm_tokens = int(self.caps.smallm_tokens)
+        if self.layout.smallm_layout is not None:
+            from b12x.moe._shared.kernels.trellismx_smallm import (
+                carve_smallm_scratch,
+            )
+
+            smallm_scratch = carve_smallm_scratch(
+                scratch_storage,
+                self.layout.smallm_layout,
+                offset_bytes=self.layout.smallm_workspace_offset,
+            )
         # Eager vLLM bind: MAP caller-owned scratch into per-spec kernel-arg views
         # and build the binding directly. NEVER construct a workspace/arena object
         # (no _materialize_core_arena / _TPCoreArena) and never init/allocate -- the
@@ -1194,9 +1238,24 @@ class TPMoEScratchPlan:
             route_pack_launches=route_pack_launches,
             a4_prefill_launches=a4_prefill_launches,
         )
+        # The binding carries the caps' declaration either way: a raw scratch
+        # plan declares ``smallm_tokens=0`` by default (the grouped arm serves
+        # every m), and dispatch must follow that declaration rather than
+        # re-resolve the bundle's default. When the caps do reserve the arm, the
+        # arm's plan is built here for the same geometry the arena was sized
+        # for, so a binding of a raw scratch plan launches it exactly as one of
+        # a prepared plan does.
+        smallm_plan = None
+        if smallm_scratch is not None:
+            smallm_plan = _trellismx_smallm_plan(
+                experts, top_k=int(self.caps.num_topk), max_tokens=smallm_tokens
+            )
         return replace(
             binding,
             scales_expanded=bool(scales_expanded),
+            trellismx_smallm_tokens=smallm_tokens,
+            trellismx_smallm_plan=smallm_plan,
+            trellismx_smallm_scratch=smallm_scratch,
         )
 
 
@@ -1301,6 +1360,22 @@ class TPMoEFP4Binding:
     mixed_trellis_buffers: object | None = None
     compiler_scratch: torch.Tensor | None = None
     compiler_a4_prefill: bool | None = None
+    # TrellisMX P8: the caller-owned arena the runtime carves its buffers from
+    # and the launch configuration its prepared plan selected (``compiler_scratch``
+    # carries the arena). Both are None for every other implementation.
+    p8_launch: object | None = None
+    # TrellisMX: the largest m the small-M arm serves, as the plan that made
+    # this binding declared it (0: the grouped arm serves every m). A prepared
+    # plan stamps the value it compiled; a raw scratch plan stamps its caps'
+    # ``smallm_tokens``. Only a hand-constructed binding is None, and its
+    # dispatch resolves the bundle's default.
+    trellismx_smallm_tokens: int | None = None
+    # TrellisMX: the arm's plan and compiled programs, built by preparation for
+    # this plan's token count, and the arm's buffers carved from the caller's
+    # scratch for this binding. Dispatch launches them and allocates nothing;
+    # two bindings of one plan hold distinct buffers.
+    trellismx_smallm_plan: object | None = None
+    trellismx_smallm_scratch: object | None = None
 
     def run(self) -> torch.Tensor:
         from .api import run
@@ -1719,7 +1794,21 @@ def _derive_trellis_codebook(
 ) -> str | None:
     """Kernel decode codebook declared by the Trellis weight plan."""
 
-    del source_format
+    format_id = str(source_format or "").lower()
+    if format_id == "trellismx":
+        # The released sidecars decode with the procedural-NPK law; the LUT
+        # table would silently produce wrong weights.
+        if trellis_codebook not in (None, PROCEDURAL_NPK):
+            raise ValueError(
+                "source_format 'trellismx' requires trellis_codebook="
+                f"{PROCEDURAL_NPK!r}; got {trellis_codebook!r}"
+            )
+        return PROCEDURAL_NPK
+    if trellis_codebook == PROCEDURAL_NPK:
+        raise ValueError(
+            f"trellis_codebook={PROCEDURAL_NPK!r} requires source_format "
+            f"'trellismx'; got {source_format!r}"
+        )
     return trellis_codebook
 
 
@@ -2211,9 +2300,15 @@ def _w4a8_dynamic_materialized_enabled(
     share_input_across_experts: bool,
     deterministic_output: bool,
     planned_tile_m: int | None = None,
+    trellis_codebook: str | None = None,
 ) -> bool:
     """Resolve the complete unified-W4A8 specialization as one decision."""
 
+    if str(trellis_codebook or "").lower() == PROCEDURAL_NPK:
+        # The procedural-NPK trellis arm has no materialized-intermediate
+        # implementation (its phase kernels have no codebook selection), so a
+        # TrellisMX plan always constructs the monolithic w4a8_trellis arm.
+        return False
     dense_candidate = _w4a8_dynamic_dense_candidate(
         quant_mode=quant_mode,
         activation=activation,
@@ -2518,12 +2613,35 @@ def _safe_dynamic_max_rows_per_launch(
     return max(tile_m, safe_rows - (safe_rows % tile_m))
 
 
+def _activation_scale_cols_pad(k: int, quant_mode: str) -> int:
+    """A-operand scale bytes per row for ``quant_mode``.
+
+    The FP4 recipes carry one E4M3 scale per 16 values; the MX recipes
+    (``w4a8_mx``, ``w6a8_mx``, ``w8a8_mx``) carry one UE8M0 byte per 32, and
+    both ``_DynamicMoEW4A8Launch`` and ``_DynamicMoEByteContainerLaunch``
+    declare the plane as ``rows_padded * (k // 32)`` with no column padding
+    (``w4a8_phase1`` reads the row at ``tok * input_k128_tiles * 4`` = k/32
+    bytes). Sizing the MX recipes at the FP4 width therefore allocated twice
+    the bytes the launch reads, and ``_dynamic_rows_padded_limit`` budgeted its
+    row count against that doubled width. The plane is consumed as a flat
+    buffer (``_packed_input_binding_views`` hands the launch
+    ``packed_input_scale.view(-1)`` and its base pointer), so the extra bytes
+    were never read: the FP4 width was safe but wasteful, not wrong. The W4A8
+    recipes share this launch ABI; ``w4a8_nvfp4`` keeps the FP4 width, which
+    this change does not touch.
+    """
+
+    mx_scale_block = _MX_BYTE_CONTAINER_QUANT_MODES | {"w4a8_mx"}
+    block = 32 if str(quant_mode).lower() in mx_scale_block else _NVFP4_BLOCK_SIZE
+    return align_up(k // block, 4)
+
+
 def _dynamic_rows_padded_limit(k: int, *, quant_mode: str = "nvfp4") -> int:
     """Return the largest padded row count whose packed input and scale planes fit
     the runtime memref limit.
     """
     tile_m = _dynamic_tile_m(quant_mode)
-    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    cols_pad_k = _activation_scale_cols_pad(k, _normalize_quant_mode(quant_mode))
     _qm = _normalize_quant_mode(quant_mode)
     input_cols = (
         k
@@ -2652,6 +2770,12 @@ def _w4a8_mx_micro_preferred(
     query: MoeDecodeQuery,
     device: DeviceIdentity | None,
 ) -> bool:
+    if query.source_format == "trellismx":
+        # The micro W4A8 trellis arm carries no codebook selection: it decodes
+        # every payload through the lut_e4m3 value table, while TrellisMX
+        # payloads are procedural NPK. Route them to the dynamic monolithic
+        # arm, which owns that decode law.
+        return False
     if not _w4a8_mx_micro_supported(
         num_tokens=query.num_tokens,
         k=query.hidden_size,
@@ -2685,6 +2809,12 @@ def _w4a8_mx_micro_preferred(
 
 
 def _policy_micro_supported(query: MoeDecodeQuery) -> bool:
+    if query.source_format == "trellismx":
+        # The micro W4A8 trellis arm carries no codebook selection: it decodes
+        # every payload through the lut_e4m3 value table. TrellisMX payloads
+        # are procedural NPK, so they must run the dynamic monolithic arm,
+        # which is where that decode law lives.
+        return False
     if query.output_layout == "routes" or query.split_fc1_scales:
         return False
     if (
@@ -2720,6 +2850,10 @@ def _heuristic_dynamic_route_mode(
     *,
     planned_tile_m: int,
 ) -> str:
+    if query.source_format == "trellismx":
+        # The direct/materialized M16 band is not qualified for the
+        # procedural-NPK trellis arm; it runs the grouped dynamic schedule.
+        return "grouped"
     dynamic_n = _dynamic_kernel_intermediate_size(
         query.intermediate_size,
         query.quant_mode,
@@ -2905,6 +3039,14 @@ def _heuristic_moe_decode_config(
                     None if device is None else device.compute_capability
                 ),
             )[0]
+            if str(
+                query.source_format
+            ).lower() == "trellismx" and dynamic_tile_m not in (16, 32):
+                # w4a8_trellis builds monolithic tiles only up to M32 and M64/M128 only as the
+                # split-materialized phase kernels, which procedural NPK never takes
+                # (_w4a8_dynamic_materialized_enabled), so the large-prefill M64/M128 default
+                # cannot be built for TrellisMX. Cap it at M32.
+                dynamic_tile_m = 32
             dynamic_route_mode = _heuristic_dynamic_route_mode(
                 query,
                 device,
@@ -3860,7 +4002,9 @@ def _plan_core_workspace(
 
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
 
-    cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    # Recipe-dependent A scale granularity: 16 for the FP4 recipes, 32 for the
+    # MX recipes (see _activation_scale_cols_pad).
+    cols_pad_k = _activation_scale_cols_pad(k, quant_mode)
     direct_micro_tokens = max(1, routed_rows // max(1, num_topk))
     direct_micro_k_supported = (
         k > 0
@@ -6344,18 +6488,23 @@ def _w4a8_trellis_weight_views(
     rotations = rotations.contiguous()
     w13 = prepared.w13.contiguous().view(torch.uint8).reshape(-1)
     w2 = prepared.w2.contiguous().view(torch.uint8).reshape(-1)
+    # A TrellisMX bundle carries real UE8M0 sfb planes; the W4A16 trellis
+    # bundle carries only the boundary rotations, and the W4A8 scale slots are
+    # then compile-time dead.
     dummy = prepared.w2_scale
+    w13_scale = getattr(prepared, "w13_sfb", None)
+    w2_scale = getattr(prepared, "w2_sfb", None)
     return _WeightViews(
         w13=w13,
         down=w2,
-        w13_sf=dummy,
-        down_sf=dummy,
+        w13_sf=dummy if w13_scale is None else w13_scale,
+        down_sf=dummy if w2_scale is None else w2_scale,
         w1_alpha=w1_alphas,
         w2_alpha=w2_alphas,
         w1_storage=w13,
         w1_scale_storage=rotations,
         w2_storage=w2,
-        w2_scale_storage=dummy,
+        w2_scale_storage=dummy if w2_scale is None else w2_scale,
     )
 
 
@@ -6366,22 +6515,36 @@ def _w4a8_prepared_dict(prepared: object) -> dict[str, torch.Tensor]:
         values = prepared
     elif getattr(prepared, "weight_layout", None) == "trellis_t256":
         # Trellis-native representation: the rp slots carry the
-        # projection-major payloads and the sfb slots carry the fp16
-        # boundary rotations. The dynamic launch keys trellis mode off
-        # that dtype; the kernel's SFB operands are compile-time dead
-        # (identity UE8M0 word).
+        # projection-major payloads and the sfb slots carry the fp16 boundary
+        # rotations. The dynamic launch keys trellis mode off that dtype; the
+        # kernel's SFB operands are compile-time dead (identity UE8M0 word).
+        # A TrellisMX bundle additionally exposes its released UE8M0 planes in
+        # the logical (``sfb_*_mx``) slots, which is the operand the release's
+        # own monolithic arm reads (p8_native_kernel.py:326-328).
         values = {
             "w13_rp": prepared.w13,
             "w13_sfb": prepared.intermediate_rotations,
             "w2_rp": prepared.w2,
             "w2_sfb": prepared.intermediate_rotations,
         }
+        w13_scale = getattr(prepared, "w13_scale", None)
+        w2_scale = getattr(prepared, "w2_scale", None)
+        if isinstance(w13_scale, torch.Tensor) and isinstance(w2_scale, torch.Tensor):
+            values["w13_logical_scale"] = w13_scale
+            values["w2_logical_scale"] = w2_scale
+        boundary = getattr(prepared, "boundary", None)
+        if boundary is not None:
+            # Not a tensor: the prepared input/output stage ops the launch
+            # calls to fill the A operands.
+            values["boundary"] = boundary
     else:
         values = {
             name: getattr(prepared, name)
             for name in ("w13_rp", "w13_sfb", "w2_rp", "w2_sfb")
         }
     for name, value in values.items():
+        if name == "boundary":
+            continue
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"prepared W4A8 {name} must be a tensor")
     return values
@@ -6404,6 +6567,11 @@ def _w4a8_prepared_weight_views(
     views = _w4a8_prepared_dict(prepared)
     w13_rp = views["w13_rp"]
     w13_sfb = views["w13_sfb"]
+    # TrellisMX: the released logical UE8M0 planes feed the sfb_*_mx operands
+    # (what the release's monolithic arm consumes); the repacked sfb planes
+    # stay available on the prepared bundle for the split-materialized arms.
+    w13_logical = views.get("w13_logical_scale")
+    w2_logical = views.get("w2_logical_scale")
     w2_rp = views["w2_rp"]
     w2_sfb = views["w2_sfb"]
     return _WeightViews(
@@ -6419,8 +6587,8 @@ def _w4a8_prepared_weight_views(
         w2_scale_storage=w2_sfb,
         w13_fp4=w13_rp,
         down_fp4=w2_rp,
-        sfb_w13_mx=w13_sfb,
-        sfb_down_mx=w2_sfb,
+        sfb_w13_mx=w13_sfb if w13_logical is None else w13_logical,
+        sfb_down_mx=w2_sfb if w2_logical is None else w2_logical,
     )
 
 
@@ -7263,6 +7431,419 @@ def prepare_b12x_trellis_v2_weights(
     )
 
 
+#: TrellisMX runs the dynamic kernel's pre-quantized-A mode: the prepared input
+#: boundary writes the A payload and UE8M0 scales, and the kernel runs no FC1
+#: activation producer. Preparation's program planning and the prepared payload
+#: both read this, so the planned kernel is the one the run launches.
+_TRELLISMX_PRE_QUANTIZED_A = True
+
+#: What every prepared TrellisMX record declares, fixed: the W4A8 trellis arm,
+#: the small-M arm and an attached P8 runtime all execute exactly this, so a
+#: record (or a ``dataclasses.replace`` of one) declaring anything else is
+#: rejected instead of being planned for one computation and run as another.
+_TRELLISMX_RECORD_INVARIANTS = (
+    ("source_format", "trellismx"),
+    ("trellis_codebook", "procedural_npk"),
+    ("trellis_exact_hadamard", True),
+    ("trellis_fp32_boundary", True),
+    ("trellis_pre_quantized_a", _TRELLISMX_PRE_QUANTIZED_A),
+    ("weight_layout", "trellis_t256"),
+    ("scale_format", "e8m0_k32"),
+    ("w13_layout", "w13"),
+    ("params_dtype", torch.bfloat16),
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class _PreparedW4A8TrellisWeights:
+    """One rank-local TrellisMX layer in the W4A8 trellis prepared layout.
+
+    ``w13``/``w2`` are the released ``int16`` carriers unchanged (the W4A8
+    trellis arm's payload ABI is the same assembled ``[K16, N16, 16*bits]``
+    tile order the W4A16 arm uses), ``*_sfb`` are the released UE8M0 K32
+    planes repacked by ``_e8m0_scale_to_w4a8_sfb_inplace`` exactly as the
+    release's own loader does, and ``intermediate_rotations`` is the fp16
+    coupled-boundary rotation set (values followed by the appended per-expert
+    sign draw). The fields in ``_TRELLISMX_RECORD_INVARIANTS`` are not
+    configurable.
+    """
+
+    w13: torch.Tensor
+    w2: torch.Tensor
+    w13_scale: torch.Tensor
+    w2_scale: torch.Tensor
+    w13_sfb: torch.Tensor
+    w2_sfb: torch.Tensor
+    intermediate_rotations: torch.Tensor
+    gate_suh: torch.Tensor
+    up_suh: torch.Tensor
+    down_svh: torch.Tensor
+    w13_global_scale: torch.Tensor
+    w2_global_scale: torch.Tensor
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+    params_dtype: torch.dtype
+    trellis_bits: int
+    trellis_codebook: str = "procedural_npk"
+    # The coupled boundary divides by the exact Sylvester norm and keeps its
+    # per-expert arithmetic in FP32.
+    trellis_exact_hadamard: bool = True
+    trellis_fp32_boundary: bool = True
+    # The kernel runs no FC1 activation producer; the prepared input boundary
+    # writes the A payload and UE8M0 scales itself.
+    trellis_pre_quantized_a: bool = _TRELLISMX_PRE_QUANTIZED_A
+    # The coupled boundary as prepared, graph-capturable ops bound to this
+    # layer's released vectors (input stage before the kernel, output stage
+    # after it).
+    boundary: object | None = None
+    source_format: str = "trellismx"
+    w13_layout: str = "w13"
+    weight_layout: str = "trellis_t256"
+    scale_format: str = "e8m0_k32"
+    # Whether every UE8M0 byte keeps the small-M arm's fp16 weight-scale product
+    # exact (see _TRELLISMX_SMALLM_EXACT_SCALE_BYTES); otherwise small m runs the
+    # grouped arm, whose tensor cores consume the scales directly.
+    smallm_exact_scales: bool = False
+    # The external P8 runtime that serves this layer instead of this package's
+    # arms (``fused_moe.trellismx_p8``); it is verified against, and owned by,
+    # this record.
+    p8: object | None = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "w13",
+            "w2",
+            "w13_scale",
+            "w2_scale",
+            "w13_sfb",
+            "w2_sfb",
+            "intermediate_rotations",
+            "gate_suh",
+            "up_suh",
+            "down_svh",
+            "w13_global_scale",
+            "w2_global_scale",
+        ):
+            if not isinstance(getattr(self, name), torch.Tensor):
+                raise TypeError(f"prepared W4A8 trellis {name} must be a tensor")
+        if self.w13.dtype != torch.int16 or self.w2.dtype != torch.int16:
+            raise TypeError("prepared W4A8 trellis carriers must stay int16")
+        if int(self.trellis_bits) not in (2, 3, 4):
+            raise ValueError(
+                f"prepared W4A8 trellis bits must be 2, 3 or 4; got {self.trellis_bits}"
+            )
+        if self.intermediate_rotations.dtype != torch.float16:
+            raise TypeError("prepared W4A8 trellis rotations must be fp16")
+        for name, required in _TRELLISMX_RECORD_INVARIANTS:
+            value = getattr(self, name)
+            if type(value) is not type(required) or value != required:
+                raise ValueError(
+                    f"prepared TrellisMX records fix {name}={required!r}; got {value!r}"
+                )
+        if self.p8 is not None:
+            from .trellismx_p8 import TrellisMxP8Attachment, TrellisMxP8Descriptor
+
+            if not isinstance(self.p8, (TrellisMxP8Attachment, TrellisMxP8Descriptor)):
+                raise TypeError(
+                    "attach a P8 runtime with trellismx_p8.attach_trellismx_p8_runtime"
+                )
+            self.p8.check_record(self)
+
+    def validate_owner(self, owner: "B12XFP4ExpertWeights") -> None:
+        """Reject an expert bundle that does not execute this record's tensors."""
+
+        if self.p8 is not None:
+            self.p8.check_owner(owner, self)
+
+
+#: UE8M0 bytes for which the small-M arm's fp16 product ``w * 2**(b - 127)`` is
+#: exact. Decoded procedural-NPK weights span 2**-9 .. 8 (E4M3 with three
+#: mantissa bits), so the product is exact iff 2**-9 * 2**s >= 2**-24 (no fp16
+#: underflow) and 8 * 2**s <= 65504 (no overflow), i.e. s in [-15, 12].
+_TRELLISMX_SMALLM_EXACT_SCALE_BYTES = (112, 139)
+
+
+def prepare_b12x_trellis_w4a8_weights(
+    *,
+    plan: MoEWeightPreparationPlan,
+    source: object,
+    weights: object,
+    device: torch.device | str | None = None,
+) -> B12XFP4ExpertWeights:
+    """Prepare a released TrellisMX sidecar for the W4A8 trellis recipe.
+
+    Lossless by construction: the ``int16`` carriers are transferred as they
+    are, the UE8M0 planes are only *repacked* (byte-preserving permutation of
+    the same 32-byte K blocks), and a CSF slab is expanded to the identical
+    UE8M0 bytes.  Nothing is requantized, rounded or re-encoded.
+    """
+
+    from b12x.moe.fused_moe.source import TrellisSource
+    from b12x.moe.fused_moe.trellis import (
+        _effective_input_scales,
+        _effective_intermediate_scales,
+        _effective_output_scales,
+    )
+    from b12x.moe.fused_moe.trellis_layout import append_intermediate_signs
+    from b12x.moe.fused_moe.trellismx import TrellisMxWeights
+
+    if not isinstance(source, TrellisSource):
+        raise TypeError("source must be a TrellisSource")
+    if source.source_format != "trellismx":
+        raise ValueError(
+            "prepare_b12x_trellis_w4a8_weights requires source_format='trellismx'; "
+            f"got {source.source_format!r}"
+        )
+    if not isinstance(weights, TrellisMxWeights):
+        raise TypeError("trellismx preparation requires TrellisMxWeights")
+    if not isinstance(plan, MoEWeightPreparationPlan):
+        raise TypeError("plan must be a MoEWeightPreparationPlan")
+    if plan.quant_modes != frozenset({"w4a8_mx"}):
+        raise ValueError(
+            "trellismx lowers onto the W4A8 trellis recipe only; the plan "
+            f"declares {sorted(plan.quant_modes)}"
+        )
+    if plan.trellis_codebook != "procedural_npk":
+        raise ValueError(
+            "trellismx requires trellis_codebook='procedural_npk'; got "
+            f"{plan.trellis_codebook!r}"
+        )
+    if not plan.intermediate_hadamard:
+        raise ValueError(
+            "trellismx requires the coupled intermediate-Hadamard boundary"
+        )
+    if plan.intermediate_hadamard_blocks != (128, 128):
+        raise ValueError(
+            "trellismx requires coupled-boundary expert blocks (128, 128); got "
+            f"{plan.intermediate_hadamard_blocks}"
+        )
+    if plan.io_dtype != "bfloat16" or plan.activation != "silu":
+        # Every TrellisMX execution path (the fused boundary kernels, the
+        # small-M arm, a P8 runtime) takes BF16 activations through silu-cap10.
+        raise ValueError(
+            "trellismx executes BF16 silu; the plan declares "
+            f"io_dtype={plan.io_dtype!r}, activation={plan.activation!r}"
+        )
+
+    experts = int(plan.num_experts)
+    hidden = int(plan.hidden_size)
+    local = int(plan.intermediate_size)
+    bits = int(plan.trellis_bits)
+    hidden_tiles = hidden // 16
+    local_tiles = local // 16
+    stream_words = 16 * bits
+    for name in ("num_experts", "hidden_size", "intermediate_size"):
+        value = int(getattr(plan, name))
+        if value <= 0:
+            raise ValueError(f"trellismx plan {name} must be positive")
+
+    # Kernel tiling the W4A8 trellis arm requires (K16/N16 windows, 128-wide
+    # activation boundary, K32 scale groups).
+    if hidden % 128 or local % 128:
+        raise ValueError(
+            "trellismx requires hidden_size % 128 == 0 and intermediate_size "
+            f"% 128 == 0; got H={hidden}, I={local}"
+        )
+
+    if device is None:
+        device = weights.w13.device
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        # ``torch.device("cuda") != torch.device("cuda:0")``; the scale
+        # validators compare device identity, so resolve the index once here.
+        device = torch.device("cuda", torch.cuda.current_device())
+
+    def to_device(tensor: torch.Tensor, *, name: str) -> torch.Tensor:
+        if tensor.device.type not in ("cpu", "cuda"):
+            raise ValueError(f"{name} must live on CPU or CUDA")
+        return tensor.to(device=device)
+
+    w13 = to_device(weights.w13, name="w13_trellis")
+    w2 = to_device(weights.w2, name="w2_trellis")
+    expected_w13 = (2, experts, hidden_tiles, local_tiles, stream_words)
+    expected_w2 = (experts, local_tiles, hidden_tiles, stream_words)
+    if tuple(w13.shape) != expected_w13:
+        raise ValueError(
+            f"w13_trellis must have shape {expected_w13}; got {tuple(w13.shape)}"
+        )
+    if tuple(w2.shape) != expected_w2:
+        raise ValueError(
+            f"w2_trellis must have shape {expected_w2}; got {tuple(w2.shape)}"
+        )
+    w13 = w13.contiguous()
+    w2 = w2.contiguous()
+
+    def scale_plane(
+        value: object, *, name: str, rows: int, columns: int
+    ) -> torch.Tensor:
+        from b12x.loader._csf_source import CsfSource
+
+        from b12x.moe.fused_moe.trellismx import decode_csf_scale_plane
+
+        if isinstance(value, CsfSource):
+            plane, _bases = decode_csf_scale_plane(value, name=name)
+        elif isinstance(value, torch.Tensor):
+            plane = value
+        else:
+            raise TypeError(
+                f"{name} must be a uint8 UE8M0 plane or a CSF source; got "
+                f"{type(value).__name__}"
+            )
+        if plane.dtype != torch.uint8:
+            raise ValueError(f"{name} must be uint8; got {plane.dtype}")
+        if tuple(plane.shape) != (experts, rows, columns):
+            raise ValueError(
+                f"{name} must have shape {(experts, rows, columns)}; got "
+                f"{tuple(plane.shape)}"
+            )
+        if bool(torch.any(plane > 247)):
+            # The W4A8 sfb repack clamps E8M0 to 247; a released plane above
+            # that would be silently changed, so refuse it instead.
+            raise ValueError(
+                f"{name} carries a UE8M0 scale above the W4A8 repack range "
+                f"(max {int(plane.max())} > 247); refusing to clamp a released "
+                "scale"
+            )
+        return to_device(plane, name=name).contiguous()
+
+    w13_scale = scale_plane(
+        weights.w13_scale, name="w13_scale", rows=2 * local, columns=hidden // 32
+    )
+    w2_scale = scale_plane(
+        weights.w2_scale, name="w2_scale", rows=hidden, columns=local // 32
+    )
+    low, high = _TRELLISMX_SMALLM_EXACT_SCALE_BYTES
+    smallm_exact_scales = all(
+        low <= int(plane.min()) and int(plane.max()) <= high
+        for plane in (w13_scale, w2_scale)
+    )
+
+    # The released w13 plane is already in kernel (up-gate) order and the
+    # kernel's trellis arm reads it as stored (no gate/up row offset), so it is
+    # handed over unchanged; swapping its halves here would double-swap them.
+    # Repack into the W4A8 sfb layout. The conversion writes in place, so each
+    # plane is cloned first and the logical plane is retained for the
+    # monolithic arm's sfb_*_mx slot.
+    w13_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
+        w13_scale.clone(),
+        weight_E=experts,
+        rows=2 * local,
+        k_dim=hidden,
+        gated_half_rows=local,
+    )
+    w2_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
+        w2_scale.clone(),
+        weight_E=experts,
+        rows=hidden,
+        k_dim=local,
+    )
+
+    sign_patterns = to_device(
+        weights.expert_sign_patterns, name="expert_sign_patterns"
+    ).contiguous()
+    if sign_patterns.dtype != torch.uint8 or tuple(sign_patterns.shape) != (experts,):
+        raise ValueError(
+            f"expert_sign_patterns must be uint8[{experts}]; got "
+            f"{sign_patterns.dtype} {tuple(sign_patterns.shape)}"
+        )
+    if source.extent is None or source.extent.intermediate_size != local:
+        raise ValueError(
+            "trellismx preparation requires an extent covering exactly the "
+            "local intermediate size"
+        )
+
+    scale = source.config.scale
+    gate_suh, up_suh = _effective_input_scales(
+        weights.input_scales,
+        scale.input_scales,
+        num_experts=experts,
+        hidden_size=hidden,
+        device=device,
+    )
+    intermediate = _effective_intermediate_scales(
+        weights.intermediate_scales,
+        scale.intermediate_scales,
+        num_experts=experts,
+        intermediate_size=local,
+        device=device,
+    )
+    down_svh = _effective_output_scales(
+        weights.output_scales,
+        scale.output_scales,
+        num_experts=experts,
+        hidden_size=hidden,
+        device=device,
+    )
+
+    rotations = append_intermediate_signs(
+        intermediate.reshape(experts, -1),
+        sign_patterns,
+        extent=source.extent,
+    )
+    if int(rotations.shape[1]) != 6 * local:
+        raise RuntimeError(
+            "trellismx coupled-boundary rotations must be 6*I wide; got "
+            f"{int(rotations.shape[1])}"
+        )
+
+    from b12x.moe.fused_moe.trellismx import TrellisMxBoundaryOps
+
+    boundary = TrellisMxBoundaryOps(
+        hidden_size=hidden,
+        intermediate_size=local,
+        bits=bits,
+        gate_up_suh=gate_suh[0].contiguous(),
+        down_svh=down_svh[0].contiguous(),
+    )
+    # Per-expert alphas: the dynamic launch indexes them by expert id, so a
+    # 0-dim scalar would be read out of bounds for every expert but the first
+    # (that is what made expert 0 the only correct expert on the real GLM
+    # bundle: e>=1 picked up ~0 and its output collapsed by six orders).
+    unit = torch.ones(experts, dtype=torch.float32, device=device)
+    value = _PreparedW4A8TrellisWeights(
+        w13=w13,
+        w2=w2,
+        w13_scale=w13_scale,
+        w2_scale=w2_scale,
+        w13_sfb=w13_sfb,
+        w2_sfb=w2_sfb,
+        intermediate_rotations=rotations,
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        down_svh=down_svh,
+        w13_global_scale=unit,
+        w2_global_scale=unit,
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=local,
+        params_dtype=torch.bfloat16,
+        trellis_bits=bits,
+        trellis_codebook=plan.trellis_codebook,
+        trellis_pre_quantized_a=_TRELLISMX_PRE_QUANTIZED_A,
+        boundary=boundary,
+        w13_layout=plan.w13_layout,
+        smallm_exact_scales=smallm_exact_scales,
+    )
+    representation = _PreparedWeightRepresentation(
+        quant_mode="w4a8_mx",
+        layout=PreparedWeightLayout.TRELLIS_NATIVE,
+        value=value,
+    )
+    return B12XFP4ExpertWeights(
+        plan=plan,
+        a1_gscale=unit,
+        w1_fp4=value.w13,
+        w1_blockscale=value.w13_sfb,
+        w1_alphas=value.w13_global_scale,
+        a2_gscale=unit,
+        w2_fp4=value.w2,
+        w2_blockscale=value.w2_sfb,
+        w2_alphas=value.w2_global_scale,
+        representation=representation,
+    )
+
+
 def prepare_w4a16_fc2_e8m0(
     w2_fp4: torch.Tensor,
     w2_e8m0_scale: torch.Tensor,
@@ -7358,7 +7939,7 @@ def run_w4a16_fc2_e8m0(
     if experts.w2.device != intermediate.device:
         raise ValueError("prepared FC2 weights and activations must share a device")
     if output is None:
-        if torch.cuda.is_current_stream_capturing():
+        if _cuda_capturing():
             raise RuntimeError("FC2-only output must be preallocated during capture")
         output = torch.empty(
             (m, experts.hidden_size),
@@ -8316,6 +8897,7 @@ def plan_tp_moe_arena_layout(
     raw_routes: bool = False,
     w4a16_block_size_m: int | None = None,
     w4a16_prefill_fused_sum: bool | None = None,
+    smallm_tokens: int = 0,
     decode_config: MoeDecodeConfig,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
@@ -8444,11 +9026,67 @@ def plan_tp_moe_arena_layout(
     else:
         route_nbytes = 0
     route_nbytes = align_up(route_nbytes, 16)
+    # The TrellisMX small-M arm's buffers are the caller's too: they follow the
+    # grouped arm's regions in the same arena, 16-byte aligned like every launch
+    # pointer, and are sized from the arm's own layout.
+    smallm_layout = None
+    smallm_offset = 0
+    smallm_nbytes = 0
+    if smallm_tokens and source_format != "trellismx":
+        raise ValueError(
+            f"the small-M arm serves trellismx experts; got {source_format!r}"
+        )
+    if smallm_tokens:
+        smallm_layout = _smallm_scratch_layout(
+            hidden_size=k,
+            intermediate_size=n,
+            num_experts=weight_E,
+            top_k=num_topk,
+            max_tokens=int(smallm_tokens),
+            device=device,
+        )
+        smallm_offset = align_up(route_nbytes + core_nbytes, 16)
+        smallm_nbytes = int(smallm_layout.nbytes)
     return TPMoEArenaLayout(
         route_workspace_nbytes=route_nbytes,
         core_workspace_nbytes=core_nbytes,
-        total_nbytes=max(route_nbytes + core_nbytes, 1),
+        total_nbytes=max(route_nbytes + core_nbytes, smallm_offset + smallm_nbytes, 1),
         core_token_counts=core_token_counts,
+        smallm_workspace_offset=smallm_offset,
+        smallm_workspace_nbytes=smallm_nbytes,
+        smallm_layout=smallm_layout,
+    )
+
+
+def _smallm_scratch_layout(
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    max_tokens: int,
+    device: torch.device,
+):
+    """The small-M arm's buffer layout for one geometry, without allocating.
+
+    The arm's packed scratch is bounded by the device's SM count, so the layout
+    needs the device; it reads no tensor and allocates nothing.
+    """
+
+    from b12x.moe._shared.kernels.trellismx_smallm import smallm_scratch_layout
+
+    if torch.device(device).type != "cuda":
+        raise RuntimeError(
+            "the TrellisMX small-M arm's scratch is sized on its CUDA device; "
+            f"got {device}"
+        )
+    return smallm_scratch_layout(
+        hidden_size=int(hidden_size),
+        intermediate_size=int(intermediate_size),
+        num_experts=int(num_experts),
+        top_k=int(top_k),
+        max_tokens=int(max_tokens),
+        sms=int(torch.cuda.get_device_properties(device).multi_processor_count),
     )
 
 
@@ -8474,7 +9112,7 @@ def _plan_full_rotation_w4a16_launches(
         return (), ()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA must be available before planning Trellis MoE")
-    if torch.cuda.is_current_stream_capturing():
+    if _cuda_capturing():
         raise RuntimeError("Trellis launch planning cannot run during capture")
 
     from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
@@ -8618,7 +9256,7 @@ def _plan_projection_mixed_trellis_launches(
         return ()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA must be available before planning Trellis MoE")
-    if torch.cuda.is_current_stream_capturing():
+    if _cuda_capturing():
         raise RuntimeError("Trellis launch planning cannot run during capture")
     if not core_plan.route_block_size_m:
         raise RuntimeError(
@@ -9047,6 +9685,7 @@ def _plan_tp_moe_arena_layout_from_caps(
         raw_routes=caps.output_layout == "routes",
         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
+        smallm_tokens=int(caps.smallm_tokens),
         decode_config=caps.decode_config,
     )
 
@@ -10923,12 +11562,18 @@ class _DynamicMoEW4A8Launch:
     sizes the packed-A scratch for one E4M3 byte per element with plain
     per-32 activation scales."""
 
-    def __init__(self, kernel, k, n, w1_n, num_topk):
+    def __init__(
+        self, kernel, k, n, w1_n, num_topk, *, materialize_intermediate_n=True
+    ):
         self._kernel = kernel
         self._k = k
         self._n = n
         self._w1_n = w1_n
         self._num_topk = num_topk
+        # The materialized phase kernels write N128-padded intermediate tiles,
+        # so their scratch view is declared at the padded extent. A kernel that
+        # writes exactly ``n`` columns declares ``n``.
+        self._materialize_intermediate_n = bool(materialize_intermediate_n)
 
     @cute.jit
     def __call__(
@@ -11020,7 +11665,9 @@ class _DynamicMoEW4A8Launch:
             scale_storage_ptr,
             layout=cute.make_layout((rows_padded * (self._k // 32),), stride=(1,)),
         )
-        materialized_n = align_up(self._n, 128)
+        materialized_n = (
+            align_up(self._n, 128) if self._materialize_intermediate_n else self._n
+        )
         intermediate_u32 = cute.make_tensor(
             intermediate_ptr,
             layout=cute.make_layout(
@@ -11093,6 +11740,9 @@ class _DynamicMoEW4A8Launch:
                 down_rp_ptr,
                 layout=cute.make_layout((num_experts * _tr_down_u32,), stride=(1,)),
             )
+            # The trellis arm parks the fp16 boundary rotations in these slots
+            # (the scale operands it reads are the logical ``sfb_*_mx`` planes
+            # bound above), so they are compile-time dead here.
             _tr_sentinel = cute.make_layout((1,), stride=(1,))
             w13_sfb_rp = cute.make_tensor(w13_sfb_rp_ptr, layout=_tr_sentinel)
             down_sfb_rp = cute.make_tensor(down_sfb_rp_ptr, layout=_tr_sentinel)
@@ -11302,6 +11952,10 @@ def _get_dynamic_kernel(
     swiglu_beta: float | None = None,
     trellis_bits: int = 0,
     trellis_intermediate_hadamard: bool = False,
+    trellis_codebook: str = LUT_E4M3,
+    trellis_exact_hadamard: bool = False,
+    trellis_fp32_boundary: bool = False,
+    trellis_pre_quantized_a: bool = False,
     planned_tile_m: int | None = None,
     planned_num_tokens: int | None = None,
 ):
@@ -11367,6 +12021,7 @@ def _get_dynamic_kernel(
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
         planned_tile_m=planned_tile_m,
+        trellis_codebook=trellis_codebook,
     ) or (quant_mode == "nvfp4" and nvfp4_materialize_intermediate)
     if w4a8_n64_repacked and not w4a8_repacked:
         raise ValueError("w4a8_n64_repacked requires repacked W4A8 weights")
@@ -11438,6 +12093,10 @@ def _get_dynamic_kernel(
         int(materialized_fc1_cta_budget),
         int(trellis_bits),
         bool(trellis_intermediate_hadamard),
+        str(trellis_codebook),
+        bool(trellis_exact_hadamard),
+        bool(trellis_fp32_boundary),
+        bool(trellis_pre_quantized_a),
         *(("csf_inline_scales",) if csf_inline_scales else ()),
     )
     reuse_compiled = _first_env(
@@ -11502,6 +12161,14 @@ def _get_dynamic_kernel(
         kernel_kwargs["trellis_intermediate_hadamard"] = bool(
             trellis_intermediate_hadamard
         )
+        kernel_kwargs["trellis_exact_hadamard"] = bool(trellis_exact_hadamard)
+        kernel_kwargs["trellis_fp32_boundary"] = bool(trellis_fp32_boundary)
+        if trellis_pre_quantized_a:
+            # Only pass the option when it is selected: the activation
+            # wrappers enumerate their kwargs, so an explicit False would need
+            # their forwarding line too.
+            kernel_kwargs["trellis_pre_quantized_a"] = True
+        kernel_kwargs["trellis_codebook"] = str(trellis_codebook)
     elif is_w4a8:
         kernel_kwargs["quant_recipe"] = quant_mode
         kernel_kwargs["w4a8_repacked"] = bool(w4a8_repacked)
@@ -11869,6 +12536,10 @@ def _launch_dynamic_flat(
     planned_tile_m: int,
     planned_direct_routing: bool,
     planned_num_tokens: int,
+    trellis_codebook: str = LUT_E4M3,
+    trellis_exact_hadamard: bool = False,
+    trellis_fp32_boundary: bool = False,
+    trellis_pre_quantized_a: bool = False,
 ) -> None:
     """Launch the compiled dynamic MoE kernel over bound workspace and weight views."""
     quant_mode = _normalize_quant_mode(quant_mode)
@@ -11887,17 +12558,19 @@ def _launch_dynamic_flat(
         scatter_rows *= (n + tile_n - 1) // tile_n
     # A trellis-native w4a8 binding carries the fp16 boundary rotations in
     # the sfb slot (the QMMA repack stores int32 scale words there); the
-    # trellis geometry is recovered from the operand extents.
+    # trellis geometry is recovered from the operand extents. TrellisMX uses
+    # the same slots and additionally supplies its released UE8M0 planes in
+    # the logical ``sfb_*_mx`` operands.
     w4a8_trellis = _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.float16
     trellis_bits = 0
     trellis_intermediate_hadamard = False
     trellis_lut_tensor = None
+    trellis_rotations = w13_sfb_rp
     if w4a8_trellis:
         from b12x.moe._shared.kernels.w4a16.kernel.config import (
             _trellis256_execution_lut,
         )
 
-        trellis_lut_tensor = _trellis256_execution_lut(a.device, LUT_E4M3)
         payload_u32 = w13_rp.numel() * w13_rp.element_size() // 4
         window_words = 2 * E * (k // 16) * (n // 16) * 8
         trellis_bits = payload_u32 // window_words
@@ -11914,6 +12587,10 @@ def _launch_dynamic_flat(
                 "w4a8 trellis rotation extent must be E*3n or E*6n fp16 "
                 f"values, got {rot_elems} for E={E}, n={n}"
             )
+        # The 4 KiB lut_e4m3 table is unused by the procedural NPK arm
+        # (``w4a8_trellis_lut`` is False there) but the launch ABI still
+        # carries a valid pointer for it.
+        trellis_lut_tensor = _trellis256_execution_lut(a.device, LUT_E4M3)
     if w4a8_repacked and int(n) % 128 != 0 and not w4a8_n64_repacked:
         # The legacy N128 repack materializes zero-padded weight tails. Launch
         # that representation at its physical N extent. Exact N64 repacks keep
@@ -11967,6 +12644,7 @@ def _launch_dynamic_flat(
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
         planned_tile_m=planned_tile_m,
+        trellis_codebook=trellis_codebook,
     ) or (quant_mode == "nvfp4" and nvfp4_materialize_intermediate)
     external_route_plan_supported = _dynamic_external_route_plan_supported(
         quant_mode=quant_mode,
@@ -12008,6 +12686,16 @@ def _launch_dynamic_flat(
         # The compact split-M16 front-end retains one cooperative participant
         # per SM. Its standalone phase kernels launch their own two-wave grids,
         # but those CTAs do not join the front-end's grid-wide barrier.
+        effective_mac = min(effective_mac, get_num_sm(torch.device("cuda")))
+    elif (
+        w4a8_repacked
+        and selected_tile_m <= 32
+        and str(trellis_codebook).lower() == PROCEDURAL_NPK
+    ):
+        # The procedural-NPK trellis arm stages a different shared-memory and
+        # register budget than the QMMA repack (it decodes in registers and
+        # carries no value table), so the two-wave allowance below does not
+        # hold: keep the conservative one-CTA/SM resident cap.
         effective_mac = min(effective_mac, get_num_sm(torch.device("cuda")))
     elif w4a8_repacked and selected_tile_m <= 32:
         # The compact repacked-W4A8 storage specialization is deliberately
@@ -12096,6 +12784,10 @@ def _launch_dynamic_flat(
         swiglu_beta=swiglu_beta,
         trellis_bits=trellis_bits,
         trellis_intermediate_hadamard=trellis_intermediate_hadamard,
+        trellis_codebook=trellis_codebook,
+        trellis_exact_hadamard=trellis_exact_hadamard,
+        trellis_fp32_boundary=trellis_fp32_boundary,
+        trellis_pre_quantized_a=trellis_pre_quantized_a,
         planned_tile_m=planned_tile_m,
         planned_num_tokens=planned_num_tokens,
     )
@@ -12216,7 +12908,7 @@ def _launch_dynamic_flat(
         *(
             (
                 _gptr(cutlass.Uint8, trellis_lut_tensor),
-                _gptr(cutlass.Float16, w13_sfb_rp),
+                _gptr(cutlass.Float16, trellis_rotations),
             )
             if w4a8_trellis
             else ()
@@ -12245,6 +12937,10 @@ def _encode_dynamic_launch_policy(
     mma_warps: int | None = None,
     materialized_fc1_cta_budget: int = 2,
     swiglu_clamp_after_silu: bool = False,
+    trellis_exact_hadamard: bool = False,
+    trellis_fp32_boundary: bool = False,
+    trellis_procedural_npk: bool = False,
+    trellis_pre_quantized_a: bool = False,
 ) -> int:
     try:
         tile_code = _DYNAMIC_TILE_M_POLICY_CODES[int(planned_tile_m)]
@@ -12272,7 +12968,14 @@ def _encode_dynamic_launch_policy(
         | (int(mma_warps == 4) << 7)
         | (int(bool(swiglu_clamp_after_silu)) << 8)
         | (int(bool(csf_inline_scales)) << 9)
-        | ((int(policy_max_active_clusters) + 1) << 10)
+        # TrellisMX compile-time selections. They change compiled code, so
+        # they travel with the launch policy (the custom-op schema has a hard
+        # 64-argument ceiling) and the cluster count starts above them.
+        | (int(bool(trellis_exact_hadamard)) << 10)
+        | (int(bool(trellis_fp32_boundary)) << 11)
+        | (int(bool(trellis_procedural_npk)) << 12)
+        | (int(bool(trellis_pre_quantized_a)) << 13)
+        | ((int(policy_max_active_clusters) + 1) << 14)
         | (_DYNAMIC_FC1_BUDGET3_BIT if materialized_fc1_cta_budget == 3 else 0)
     )
 
@@ -12289,7 +12992,19 @@ def _decode_dynamic_launch_policy(
         bool(value & 32),
         bool(value & 64),
         4 if value & 128 else None,
-        ((value & (_DYNAMIC_FC1_BUDGET3_BIT - 1)) >> 10) - 1,
+        ((value & (_DYNAMIC_FC1_BUDGET3_BIT - 1)) >> 14) - 1,
+    )
+
+
+def _decode_dynamic_trellis_policy(value: int) -> tuple[bool, bool, bool, bool]:
+    """``(exact_hadamard, fp32_boundary, procedural_npk, pre_quantized_a)``."""
+
+    value = int(value)
+    return (
+        bool(value & 1024),
+        bool(value & 2048),
+        bool(value & 4096),
+        bool(value & 8192),
     )
 
 
@@ -12401,6 +13116,12 @@ def _tp_moe_dynamic_launch_op(
         mma_warps,
         policy_max_active_clusters,
     ) = _decode_dynamic_launch_policy(launch_policy)
+    (
+        trellis_exact_hadamard,
+        trellis_fp32_boundary,
+        trellis_procedural_npk,
+        trellis_pre_quantized_a,
+    ) = _decode_dynamic_trellis_policy(launch_policy)
     swiglu_clamp_after_silu = bool(launch_policy & 256)
     _launch_dynamic_flat(
         packed_a_view=packed_a_view,
@@ -12480,6 +13201,10 @@ def _tp_moe_dynamic_launch_op(
         planned_tile_m=planned_tile_m,
         planned_direct_routing=planned_direct_routing,
         planned_num_tokens=planned_num_tokens,
+        trellis_codebook=(PROCEDURAL_NPK if trellis_procedural_npk else LUT_E4M3),
+        trellis_exact_hadamard=bool(trellis_exact_hadamard),
+        trellis_fp32_boundary=bool(trellis_fp32_boundary),
+        trellis_pre_quantized_a=bool(trellis_pre_quantized_a),
     )
 
 
@@ -12592,6 +13317,10 @@ def _launch_dynamic(
     planned_tile_m: int = 128,
     dynamic_route_mode: str = "grouped",
     planned_num_tokens: int | None = None,
+    trellis_codebook: str = LUT_E4M3,
+    trellis_exact_hadamard: bool = False,
+    trellis_fp32_boundary: bool = False,
+    trellis_pre_quantized_a: bool = False,
 ) -> None:
     del stream
     if dynamic_route_mode not in {"direct", "grouped"}:
@@ -12608,9 +13337,43 @@ def _launch_dynamic(
         mma_warps=mma_warps,
         materialized_fc1_cta_budget=materialized_fc1_cta_budget,
         swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+        trellis_exact_hadamard=trellis_exact_hadamard,
+        trellis_fp32_boundary=trellis_fp32_boundary,
+        trellis_procedural_npk=(str(trellis_codebook).lower() == PROCEDURAL_NPK),
+        trellis_pre_quantized_a=trellis_pre_quantized_a,
     )
     if raw_routes:
         launch_policy -= _DYNAMIC_RAW_ROUTES_BIT
+    if trellis_pre_quantized_a:
+        # The kernel runs no FC1 activation producer in this mode: the prepared
+        # input boundary writes the A operand bytes itself, one E4M3 byte per
+        # hidden channel in the native K32 permutation and one UE8M0 byte per
+        # K32 block, at token rows 0..m-1 of the arena the launch reads.
+        boundary = None if w4a8_prepared is None else w4a8_prepared.get("boundary")
+        if boundary is None:
+            raise RuntimeError(
+                "trellis_pre_quantized_a requires the prepared TrellisMX "
+                "boundary (the launch has no A producer to fall back on)"
+            )
+        payload, scales = boundary.input_boundary_quantized(a)
+        if tuple(payload.shape) != (m, k) or payload.dtype != torch.uint8:
+            raise RuntimeError(
+                f"prepared A payload must be uint8 {(m, k)}; got "
+                f"{payload.dtype} {tuple(payload.shape)}"
+            )
+        if tuple(scales.shape) != (m, k // 32) or scales.dtype != torch.uint8:
+            raise RuntimeError(
+                f"prepared A scales must be uint8 {(m, k // 32)}; got "
+                f"{scales.dtype} {tuple(scales.shape)}"
+            )
+        payload_flat = workspace.packed_a_flat
+        scale_flat_storage = workspace.scale_flat
+        if payload_flat.numel() < m * k or scale_flat_storage.numel() < m * (k // 32):
+            raise RuntimeError(
+                "prepared A operands exceed the planned packed-input capacity"
+            )
+        payload_flat[: m * k].copy_(payload.reshape(-1))
+        scale_flat_storage[: m * (k // 32)].copy_(scales.reshape(-1))
     if deterministic_output and workspace.route_output.numel() < routed_rows * k:
         raise RuntimeError(
             "deterministic dynamic launch exceeds the planned route-output "
@@ -13463,15 +14226,358 @@ def _finalize_trellis_output(
     return target
 
 
+#: GLM-5.3 ``silu-cap10``; the small-M arm and the P8 runtime hard-code it.
+_TRELLISMX_SWIGLU_LIMIT = 10.0
+
+
+def _trellismx_smallm_request(max_tokens: int | None) -> int:
+    """Validate the plan's ``smallm_max_tokens`` declaration.
+
+    ``None`` takes the declared default, the small-M module's
+    ``SMALLM_MAX_TOKENS`` (16, the release runtime's direct limit); ``0`` hands
+    every m to the grouped arm. The arm's boundary and fused launches are
+    compiled per token count over 1..``SMALLM_MAX_TOKENS``, so a larger value
+    names a program that does not exist.
+    """
+
+    from b12x.moe._shared.kernels.trellismx_smallm import SMALLM_MAX_TOKENS
+
+    if max_tokens is None:
+        return int(SMALLM_MAX_TOKENS)
+    if type(max_tokens) is not int:
+        raise TypeError(
+            f"smallm_max_tokens must be an integer or None; got {type(max_tokens).__name__}"
+        )
+    if not 0 <= max_tokens <= SMALLM_MAX_TOKENS:
+        raise ValueError(
+            f"smallm_max_tokens must be 0 (grouped arm only) or 1.."
+            f"{SMALLM_MAX_TOKENS}; got {max_tokens}"
+        )
+    return int(max_tokens)
+
+
+def _trellismx_smallm_policy(
+    experts: "B12XFP4ExpertWeights",
+    *,
+    fast_math: bool | None,
+    max_tokens: int | None = None,
+) -> tuple[bool, int]:
+    """``(enabled, limit)``: whether m <= ``limit`` takes the small-M arm.
+
+    ``limit`` is the plan's declared ``smallm_max_tokens``
+    (``_trellismx_smallm_request``: 16 unless the declaration says otherwise,
+    0 to hand every m to the grouped arm). ``plan_execution`` resolves this once
+    and keeps it in the plan's controls; discovery compiles from those controls
+    and every binding the prepared plan makes carries them
+    (``TPMoEFP4Binding.trellismx_smallm_tokens``), which dispatch consumes. Only
+    a hand-constructed binding (no plan stamped it) has dispatch call this, and
+    it resolves the declared default. The grouped arm serves every m instead when
+    the bundle's scale bytes would make the arm's fp16 weight-scale product
+    inexact, or when the call requires exact math: the small-M arm is compiled
+    with fast math only.
+    """
+
+    limit = _trellismx_smallm_request(max_tokens)
+    record = getattr(getattr(experts, "representation", None), "value", None)
+    exact = bool(getattr(record, "smallm_exact_scales", False))
+    fast = _FAST_MATH_DEFAULT if fast_math is None else bool(fast_math)
+    return bool(limit) and exact and fast, limit
+
+
+def _trellismx_smallm_tokens(policy: tuple[bool, int]) -> int:
+    """The largest m the small-M arm serves under ``policy`` (0: none)."""
+
+    enabled, limit = policy
+    return int(limit) if enabled else 0
+
+
+def _trellismx_smallm_limit(binding: TPMoEFP4Binding) -> int:
+    """The largest m this binding sends to the small-M arm (0: none).
+
+    The decision of the plan that made the binding when it carries one (a raw
+    scratch plan's declared ``smallm_tokens`` included), so dispatch runs
+    exactly the arm that plan sized and compiled for.
+    """
+
+    stored = binding.trellismx_smallm_tokens
+    if stored is not None:
+        return int(stored)
+    return _trellismx_smallm_tokens(
+        _trellismx_smallm_policy(binding.experts, fast_math=binding.fast_math)
+    )
+
+
+def _on_cuda(tensor: torch.Tensor) -> bool:
+    return tensor.is_cuda
+
+
+def _validate_trellismx_binding(
+    binding: TPMoEFP4Binding,
+    *,
+    top_k: int,
+    ids_dtypes: tuple[torch.dtype, ...] = (torch.int32, torch.int64),
+) -> None:
+    """Reject a TrellisMX call that no TrellisMX arm can execute as declared.
+
+    Runs before every TrellisMX fast-path return (P8 runtime, small-M arm), so
+    those paths observe the same routing, activation and output contract as the
+    grouped launch.
+    """
+
+    a = binding.a
+    experts = binding.experts
+    if (
+        a.ndim != 2
+        or a.dtype != torch.bfloat16
+        or int(a.shape[1]) != experts.hidden_size
+    ):
+        raise ValueError(
+            f"TrellisMX takes BF16 [m, {experts.hidden_size}] activations; got "
+            f"{a.dtype} {tuple(a.shape)}"
+        )
+    # Every TrellisMX launch hands the activations and the output to its
+    # kernels as 16-byte aligned pointers on the weights' device.
+    if a.device != experts.w1_fp4.device:
+        raise ValueError(
+            f"activations live on {a.device}; the TrellisMX experts on "
+            f"{experts.w1_fp4.device}"
+        )
+    if not a.is_contiguous() or a.data_ptr() % 16:
+        raise ValueError("TrellisMX activations must be contiguous and 16-byte aligned")
+    m = int(a.shape[0])
+    ids, weights = binding.topk_ids, binding.topk_weights
+    if tuple(ids.shape) != (m, int(top_k)) or tuple(weights.shape) != (m, int(top_k)):
+        raise ValueError(
+            f"TrellisMX routing must be [{m}, {int(top_k)}]; got ids "
+            f"{tuple(ids.shape)} weights {tuple(weights.shape)}"
+        )
+    if ids.dtype not in ids_dtypes:
+        raise TypeError(f"topk_ids must be one of {ids_dtypes}; got {ids.dtype}")
+    if not weights.is_floating_point():
+        raise TypeError(f"topk_weights must be floating point; got {weights.dtype}")
+    if ids.device != a.device or weights.device != a.device:
+        raise ValueError("routing tensors must live on the activation device")
+    if binding.apply_router_weight_on_input:
+        raise NotImplementedError(
+            "TrellisMX applies router weights in its top-k reduction only"
+        )
+    if binding.route_expert_map is not None or binding.output_expert_map is not None:
+        raise ValueError("TrellisMX does not take expert route maps")
+    if binding.activation_amax is not None:
+        raise NotImplementedError("TrellisMX cannot collect activation amax")
+    if (
+        binding.swiglu_limit is None
+        or float(binding.swiglu_limit) != _TRELLISMX_SWIGLU_LIMIT
+        or binding.swiglu_clamp_after_silu
+    ):
+        raise ValueError(
+            "TrellisMX executes silu-cap10 (SwiGLU limit 10, clamp before SiLU); "
+            f"the binding declares limit={binding.swiglu_limit}, "
+            f"clamp_after_silu={binding.swiglu_clamp_after_silu}"
+        )
+    if binding.swiglu_alpha not in (None, 1.0) or binding.swiglu_beta not in (
+        None,
+        0.0,
+    ):
+        # Plain SiLU gating: no arm (or P8 runtime) applies an alpha/beta.
+        raise ValueError(
+            "TrellisMX silu takes no swiglu_alpha/swiglu_beta; the binding declares "
+            f"alpha={binding.swiglu_alpha}, beta={binding.swiglu_beta}"
+        )
+    if binding.quant_mode not in (None, "w4a8_mx"):
+        raise ValueError(f"TrellisMX runs w4a8_mx; got {binding.quant_mode!r}")
+    if binding.output_cast_target is not None:
+        raise ValueError(
+            "TrellisMX writes its BF16 output directly; it takes no cast target"
+        )
+    capacity = binding.routed_rows_capacity or binding.max_rows
+    if capacity and m * int(top_k) > int(capacity):
+        raise ValueError(
+            f"{m} tokens x top-{int(top_k)} exceed the bound capacity of "
+            f"{int(capacity)} routed rows"
+        )
+    output = binding.output
+    if output is not None and (
+        output.dtype != torch.bfloat16
+        or tuple(output.shape) != (m, experts.hidden_size)
+        or output.device != a.device
+        or not output.is_contiguous()
+        or output.data_ptr() % 16
+    ):
+        raise ValueError(
+            f"TrellisMX output must be a contiguous, 16-byte aligned BF16 "
+            f"[{m}, {experts.hidden_size}] tensor on {a.device}; got {output.dtype} "
+            f"{tuple(output.shape)} on {output.device}"
+        )
+
+
+def _cuda_capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def _trellismx_output(binding: TPMoEFP4Binding) -> torch.Tensor:
+    output = binding.output
+    if output is None:
+        if _cuda_capturing():
+            raise ValueError("CUDA graph capture requires a caller-owned output buffer")
+        output = torch.zeros(
+            int(binding.a.shape[0]),
+            binding.experts.hidden_size,
+            dtype=torch.bfloat16,
+            device=binding.a.device,
+        )
+    return output
+
+
+def _trellismx_smallm_plan(
+    experts: B12XFP4ExpertWeights, *, top_k: int, max_tokens: int
+) -> object:
+    """The bundle's small-M arm for ``(top_k, max_tokens)``, built once.
+
+    The arm reads the same prepared bundle as the grouped arm (payload and
+    UE8M0 planes as views, boundary vectors from the bundle). Planning resolves
+    the arm's programs and declares its buffer layout, so preparation builds it
+    (``_preparation.materialize``, for every plan whose token count the arm
+    serves) and dispatch only looks it up; a capture that reaches an unbuilt
+    arm fails loudly instead of compiling or allocating.
+
+    The plan holds no mutable buffer: every binding carves its own from the
+    caller's scratch (``TPMoEScratchPlan.bind``), so calls and captured replays
+    on one bundle no longer share storage. The compiled programs are shared,
+    which is safe: they are read-only.
+    """
+
+    plans = experts._trellismx_smallm_plans
+    key = (int(top_k), int(max_tokens))
+    plan = plans.get(key)
+    if plan is not None:
+        return plan
+    if _cuda_capturing():
+        raise RuntimeError(
+            "the TrellisMX small-M arm must be planned before CUDA graph "
+            f"capture: prepare a plan for this bundle whose token count is "
+            f"at most {int(max_tokens)} (m <= {int(max_tokens)})"
+        )
+    from types import SimpleNamespace
+
+    from b12x.moe._shared.kernels.trellismx_smallm import TrellisMxSmallM
+
+    plan = TrellisMxSmallM.plan(
+        SimpleNamespace(_impl=experts),
+        max_tokens=int(max_tokens),
+        top_k=int(top_k),
+    )
+    plans[key] = plan
+    return plan
+
+
+def _run_trellismx_fast_path(binding: TPMoEFP4Binding) -> torch.Tensor | None:
+    """Serve a TrellisMX binding outside the grouped launch, or return None.
+
+    A bundle that owns a P8 runtime runs it for every m (its direct RP2 kernels
+    up to B12X_P8_RP2_DIRECT_MAX_TOKENS, grouped above; its FP32 top-k reducer
+    stores the BF16 partial sum into the output). A bundle deserialized from
+    one carries an inert descriptor instead and raises here: it never launches
+    and never falls back to this package's arms. Otherwise m <= the small-M
+    limit the plan resolved takes the small-M arm (its own FP32 top-k sum and
+    H128/svh/H512 output stage) and larger m the grouped dynamic arm. m is
+    fixed per captured graph, so the choice is static and needs no host sync.
+    """
+
+    from .trellismx_p8 import P8_BACKEND, trellismx_p8_attachment
+
+    experts = binding.experts
+    entry = trellismx_p8_attachment(experts)
+    if entry is not None:
+        attachment = entry.require_live()
+        # Host-side only: the verified runtime handles and settings are unchanged.
+        attachment.check_runtime()
+        if attachment.contract.device != binding.a.device:
+            raise ValueError(
+                f"the P8 runtime lives on {attachment.contract.device}; the "
+                f"activations on {binding.a.device}"
+            )
+        _validate_trellismx_binding(
+            binding,
+            top_k=attachment.contract.top_k,
+            ids_dtypes=(torch.int32,),
+        )
+        if binding.fast_math is False:
+            raise ValueError(
+                "the P8 runtime's arithmetic is fixed; fast_math=False cannot be honored"
+            )
+        if binding.compiler_scratch is None:
+            raise RuntimeError(
+                "the P8 runtime takes its scratch from the caller: bind the plan's "
+                "scratch buffer"
+            )
+        # The runtime carves every buffer out of the bound arena and writes a
+        # caller-owned output, so a captured call allocates nothing. The output
+        # is the caller's, or one allocated here on the eager path; capture
+        # requires the caller to own it (_trellismx_output).
+        return attachment.runtime(
+            binding.a,
+            binding.topk_weights,
+            binding.topk_ids,
+            _trellismx_output(binding),
+            scratch=binding.compiler_scratch,
+            config=binding.p8_launch,
+        )
+    if binding.implementation == P8_BACKEND:
+        raise RuntimeError(
+            "this binding was planned for a P8 runtime that its experts no longer own"
+        )
+    _validate_trellismx_binding(binding, top_k=binding.num_topk)
+    m = int(binding.a.shape[0])
+    limit = _trellismx_smallm_limit(binding)
+    if not (0 < m <= limit and _on_cuda(binding.a)):
+        return None
+    # Preparation built the arm for every plan whose token count it serves and
+    # the binding carries that plan, so dispatch only looks it up: a capture
+    # allocates and resolves nothing. A binding made without a prepared plan
+    # builds the arm here (and refuses to do so inside capture).
+    plan = binding.trellismx_smallm_plan
+    if plan is None:
+        plan = _trellismx_smallm_plan(experts, top_k=binding.num_topk, max_tokens=limit)
+    # The arm's buffers are the caller's: bind carved this binding's views out
+    # of the scratch it was given, and a call never shares them with another
+    # binding. With a bound output the call allocates nothing either; without
+    # one, ``_trellismx_output`` allocates the tensor it returns (capture
+    # refuses that case).
+    scratch = binding.trellismx_smallm_scratch
+    if scratch is None:
+        raise RuntimeError(
+            "the TrellisMX small-M arm takes caller-owned scratch: bind a plan "
+            "that declares the arm's token count (plan_execution(...)) with a "
+            "scratch buffer of plan.scratch_specs()"
+        )
+    from b12x.moe._shared.kernels.trellismx_smallm import TrellisMxSmallM
+
+    output = _trellismx_output(binding)
+    TrellisMxSmallM.run(
+        binding.a,
+        binding.topk_ids,
+        binding.topk_weights,
+        output,
+        workspace=plan,
+        scratch=scratch,
+    )
+    return output
+
+
 def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     """Execute one fully planned, prepared, and scratch-bound FP4 MoE launch."""
     if not isinstance(binding, TPMoEFP4Binding):
         raise TypeError("binding must be a TPMoEFP4Binding")
+    if not isinstance(binding.experts, B12XFP4ExpertWeights):
+        raise TypeError("binding.experts must be a B12XFP4ExpertWeights")
+    if binding.experts.source_format == "trellismx":
+        served = _run_trellismx_fast_path(binding)
+        if served is not None:
+            return served
 
     a = binding.a
     experts = binding.experts
-    if not isinstance(experts, B12XFP4ExpertWeights):
-        raise TypeError("binding.experts must be a B12XFP4ExpertWeights")
     if binding.implementation == "trellis_mixed3":
         from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
             MixedTrellis3Binding,
@@ -13737,9 +14843,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         full_rotation = getattr(prepared, "weight_layout", "") == "trellis_t256"
         output_dtype = torch.float32 if full_rotation else a.dtype
         if output is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise ValueError(
-                    "CUDA graph capture requires a caller-owned output buffer"
+            if _cuda_capturing():
+                raise RuntimeError(
+                    "CUDA graph capture requires a caller-owned W4A16 output"
                 )
             scatter_output = torch.empty(m, k, dtype=output_dtype, device=device)
         else:
@@ -13785,13 +14891,13 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         fused_launch = binding.fused_launch
         topk_sum_launch = binding.topk_sum_launch
         if not topk_weights.is_contiguous():
-            if torch.cuda.is_current_stream_capturing():
+            if _cuda_capturing():
                 raise ValueError(
                     "CUDA graph capture requires contiguous W4A16 topk_weights"
                 )
             topk_weights = topk_weights.contiguous()
         if not topk_ids.is_contiguous():
-            if torch.cuda.is_current_stream_capturing():
+            if _cuda_capturing():
                 raise ValueError(
                     "CUDA graph capture requires contiguous W4A16 topk_ids"
                 )
@@ -13993,7 +15099,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     raw_routes = binding.output_layout == "routes"
     output_shape = (m, num_topk, k) if raw_routes else (m, k)
     if output is None:
-        if torch.cuda.is_current_stream_capturing():
+        if _cuda_capturing():
             raise ValueError("CUDA graph capture requires a caller-owned output buffer")
         scatter_output = torch.zeros(output_shape, dtype=a.dtype, device=device)
     else:
@@ -14143,6 +15249,22 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             ),
             planned_tile_m=planned_tile_m,
             planned_num_tokens=plan.routed_rows // plan.num_topk,
+            # A TrellisMX bundle declares its bitrate and boundary rotations
+            # explicitly; the W4A16 trellis bundle keeps the dtype heuristic.
+            trellis_codebook=(
+                str(getattr(prepared_payload, "trellis_codebook", LUT_E4M3))
+                if getattr(prepared_payload, "w13_sfb", None) is not None
+                else LUT_E4M3
+            ),
+            trellis_exact_hadamard=bool(
+                getattr(prepared_payload, "trellis_exact_hadamard", False)
+            ),
+            trellis_fp32_boundary=bool(
+                getattr(prepared_payload, "trellis_fp32_boundary", False)
+            ),
+            trellis_pre_quantized_a=bool(
+                getattr(prepared_payload, "trellis_pre_quantized_a", False)
+            ),
             dynamic_route_mode=decode_config.dynamic_route_mode or "",
             share_input_across_experts=(
                 (quant_mode == "nvfp4" and decode_config.nvfp4_share_input)
@@ -14213,6 +15335,37 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             unit_scale_contract=unit_scale_contract,
             w4a8_trellis=micro_w4a8_trellis,
         )
+    if getattr(prepared_payload, "trellis_codebook", None) == PROCEDURAL_NPK:
+        # TrellisMX: the kernel returns the reduced per-token value in the
+        # coupled boundary's inner basis, so the declared output stage belongs
+        # to the run path, not to each caller. Exact algebra: the per-route
+        # H128 and the per-hidden-channel down_svh are both linear and act on
+        # the same axis as the router-order weighted sum, so applying them once
+        # after the reduction is identical to applying them per route before it
+        # (`boundary.apply_output` documents the same identity). Two rounding
+        # points differ from the release: its per-route FP16 store, which the
+        # kernel does not have, and the BF16 store of the reduced sum here
+        # (``scatter_output`` has the activation dtype), which the release keeps
+        # in FP32 until after the outer H512.
+        boundary = getattr(prepared_payload, "boundary", None)
+        if boundary is None:
+            raise RuntimeError(
+                "a trellismx execution needs its prepared coupled boundary to "
+                "finish the output stage"
+            )
+        from b12x.moe._shared.kernels.trellismx_boundary_fused import (
+            fused_output_stage,
+        )
+
+        # One fused kernel for the whole output stage (H128 -> *down_svh ->
+        # outer H512), bit-exact to the composition below and 8.6x faster:
+        # staged = boundary.outer_h512(
+        #     h128_normalized(scatter_output.float()) * boundary.down_svh.float()
+        # )
+        staged = fused_output_stage(
+            scatter_output, boundary.down_svh, hidden_size=int(scatter_output.shape[1])
+        )
+        scatter_output.copy_(staged.to(scatter_output.dtype))
     return scatter_output
 
 

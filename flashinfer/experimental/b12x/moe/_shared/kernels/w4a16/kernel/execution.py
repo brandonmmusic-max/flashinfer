@@ -586,6 +586,7 @@ def run_w4a16_moe(
     intermediate_rotation_scales: torch.Tensor | None = None,
     a_input_up: torch.Tensor | None = None,
     full_rotation: bool = False,
+    external_input_boundary: bool = False,
     suh_gate_table: torch.Tensor | None = None,
     suh_up_table: torch.Tensor | None = None,
     svh_table: torch.Tensor | None = None,
@@ -604,6 +605,12 @@ def run_w4a16_moe(
         swiglu_beta,
     )
     full_rotation = bool(full_rotation)
+    external_input_boundary = bool(external_input_boundary)
+    if external_input_boundary and not full_rotation:
+        raise ValueError(
+            "external_input_boundary requires full_rotation (the intermediate "
+            "chain still runs inside the fused kernel)"
+        )
     route_mode = str(route_mode).lower()
     if route_mode not in {"auto", "direct", "packed"}:
         raise ValueError("W4A16 route_mode must be 'auto', 'direct', or 'packed'")
@@ -635,6 +642,9 @@ def run_w4a16_moe(
     trellis_codebook = str(
         getattr(prepared, "trellis_codebook", None) or LUT_E4M3
     ).lower()
+    trellis_weight_scale_row_rotation = getattr(
+        prepared, "weight_block_scale_row_rotation", None
+    )
     fc1_trellis_pair_kind = getattr(prepared, "fc1_trellis_pair_kind", None)
     fc2_trellis_pair_kind = getattr(prepared, "fc2_trellis_pair_kind", None)
     fc1_trellis_pair_modes = getattr(prepared, "fc1_trellis_pair_modes", None)
@@ -840,6 +850,8 @@ def run_w4a16_moe(
             ("rotation_a_gate", rotation_a_gate),
             ("rotation_a_up", rotation_a_up),
         ):
+            if scratch is None and external_input_boundary:
+                continue
             if scratch is None:
                 raise ValueError(f"full_rotation requires preallocated {name}")
             if (
@@ -852,12 +864,13 @@ def run_w4a16_moe(
                     f"{name} must be contiguous fp16 on {a_input.device} with at least "
                     f"{required_a} elements"
                 )
-        assert rotation_a_gate is not None and rotation_a_up is not None
-        if (
-            not intermediate_hadamard
-            and rotation_a_gate.data_ptr() == rotation_a_up.data_ptr()
-        ):
-            raise ValueError("full_rotation gate/up A scratches must not alias")
+        if not external_input_boundary:
+            assert rotation_a_gate is not None and rotation_a_up is not None
+            if (
+                not intermediate_hadamard
+                and rotation_a_gate.data_ptr() == rotation_a_up.data_ptr()
+            ):
+                raise ValueError("full_rotation gate/up A scratches must not alias")
     elif any(
         value is not None
         for value in (
@@ -1267,6 +1280,7 @@ def run_w4a16_moe(
             w13_layout=w13_layout,
             trellis_bits=trellis_bits,
             trellis_codebook=trellis_codebook,
+            trellis_weight_scale_row_rotation=trellis_weight_scale_row_rotation,
             fc1_trellis_pair_kind=fc1_trellis_pair_kind,
             fc2_trellis_pair_kind=fc2_trellis_pair_kind,
             direct_topk_routes=use_direct_topk_routes,
@@ -1276,6 +1290,7 @@ def run_w4a16_moe(
             collect_activation_amax=collect_activation_amax,
             intermediate_rotation=intermediate_rotation_scales is not None,
             full_rotation=full_rotation,
+            external_input_boundary=external_input_boundary,
             intermediate_hadamard=intermediate_hadamard,
             rotation_input_dtype=rotation_input_dtype,
             broadcast_suh=full_rotation and suh_gate_table.numel() == hidden_size,
@@ -1607,11 +1622,14 @@ def run_w4a16_moe(
             _lt_fc2tk,
             _lt_fc2tn,
         ) = launch_tail
-        launch_a = rotation_a_gate if full_rotation else _rc_a
-        launch_a_up = rotation_a_up if full_rotation else a_input_up
-        # Intermediate-Hadamard gate/up matrices consume the same transformed input. Reuse
-        # the gate buffer instead of materializing an identical second row.
-        if full_rotation and intermediate_hadamard:
+        if full_rotation and not external_input_boundary:
+            launch_a = rotation_a_gate
+            launch_a_up = rotation_a_up
+        else:
+            # External boundary: the caller's fp16 A is already the GEMM operand.
+            launch_a = _rc_a
+            launch_a_up = a_input_up
+        if full_rotation and intermediate_hadamard and not external_input_boundary:
             launch_a_up = rotation_a_gate
         assert launch_a is not None
         _w4a16_fused_moe_launch_flat(
@@ -1672,9 +1690,11 @@ def run_w4a16_moe(
             a_input_up=launch_a_up,
             trellis_bits=trellis_bits,
             trellis_codebook=trellis_codebook,
+            trellis_weight_scale_row_rotation=trellis_weight_scale_row_rotation,
             fc1_trellis_pair_kind=fc1_trellis_pair_kind,
             fc2_trellis_pair_kind=fc2_trellis_pair_kind,
             full_rotation=full_rotation,
+            external_input_boundary=external_input_boundary,
             intermediate_hadamard=intermediate_hadamard,
             rotation_input=_rc_a,
             suh_gate_table=suh_gate_table,

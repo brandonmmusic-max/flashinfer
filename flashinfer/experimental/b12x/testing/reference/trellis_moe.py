@@ -18,8 +18,59 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
 )
+from b12x.moe._shared.trellis_codebooks import (
+    LUT_E4M3,
+    PROCEDURAL_NPK,
+    validate_codebook_bits,
+)
 
 _RATE_INDEX = {2: 0, 3: 1, 4: 2}
+
+_W4A8_CODEBOOKS = (LUT_E4M3, PROCEDURAL_NPK)
+
+
+def _check_w4a8_codebook(codebook: str, bits: int | None = None) -> str:
+    """Reject codebook ids the W4A8 E4M3 reference does not decode."""
+
+    text = str(codebook).strip().lower()
+    if text not in _W4A8_CODEBOOKS:
+        raise ValueError(
+            f"unsupported trellis codebook {codebook!r}; the W4A8 E4M3 "
+            f"reference decodes {LUT_E4M3!r} or {PROCEDURAL_NPK!r}"
+        )
+    if bits is not None:
+        validate_codebook_bits(text, int(bits))
+    return text
+
+
+def _decode_states(
+    states: torch.Tensor, bits: int, codebook: str, device: torch.device
+) -> torch.Tensor:
+    """Map [W, 256] 16-bit states to float32 weights through one codebook."""
+
+    if codebook == PROCEDURAL_NPK:
+        # The procedural law is a CPU reference (pinned on the host, bit for
+        # bit); import it lazily so this module stays
+        # importable without the kernel DSL.
+        from b12x.moe._shared.kernels.w4a8_npk_decode import (
+            npk_decode_states_reference,
+        )
+
+        bytes_cpu = npk_decode_states_reference(states.detach().cpu())
+        return (
+            bytes_cpu.to(device=device)
+            .view(torch.float8_e4m3fn)
+            .float()
+            .reshape(states.shape)
+        )
+    direct = lut_e4m3_direct_table_cpu().to(device)
+    rate = _RATE_INDEX[bits] << 16
+    return (
+        direct[rate + states.reshape(-1)]
+        .view(torch.float8_e4m3fn)
+        .float()
+        .reshape(states.shape)
+    )
 
 
 def _hadamard(order: int, device: torch.device) -> torch.Tensor:
@@ -78,14 +129,24 @@ def build_trellis_weight(
     in_features: int,
     bits: int,
     device: torch.device,
+    codebook: str = LUT_E4M3,
+    scale_plane: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Random payload [E, K16, N16, 16*bits] i16 and weights [E, N, K] f32.
 
     The payload axes follow the kernel layout: K16 tiles over ``in_features``
     and N16 tiles over ``out_features``, each tile owning a 16x16 fragment
-    of the weight matrix.
+    of the weight matrix. ``codebook`` selects the decode law that turns each
+    tile's 256 tail-biting 16-bit states into E4M3 weights: ``lut_e4m3``
+    (default) or ``procedural_npk``.
+
+    ``scale_plane`` is the UE8M0/K32 weight plane in the *weights'* own row
+    order, ``uint8 [E, out_features, in_features // 32]``; each weight is then
+    multiplied by ``2 ** (byte - 127)``, which is the block-scaled MMA's
+    per-K32 weight scale. ``None`` keeps the unscaled (unit-scale) weights.
     """
 
+    codebook = _check_w4a8_codebook(codebook, bits)
     k16 = in_features // 16
     n16 = out_features // 16
     windows = experts * k16 * n16
@@ -94,14 +155,32 @@ def build_trellis_weight(
     ).to(device)
     payload = _pack_native_tiles(edges, bits).reshape(experts, k16, n16, 16 * bits)
     states = _cyclic_states(edges, bits)
-    direct = lut_e4m3_direct_table_cpu().to(device)
-    rate = _RATE_INDEX[bits] << 16
-    values = (
-        direct[rate + states.reshape(-1)]
-        .view(torch.float8_e4m3fn)
-        .float()
-        .reshape(windows, 256)
-    )
+    values = _decode_states(states, bits, codebook, device)
+    if scale_plane is not None:
+        plane = scale_plane.to(device=device)
+        expected = (experts, out_features, in_features // 32)
+        if tuple(plane.shape) != expected or plane.dtype != torch.uint8:
+            raise ValueError(
+                f"scale_plane must be uint8 {expected}, got "
+                f"{plane.dtype} {tuple(plane.shape)}"
+            )
+        # ``values`` rows are the windows in (expert, K16 tile, N16 tile)
+        # order with the N16 axis fastest, and the 256 states of a window are
+        # in lane*8+j order. A window spans 16 output rows and 16 K columns,
+        # i.e. exactly one K32 block (k16 // 2), so each of its 256 states
+        # takes the plane byte of its own output row in that block.
+        window = torch.arange(windows, device=device)
+        n16_index = window % n16
+        k16_index = (window // n16) % k16
+        expert_index = window // (n16 * k16)
+        plane_f32 = plane.to(torch.float32)
+        rows_map, _ = _tile_position_map(device)
+        scale_bytes = plane_f32[
+            expert_index[:, None],
+            n16_index[:, None] * 16 + rows_map[None, :],
+            k16_index[:, None] // 2,
+        ]
+        values = values * torch.pow(2.0, scale_bytes - 127.0)
     rows, cols = _tile_position_map(device)
     tiles = torch.zeros(windows, 16, 16, dtype=torch.float32, device=device)
     tiles[:, rows, cols] = values
@@ -213,14 +292,22 @@ def trellis_moe_reference(
     topk_weights: torch.Tensor,
     *,
     intermediate_hadamard: bool,
+    codebook: str = LUT_E4M3,
 ) -> torch.Tensor:
     """Float32 MoE forward in the kernels' rotated input/output bases.
 
     ``x_rot`` is the already-rotated kernel input; the result is the raw
     scatter-basis output (pre any residual unrotation). ``w13_weights`` is
     [2, E, I, K] (gate, up); ``w2_weights`` is [E, K, I].
+
+    ``codebook`` names the decode law that produced the weight tensors
+    (``build_trellis_weight``'s argument). The forward itself is
+    codebook-independent -- decoding happened when the weights were built --
+    so the argument exists to keep the scaffold's parametrization symmetric
+    and to reject a call that names an arm this reference does not model.
     """
 
+    _check_w4a8_codebook(codebook)
     device = x_rot.device
     m, hidden = x_rot.shape
     intermediate = w13_weights.shape[2]

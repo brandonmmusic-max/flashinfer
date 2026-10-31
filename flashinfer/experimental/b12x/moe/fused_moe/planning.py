@@ -6,8 +6,12 @@ from b12x._lib.quant.block_codec import BLOCK_CODECS
 
 from dataclasses import dataclass, replace
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from .trellismx import TrellisMxWeights
 
 from .._shared.execution import MoEWeightPreparationPlan
 from .._shared.kernels.activations import is_gated_moe_activation
@@ -15,6 +19,7 @@ from ._impl import (
     plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,
     prepare_b12x_trellis_v2_weights,
+    prepare_b12x_trellis_w4a8_weights,
     prepare_b12x_iq2_xs_weights,
 )
 from .config import TrellisConfig
@@ -173,9 +178,58 @@ def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
         ) from exc
 
 
+#: The activation every TrellisMX execution path implements: GLM-5.3's
+#: ``silu-cap10`` (clamp gate at 10 and up to [-10, 10] before SiLU) with BF16
+#: activations in and out.
+TRELLISMX_SWIGLU_LIMIT = 10.0
+
+
+def _validate_trellismx_activation(activation: ActivationSpec) -> None:
+    """Reject an activation spec that the TrellisMX arms would not honor.
+
+    The fused boundary kernels, the small-M arm and the P8 runtime take BF16
+    inputs and hard-code silu-cap10, so any other declaration would be planned
+    for one arm and executed differently by another.
+    """
+
+    if activation.nonlinearity != "silu":
+        raise ValueError(
+            "trellismx executes silu-cap10; got nonlinearity "
+            f"{activation.nonlinearity!r}"
+        )
+    if activation.io_dtype != torch.bfloat16:
+        raise ValueError(
+            f"trellismx executes BF16 activations; got io_dtype {activation.io_dtype}"
+        )
+    if (
+        activation.swiglu_limit is None
+        or float(activation.swiglu_limit) != TRELLISMX_SWIGLU_LIMIT
+        or activation.swiglu_clamp_after_silu
+    ):
+        raise ValueError(
+            "trellismx executes silu-cap10 (swiglu_limit=10.0, clamp before "
+            f"SiLU); got swiglu_limit={activation.swiglu_limit!r}, "
+            f"swiglu_clamp_after_silu={activation.swiglu_clamp_after_silu}"
+        )
+    if activation.swiglu_alpha not in (None, 1.0) or activation.swiglu_beta not in (
+        None,
+        0.0,
+    ):
+        raise ValueError("trellismx silu takes no swiglu_alpha/swiglu_beta")
+    if activation.rotation_dtype is not None or activation.a16_max_tokens:
+        raise ValueError(
+            "trellismx has no rotation_dtype or A16 token cutoff; its coupled "
+            "boundary fixes both"
+        )
+
+
 def _validate_trellis_runtime(
-    source: TrellisConfig, *, explicit_uniform: bool = False
+    source: TrellisConfig,
+    *,
+    explicit_uniform: bool = False,
+    source_format: str = "b12x_trellis",
 ) -> None:
+    trellismx = str(source_format).lower() == "trellismx"
     if source.codebook.value == "lut_fp16" and not explicit_uniform:
         raise NotImplementedError(
             "lut_fp16 preparation requires an explicit uniform_bits declaration"
@@ -185,6 +239,42 @@ def _validate_trellis_runtime(
             "grouped trellis rates are defined by the checkpoint schema but "
             "are not implemented by the fused MoE runtime"
         )
+    if trellismx:
+        # TrellisMX's coupled boundary puts H512 on the projection (hidden)
+        # axis and H128 per expert on the intermediate axis; the W4A8 trellis
+        # kernels own both stages.
+        if source.transform.projection.kind != "scaled_hadamard" or (
+            source.transform.projection.block_size != 512
+        ):
+            raise NotImplementedError(
+                "trellismx requires scaled_hadamard(512); got "
+                f"{source.transform.projection.to_dict()}"
+            )
+        expert = source.transform.expert
+        if expert.kind != "intermediate_hadamard" or (
+            expert.pre_block_size,
+            expert.post_block_size,
+        ) != (128, 128):
+            raise NotImplementedError(
+                "trellismx requires the coupled intermediate_hadamard boundary "
+                "with blocks (128, 128); got "
+                f"{expert.to_dict()}"
+            )
+        if expert.sign_pattern_granularity != "per_expert":
+            raise NotImplementedError(
+                "trellismx requires per-expert coupled sign patterns"
+            )
+        if source.codebook.value != "procedural_npk":
+            raise ValueError(
+                "trellismx requires the procedural_npk codebook; got "
+                f"{source.codebook.value!r}"
+            )
+        if source.rate.granularity.value != "uniform":
+            raise ValueError(
+                "trellismx is a uniform-rate container; got "
+                f"{source.rate.granularity.value!r}"
+            )
+        return
     if source.transform.projection.kind != "scaled_hadamard" or (
         source.transform.projection.block_size != 128
     ):
@@ -232,7 +322,11 @@ def _prepared_format(
         )
     if isinstance(source, TrellisSource):
         weights = WeightEncoding.TRELLIS
-        scales = ScaleEncoding.TRELLIS_SCALES
+        scales = (
+            ScaleEncoding.E8M0_K32
+            if source.source_format == "trellismx"
+            else ScaleEncoding.TRELLIS_SCALES
+        )
     else:
         weights = (
             WeightEncoding(source.format.value)
@@ -331,14 +425,24 @@ def plan_weights(
         )
     elif isinstance(source, TrellisSource):
         config = source.config
+        trellismx = source.source_format == "trellismx"
         if activation.a16_max_tokens:
             raise ValueError("A16 token cutoff requires ModelOpt NVFP4 weights")
-        if activation.mode is not ActivationMode.A16:
+        if trellismx:
+            if activation.mode is not ActivationMode.A8:
+                raise ValueError(
+                    "trellismx lowers onto the W4A8 trellis recipe; it requires "
+                    f"A8 activations, got {activation.mode.value!r}"
+                )
+            _validate_trellismx_activation(activation)
+        elif activation.mode is not ActivationMode.A16:
             raise ValueError("Trellis fused MoE requires A16 activations")
         if constraints.required_packing not in {None, WeightPacking.TRELLIS_NATIVE}:
             raise ValueError("Trellis weights require trellis_native packing")
         _validate_trellis_runtime(
-            config, explicit_uniform=source.uniform_bits is not None
+            config,
+            explicit_uniform=source.uniform_bits is not None,
+            source_format=source.source_format,
         )
         expert = config.transform.expert
         if source.extent is not None:
@@ -357,12 +461,16 @@ def plan_weights(
             config.codebook.value == "mcg" and source.uniform_bits is None
         ):
             raise ValueError("rotation_dtype requires a uniform full-rotation path")
-        recipe = "w4a16"
+        recipe = "w4a8_mx" if trellismx else "w4a16"
         bits = source.uniform_bits or 3
         # Match the native K2 intermediate-Hadamard and projection-tiered
         # geometries; container identity does not select an execution policy.
+        # TrellisMX runs the dynamic W4A8 kernel, whose tile shape is planned
+        # at execution time, so it declares no W4A16 tile config.
         tile_config = (
-            (128, 128, 128, 128)
+            None
+            if trellismx
+            else (128, 128, 128, 128)
             if expert.kind == "intermediate_hadamard" and bits == 2
             else (128, 256, 64, 256)
             if config.codebook.value == "mcg" and source.uniform_bits is None
@@ -370,14 +478,16 @@ def plan_weights(
         )
         raw_plan = plan_b12x_fp4_moe_weights(
             quant_modes=recipe,
-            source_format="b12x_trellis",
+            source_format=source.source_format,
             activation=activation.nonlinearity,
             params_dtype=activation.io_dtype,
             num_experts=geometry.num_experts,
             hidden_size=geometry.hidden_size,
             intermediate_size=geometry.intermediate_size,
-            w13_layout="w31",
-            w4a16_layout="trellis_native",
+            # TrellisMX payloads carry gate/up by projection and its UE8M0
+            # plane is already in kernel (up-gate) order, so no rotation.
+            w13_layout="w13" if trellismx else "w31",
+            w4a16_layout=None if trellismx else "trellis_native",
             trellis_bits=bits,
             trellis_tile_config=tile_config,
             intermediate_hadamard=expert.kind == "intermediate_hadamard",
@@ -414,7 +524,8 @@ def prepare_weights(
     | TrellisWeights
     | IQ2XSWeights
     | Mxfp4CsfWeights
-    | Nvfp4CsfWeights,
+    | Nvfp4CsfWeights
+    | "TrellisMxWeights",
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
     scale_scratch: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -464,16 +575,31 @@ def prepare_weights(
             )
         prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)
     elif isinstance(plan.source, TrellisSource):
-        if not isinstance(weights, TrellisWeights):
-            raise TypeError("Trellis preparation requires TrellisWeights")
-        prepared = prepare_b12x_trellis_v2_weights(
-            plan=plan._impl,
-            source=plan.source,
-            weights=weights,
-            device=device,
-            staging=staging,
-            rotation_dtype=plan.activation.rotation_dtype,
-        )
+        if plan.source.source_format == "trellismx":
+            from .trellismx import TrellisMxWeights
+
+            if not isinstance(weights, TrellisMxWeights):
+                raise TypeError(
+                    "trellismx preparation requires TrellisMxWeights (the "
+                    "released sidecar carriers and scale planes)"
+                )
+            prepared = prepare_b12x_trellis_w4a8_weights(
+                plan=plan._impl,
+                source=plan.source,
+                weights=weights,
+                device=device,
+            )
+        else:
+            if not isinstance(weights, TrellisWeights):
+                raise TypeError("Trellis preparation requires TrellisWeights")
+            prepared = prepare_b12x_trellis_v2_weights(
+                plan=plan._impl,
+                source=plan.source,
+                weights=weights,
+                device=device,
+                staging=staging,
+                rotation_dtype=plan.activation.rotation_dtype,
+            )
     else:
         if not isinstance(weights, PackedWeights):
             raise TypeError("packed preparation requires PackedWeights")

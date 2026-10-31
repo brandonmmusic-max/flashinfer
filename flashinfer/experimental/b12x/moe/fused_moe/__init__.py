@@ -131,6 +131,10 @@ META = OpMeta(
         "w8a8_mx",
         "w4a16",
         "b12x_trellis",
+        # TrellisMX is a weight source format (source_format="trellismx") on
+        # the w4a8_mx recipe, not another operator; its preparation entry point
+        # is ``fused_moe.trellismx.prepare_trellismx_experts``.
+        "trellismx",
     ),
     requires=("triton",),
     provenance=Provenance(

@@ -146,6 +146,7 @@ def _canonical_plan_execution(
     invocation: FrozenMapping = FrozenMapping(),
     override: MoeDecodeConfig | None = None,
     scale_expansion=None,
+    smallm_max_tokens: int | None = None,
 ):
     """Declare capacity variants; preparation publishes executable states."""
     return _plan_execution(
@@ -155,6 +156,7 @@ def _canonical_plan_execution(
         invocation=invocation,
         override=override,
         scale_expansion=scale_expansion,
+        smallm_max_tokens=smallm_max_tokens,
     )
 
 

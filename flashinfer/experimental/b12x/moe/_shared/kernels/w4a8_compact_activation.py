@@ -31,7 +31,25 @@ class W4A8CompactMicroActivationKernel:
         *,
         swiglu_limit: float | None,
         fast_math: bool,
+        trellis_coupled: bool = False,
     ):
+        if trellis_coupled:
+            # TrellisMX (coupled-h512-h128-suh-svh-v1) needs, per expert and
+            # before the activation: H128 on the atom32-interleaved gate/up
+            # window, *(gate_svh|up_svh), a second H128, *pre_signs, the
+            # adjacent-position silu-cap10 pair, *post_signs, H128, *down_suh
+            # and a final H128, all in FP32 up to the E4M3 quantizer.  This
+            # compact producer applies only SwiGLU -> BF16 -> E4M3/UE8M0, so it
+            # would silently compute the ordinary boundary.  Fail closed until
+            # the coupled chain is implemented here or the launch is routed to
+            # the coupled epilogue in dynamic/kernel.py.
+            raise NotImplementedError(
+                "W4A8CompactMicroActivationKernel cannot serve TrellisMX: the "
+                "coupled intermediate boundary (H128/svh/sign sandwich around "
+                "silu-cap10) is not implemented in this compact producer; use "
+                "the coupled epilogue path (trellis_intermediate_hadamard) or "
+                "see b12x/moe/_shared/kernels/trellismx_boundary.py:KERNEL_CONTRACT"
+            )
         self.n = int(n)
         self.num_experts = int(num_experts)
         self.has_swiglu_limit = swiglu_limit is not None

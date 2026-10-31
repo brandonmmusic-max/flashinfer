@@ -1,4 +1,9 @@
-"""Typed configuration for the ``b12x_trellis`` checkpoint encoding."""
+"""Typed configuration for the ``b12x_trellis`` checkpoint encoding.
+
+``TrellisCodebook.PROCEDURAL_NPK`` is the TrellisMX (procedural NPK) arm of
+the same v2 container contract; ``source_format`` selects which prepared
+layout a plan produces, not which fields this config has.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,9 @@ class TrellisCodebook(str, Enum):
     MCG = "mcg"
     LUT_E4M3 = "lut_e4m3"
     LUT_FP16 = "lut_fp16"
+    # The owner's procedural NPK law (TrellisMX). Defined for K2/K3/K4; the
+    # decode itself lives in ``kernels/w4a8_npk_decode.py``.
+    PROCEDURAL_NPK = "procedural_npk"
 
 
 class RateGranularity(str, Enum):
