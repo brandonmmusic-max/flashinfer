@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -11,6 +11,12 @@ from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan, PreparedCall
 
 from ._tuning import RoceQuery, TUNING
+
+
+def _scatter_gather_operations() -> tuple[str, ...]:
+    from ._scatter_gather_cute import OPERATIONS
+
+    return OPERATIONS
 
 
 def _dtypes(query: RoceQuery) -> tuple[torch.dtype, ...]:
@@ -25,7 +31,7 @@ def _dtypes(query: RoceQuery) -> tuple[torch.dtype, ...]:
 @program_cache(scope="preparation")
 def compile_roce(payload, ordinal: int):
     """Resolve exactly the all-reduce/all-gather launchers in a declaration."""
-    from . import _allgather_cute, _twoshot_cute, _varlen_cute
+    from . import _allgather_cute, _scatter_gather_cute, _twoshot_cute, _varlen_cute
     from ._oneshot_cute import get_launcher
     from .roce_oneshot import _DTYPE_NAMES
 
@@ -59,6 +65,18 @@ def compile_roce(payload, ordinal: int):
                     max_chunks,
                     ordinal,
                 )
+                for operation in _scatter_gather_cute.OPERATIONS:
+                    programs[(operation, dtype)] = _scatter_gather_cute.get_launcher(
+                        operation,
+                        _DTYPE_NAMES[dtype],
+                        query.world_size,
+                        query.rank,
+                        int(setup["threads"]),
+                        int(setup["flag_stride"]),
+                        int(setup["hca_count"]),
+                        max_chunks,
+                        ordinal,
+                    )
         varlen_chunks = int(setup.get("varlen_chunks", 0))
         if varlen_chunks:
             programs["varlen"] = _varlen_cute.get_launcher(
@@ -80,9 +98,19 @@ class _PreparedRoce:
     gather_launcher: object
     twoshot_launchers: dict[torch.dtype, object]
     varlen_launcher: object = None
+    # (operation, dtype) -> launcher of the pipelined reduce-scatter and shard gather.
+    scatter_gather_launchers: dict[tuple[str, torch.dtype], object] = field(
+        default_factory=dict
+    )
 
     def all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor | None = None):
         return self.runtime._run_prepared_all_reduce(inp, prepared=self, out=out)
+
+    def reduce_scatter(self, inp: torch.Tensor, *, out: torch.Tensor | None = None):
+        return self.runtime._run_prepared_reduce_scatter(inp, prepared=self, out=out)
+
+    def gather_shards(self, inp: torch.Tensor, *, out: torch.Tensor | None = None):
+        return self.runtime._run_prepared_gather_shards(inp, prepared=self, out=out)
 
     def all_gather(self, inp: torch.Tensor, *, out: torch.Tensor | None = None):
         return self.runtime._run_prepared_all_gather(inp, prepared=self, dim=0, out=out)
@@ -121,6 +149,24 @@ def prepared_gather_call(state: object, *, inp: torch.Tensor) -> PreparedCall:
     if not isinstance(state, _PreparedRoce):
         raise TypeError("RoCE preparation callback requires materialized runtime state")
     return PreparedCall(run=lambda: state.all_gather(inp))
+
+
+def prepared_reduce_scatter_call(
+    state: object, *, inp: torch.Tensor, out: torch.Tensor | None = None
+) -> PreparedCall:
+    """Prime the actual pipelined reduce-scatter launcher before publication."""
+    if not isinstance(state, _PreparedRoce):
+        raise TypeError("RoCE preparation callback requires materialized runtime state")
+    return PreparedCall(run=lambda: state.reduce_scatter(inp, out=out), output=out)
+
+
+def prepared_gather_shards_call(
+    state: object, *, inp: torch.Tensor, out: torch.Tensor | None = None
+) -> PreparedCall:
+    """Prime the actual pipelined shard-gather launcher before publication."""
+    if not isinstance(state, _PreparedRoce):
+        raise TypeError("RoCE preparation callback requires materialized runtime state")
+    return PreparedCall(run=lambda: state.gather_shards(inp, out=out), output=out)
 
 
 def prepared_varlen_call(
@@ -186,6 +232,11 @@ def plan(
                 if isinstance(key, tuple) and key[0] == "twoshot"
             },
             programs.get("varlen"),
+            {
+                key: value
+                for key, value in programs.items()
+                if isinstance(key, tuple) and key[0] in _scatter_gather_operations()
+            },
         )
 
     return Plan(
@@ -239,6 +290,8 @@ __all__ = [
     "plan",
     "prepared_call",
     "prepared_gather_call",
+    "prepared_gather_shards_call",
+    "prepared_reduce_scatter_call",
     "prepared_varlen_call",
     "query_from_runtime",
 ]

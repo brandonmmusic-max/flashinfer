@@ -60,6 +60,20 @@ matching C source and call `roce_enable_ring` before exchanging blobs. The
 returned `native_description()` records `ring`; private mailbox addresses are
 exchanged fresh at startup rather than restored from a CUDA graph.
 
+The two halves of the pipelined two-shot path are also separate operations.
+`reduce_scatter` reduces a whole message and keeps this rank's shard of the
+sum (rows `[r R / world, (r + 1) R / world)` of an `R`-row operand), and
+`gather_shards` concatenates every rank's shard along dimension 0, both over
+the two-shot buffers, chunk flags and grid, so they interleave with one-shot
+and two-shot operations in one graph. A reduce-scatter followed by a shard
+gather moves the bytes of one two-shot all-reduce and reproduces its bits,
+which lets a caller run row-local work on its shard between the halves.
+`should_reduce_scatter` and `should_gather_shards` admit operands whose rows
+hold whole 16-byte packs, whose row count (or gathered row count) divides by
+the world size, and whose whole message fits `pipe_bytes`. The control record
+carries them as op kinds 3 and 4; proxy ABI 11 adds the two kinds and changes
+no region layout.
+
 Collective generations range from 1 through 2,147,483,647. The proxy fails
 with `RoCE sequence space exhausted` before dispatching a larger generation;
 recreate every rank's runtime to reset the sequence. The bound preserves the

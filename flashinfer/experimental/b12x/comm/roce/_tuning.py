@@ -14,6 +14,8 @@ SURFACES = (
     "AllReduce.all_reduce",
     "AllReduce.all_gather",
     "AllReduce.all_gather_varlen",
+    "AllReduce.reduce_scatter",
+    "AllReduce.gather_shards",
 )
 
 
