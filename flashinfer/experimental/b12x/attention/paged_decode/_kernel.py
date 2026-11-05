@@ -54,6 +54,7 @@ from b12x.attention.paged.forward_paged import (
     _literal_qk_mma_into_sfrag_plane_bf16,
     _literal_update_mdo_states_fp32_pack_p,
     _mask_pv_bf16_pair,
+    _mask_pv_bf16_pair_windowed,
     _max_nan_f32,
     _make_paged_kv_tma_source_tensor,
     _make_payload_memrange,
@@ -176,7 +177,15 @@ def _qk_fp8_into_sfrag(
 
 @cute.jit
 def _pv_fp8_into_ofrag(
-    o_frag, p_frag, v_plane0, v_plane1, lane, key_base, num_mma_d_vo, valid_rows
+    o_frag,
+    p_frag,
+    v_plane0,
+    v_plane1,
+    lane,
+    key_base,
+    num_mma_d_vo,
+    valid_rows,
+    window_lo,
 ):
     """O += P V over one 16-key sub-tile of 128-byte FP8 V rows.
 
@@ -202,10 +211,10 @@ def _pv_fp8_into_ofrag(
         )
         b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
         b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
-        b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-        b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-        b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-        b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+        b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+        b1 = _mask_pv_bf16_pair_windowed(b1, key + Int32(8), valid_rows, window_lo)
+        b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+        b3 = _mask_pv_bf16_pair_windowed(b3, key + Int32(8), valid_rows, window_lo)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             o_frag[0, mma_d, 0],
             o_frag[0, mma_d, 1],
@@ -800,6 +809,17 @@ class PagedDecodeKernel:
                     context_len + token_local - Int32(self.window_left)
                 )
 
+            # Window lower bound shared by this warp's PV fragment: rows are
+            # packed in token order, so the earliest row gives the smallest
+            # window start; keys below it are unattended by every row this
+            # warp's B fragment feeds. No window means no lower bound.
+            if const_expr(self.window_left >= 0):
+                warp_window_lo = (
+                    context_len + warp_row_base // sub_group - Int32(self.window_left)
+                )
+            else:
+                warp_window_lo = Int32(0)
+
             q_regs = cute.make_rmem_tensor(
                 cute.make_layout((self.num_mma_d_qk, 1, 4), stride=(4, 4, 1)), Uint32
             )
@@ -962,6 +982,7 @@ class PagedDecodeKernel:
                                 Int32(sub * 16),
                                 self.num_mma_d_vo,
                                 tile_tokens,
+                                warp_window_lo - tile_base,
                             )
                         else:
                             _literal_pv_mma_into_ofrag_plane_bf16_packed(
@@ -980,6 +1001,7 @@ class PagedDecodeKernel:
                                 Int32(PLANE_DIM // 8),
                                 Float32(1.0),
                                 valid_rows=tile_tokens,
+                                window_lo=warp_window_lo - tile_base,
                             )
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(empty + buf)

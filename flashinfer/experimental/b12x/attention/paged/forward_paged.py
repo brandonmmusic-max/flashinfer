@@ -2029,6 +2029,21 @@ def _mask_pv_bf16_pair(word, key, valid_rows):
 
 
 @cute.jit
+def _mask_pv_bf16_pair_windowed(word, key, valid_rows, window_lo):
+    # Same contract as _mask_pv_bf16_pair, with a window lower bound: keys
+    # below window_lo are unattended by every row this warp fragment covers.
+    mask = cutlass.select_(
+        key < valid_rows and key >= window_lo, Uint32(0xFFFF), Uint32(0)
+    )
+    mask |= cutlass.select_(
+        key + Int32(1) < valid_rows and key + Int32(1) >= window_lo,
+        Uint32(0xFFFF0000),
+        Uint32(0),
+    )
+    return word & mask
+
+
+@cute.jit
 def _literal_pv_mma_into_ofrag_plane_bf16_packed(
     o_frag: cute.Tensor,
     p_frag: cute.Tensor,
@@ -2047,6 +2062,7 @@ def _literal_pv_mma_into_ofrag_plane_bf16_packed(
     debug_regs: cute.Tensor | None = None,
     *,
     valid_rows,
+    window_lo,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     for mma_kv in cutlass.range_constexpr(num_mma_kv):
@@ -2096,10 +2112,14 @@ def _literal_pv_mma_into_ofrag_plane_bf16_packed(
                     + mma_kv * 16
                     + (lane % 4) * 2
                 )
-                b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-                b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-                b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-                b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+                b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+                b1 = _mask_pv_bf16_pair_windowed(
+                    b1, key + Int32(8), valid_rows, window_lo
+                )
+                b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+                b3 = _mask_pv_bf16_pair_windowed(
+                    b3, key + Int32(8), valid_rows, window_lo
+                )
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
                     o_frag[mma_q, mma_d, 1],
@@ -6790,6 +6810,7 @@ class PagedForwardKernel:
                                 v_scale,
                                 mDebugU32,
                                 valid_rows=tile_tokens,
+                                window_lo=Int32(0),
                             )
                     _exit_thread()
 
@@ -7063,6 +7084,7 @@ class PagedForwardKernel:
                             tc_upcast_stride_plane,
                             v_scale,
                             valid_rows=tile_tokens,
+                            window_lo=Int32(0),
                         )
 
                 pipeline_v.consumer_release(v_consumer_state)
@@ -9707,6 +9729,7 @@ class PagedBf16ExtendRawForwardKernel:
                             tc_upcast_stride_plane,
                             Float32(1.0),
                             valid_rows=tile_tokens,
+                            window_lo=Int32(0),
                         )
                         _literal_pv_mma_into_ofrag_plane_bf16_packed(
                             o_frag,
@@ -9724,6 +9747,7 @@ class PagedBf16ExtendRawForwardKernel:
                             tc_upcast_stride_plane,
                             Float32(1.0),
                             valid_rows=tile_tokens,
+                            window_lo=Int32(0),
                         )
                     else:
                         _literal_update_mdo_states_fp32_pack_p(
@@ -9754,6 +9778,7 @@ class PagedBf16ExtendRawForwardKernel:
                             tc_upcast_stride_plane,
                             Float32(1.0),
                             valid_rows=tile_tokens,
+                            window_lo=Int32(0),
                         )
 
             consumer_state.advance()
@@ -10897,6 +10922,7 @@ class PagedFp8ExtendRawForwardKernel:
                         Int32(8),
                         v_scale,
                         valid_rows=tile_tokens,
+                        window_lo=Int32(0),
                     )
                     _literal_pv_mma_into_ofrag_plane_bf16_packed(
                         o_frag,
@@ -10914,6 +10940,7 @@ class PagedFp8ExtendRawForwardKernel:
                         Int32(8),
                         v_scale,
                         valid_rows=tile_tokens,
+                        window_lo=Int32(0),
                     )
                 cute.arch.sync_threads()
 
