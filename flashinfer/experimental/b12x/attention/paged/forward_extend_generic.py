@@ -3838,6 +3838,41 @@ class PagedForwardKernel:
         return tile_token_base
 
     @cute.jit
+    def _msa_v_stage_valid_rows(
+        self,
+        mQ2KIndices: cute.Tensor | None,
+        mMSAUnionBlocks: cute.Tensor | None,
+        work_idx,
+        kv_head_idx,
+        q_row_idx,
+        tile_token_base,
+        packed_rows,
+        live_limit,
+    ):
+        # Valid-row count the V producer must pass for one stage tile.  The
+        # consumer trims the same packed span to the visible extent before
+        # masking scores; the producer has to trim identically so the
+        # zero-filled V copy covers rows past the visible length instead of
+        # loading them (P is exactly zero there, and 0 x NaN = NaN would
+        # otherwise reach the output accumulator).  live_limit is
+        # msa_tile_max_visible_len for union tiles, so only rows invalid for
+        # every query row of the tile are zeroed, and msa_visible_len for
+        # per-token selections.
+        if const_expr(self.msa_block_sparse):
+            tile_key_base = self._tile_key_base(
+                mQ2KIndices,
+                mMSAUnionBlocks,
+                work_idx,
+                kv_head_idx,
+                q_row_idx,
+                tile_token_base,
+            )
+            live_tokens = live_limit - tile_key_base
+            live_tokens = cutlass.select_(live_tokens < Int32(0), Int32(0), live_tokens)
+            return cutlass.select_(live_tokens < packed_rows, live_tokens, packed_rows)
+        return packed_rows
+
+    @cute.jit
     def _msa_union_row_has_block(
         self,
         mMSAUnionMasks: cute.Tensor | None,
@@ -3902,8 +3937,14 @@ class PagedForwardKernel:
                     if const_expr(self.msa_block_sparse)
                     else token_idx - page_iter * page_size
                 )
-            page_id = mPageTable[request_idx, page_iter]
-            row_valid = row_idx < valid_rows
+            if const_expr(self.msa_block_sparse and self.entries_per_block > 1):
+                row_valid = row_idx < valid_rows
+                page_id = Int32(0)
+                if row_valid:
+                    page_id = mPageTable[request_idx, page_iter]
+            else:
+                page_id = mPageTable[request_idx, page_iter]
+                row_valid = row_idx < valid_rows
             row_byte_base = (
                 (
                     Int64(Uint32(page_id)) * Int64(page_stride_bytes)
@@ -4402,6 +4443,11 @@ class PagedForwardKernel:
                     msa_visible_len,
                 )
             )
+            msa_live_limit = (
+                msa_tile_max_visible_len
+                if const_expr(self.msa_union_tile)
+                else msa_visible_len
+            )
             chunk_start = (
                 kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else Int32(0)
             )
@@ -4449,6 +4495,7 @@ class PagedForwardKernel:
             msa_tile_first_token = Int32(0)
             msa_tile_token_count = Int32(0)
             msa_tile_max_visible_len = Int32(0)
+            msa_live_limit = Int32(0)
             chunk_start = (
                 kv_window_start + kv_tile_idx * kv_chunk_size
                 if const_expr(self.split_kv)
@@ -5513,6 +5560,21 @@ class PagedForwardKernel:
                                 page_size,
                             )
                 if const_expr(not self.use_paged_k_tma):
+                    if const_expr(self.msa_block_sparse and self.entries_per_block > 1):
+                        k_valid_rows = self._msa_v_stage_valid_rows(
+                            mQ2KIndices,
+                            mMSAUnionBlocks,
+                            work_idx,
+                            kv_head_idx,
+                            msa_q_row_idx,
+                            prefetch_base,
+                            tile_tokens,
+                            msa_live_limit,
+                        )
+                        k_fill_zero = True
+                    else:
+                        k_valid_rows = tile_tokens
+                        k_fill_zero = False
                     self._async_copy_paged_tile_permuted_128b(
                         mKBytes,
                         mPageTable,
@@ -5529,12 +5591,22 @@ class PagedForwardKernel:
                         Int32(preload_stage_idx * k_stage_bytes),
                         lane,
                         warp_linear_idx,
-                        tile_tokens,
+                        k_valid_rows,
                         self.traits.upcast_stride_k,
-                        False,
+                        k_fill_zero,
                     )
                     cute.arch.cp_async_commit_group()
                 if const_expr(not self.use_paged_v_tma):
+                    v_valid_rows = self._msa_v_stage_valid_rows(
+                        mQ2KIndices,
+                        mMSAUnionBlocks,
+                        work_idx,
+                        kv_head_idx,
+                        msa_q_row_idx,
+                        prefetch_base,
+                        tile_tokens,
+                        msa_live_limit,
+                    )
                     self._async_copy_paged_tile_permuted_128b(
                         mVBytes,
                         mPageTable,
@@ -5551,7 +5623,7 @@ class PagedForwardKernel:
                         Int32(preload_stage_idx * v_stage_bytes),
                         lane,
                         warp_linear_idx,
-                        tile_tokens,
+                        v_valid_rows,
                         self.traits.upcast_stride_v,
                         True,
                     )
@@ -5576,6 +5648,21 @@ class PagedForwardKernel:
                     prefetch_base,
                     page_size,
                 )
+                if const_expr(self.msa_block_sparse and self.entries_per_block > 1):
+                    k_valid_rows = self._msa_v_stage_valid_rows(
+                        mQ2KIndices,
+                        mMSAUnionBlocks,
+                        work_idx,
+                        kv_head_idx,
+                        msa_q_row_idx,
+                        prefetch_base,
+                        tile_tokens,
+                        msa_live_limit,
+                    )
+                    k_fill_zero = True
+                else:
+                    k_valid_rows = tile_tokens
+                    k_fill_zero = False
                 self._async_copy_paged_tile_permuted_128b(
                     mKBytes,
                     mPageTable,
@@ -5592,9 +5679,19 @@ class PagedForwardKernel:
                     Int32(preload_stage_idx * k_stage_bytes),
                     lane,
                     warp_linear_idx,
-                    tile_tokens,
+                    k_valid_rows,
                     self.traits.upcast_stride_k,
-                    False,
+                    k_fill_zero,
+                )
+                v_valid_rows = self._msa_v_stage_valid_rows(
+                    mQ2KIndices,
+                    mMSAUnionBlocks,
+                    work_idx,
+                    kv_head_idx,
+                    msa_q_row_idx,
+                    prefetch_base,
+                    tile_tokens,
+                    msa_live_limit,
                 )
                 self._async_copy_paged_tile_permuted_128b(
                     mVBytes,
@@ -5612,7 +5709,7 @@ class PagedForwardKernel:
                     Int32(preload_stage_idx * v_stage_bytes),
                     lane,
                     warp_linear_idx,
-                    tile_tokens,
+                    v_valid_rows,
                     self.traits.upcast_stride_v,
                     True,
                 )
@@ -6469,6 +6566,7 @@ class PagedForwardKernel:
 
                 next_tile_base = prefetch_base
                 next_tile_tokens = Int32(0)
+                next_v_tile_tokens = Int32(0)
                 next_page_idx = Int32(0)
                 if const_expr(not self.use_paged_k_tma):
                     # Every query warp reads the same K stage.  Do not let an
@@ -6482,6 +6580,16 @@ class PagedForwardKernel:
                                 chunk_end,
                             )
                             next_tile_tokens = next_tile_limit - next_tile_base
+                            next_v_tile_tokens = self._msa_v_stage_valid_rows(
+                                mQ2KIndices,
+                                mMSAUnionBlocks,
+                                work_idx,
+                                kv_head_idx,
+                                msa_q_row_idx,
+                                next_tile_base,
+                                next_tile_tokens,
+                                msa_live_limit,
+                            )
                             next_page_idx = self._tile_page_idx(
                                 mQ2KIndices,
                                 mMSAUnionBlocks,
@@ -6491,6 +6599,23 @@ class PagedForwardKernel:
                                 next_tile_base,
                                 page_size,
                             )
+                            if const_expr(
+                                self.msa_block_sparse and self.entries_per_block > 1
+                            ):
+                                k_valid_rows = self._msa_v_stage_valid_rows(
+                                    mQ2KIndices,
+                                    mMSAUnionBlocks,
+                                    work_idx,
+                                    kv_head_idx,
+                                    msa_q_row_idx,
+                                    next_tile_base,
+                                    next_tile_tokens,
+                                    msa_live_limit,
+                                )
+                                k_fill_zero = True
+                            else:
+                                k_valid_rows = next_tile_tokens
+                                k_fill_zero = False
                             self._async_copy_paged_tile_permuted_128b(
                                 mKBytes,
                                 mPageTable,
@@ -6507,9 +6632,9 @@ class PagedForwardKernel:
                                 Int32(consume_stage_idx * k_stage_bytes),
                                 lane,
                                 warp_linear_idx,
-                                next_tile_tokens,
+                                k_valid_rows,
                                 self.traits.upcast_stride_k,
-                                False,
+                                k_fill_zero,
                             )
                     elif const_expr(self.traits.num_warps_kv == 1):
                         if next_tile_base < chunk_end:
@@ -6519,6 +6644,16 @@ class PagedForwardKernel:
                                 chunk_end,
                             )
                             next_tile_tokens = next_tile_limit - next_tile_base
+                            next_v_tile_tokens = self._msa_v_stage_valid_rows(
+                                mQ2KIndices,
+                                mMSAUnionBlocks,
+                                work_idx,
+                                kv_head_idx,
+                                msa_q_row_idx,
+                                next_tile_base,
+                                next_tile_tokens,
+                                msa_live_limit,
+                            )
                             next_page_idx = self._tile_page_idx(
                                 mQ2KIndices,
                                 mMSAUnionBlocks,
@@ -6528,6 +6663,23 @@ class PagedForwardKernel:
                                 next_tile_base,
                                 page_size,
                             )
+                            if const_expr(
+                                self.msa_block_sparse and self.entries_per_block > 1
+                            ):
+                                k_valid_rows = self._msa_v_stage_valid_rows(
+                                    mQ2KIndices,
+                                    mMSAUnionBlocks,
+                                    work_idx,
+                                    kv_head_idx,
+                                    msa_q_row_idx,
+                                    next_tile_base,
+                                    next_tile_tokens,
+                                    msa_live_limit,
+                                )
+                                k_fill_zero = True
+                            else:
+                                k_valid_rows = next_tile_tokens
+                                k_fill_zero = False
                             self._async_copy_paged_tile_permuted_128b(
                                 mKBytes,
                                 mPageTable,
@@ -6544,9 +6696,9 @@ class PagedForwardKernel:
                                 Int32(consume_stage_idx * k_stage_bytes),
                                 lane,
                                 warp_linear_idx,
-                                next_tile_tokens,
+                                k_valid_rows,
                                 self.traits.upcast_stride_k,
-                                False,
+                                k_fill_zero,
                             )
 
                 if const_expr(self.use_paged_v_tma):
@@ -7015,6 +7167,23 @@ class PagedForwardKernel:
                                         page_size,
                                     )
                         if const_expr(not self.use_paged_k_tma):
+                            if const_expr(
+                                self.msa_block_sparse and self.entries_per_block > 1
+                            ):
+                                k_valid_rows = self._msa_v_stage_valid_rows(
+                                    mQ2KIndices,
+                                    mMSAUnionBlocks,
+                                    work_idx,
+                                    kv_head_idx,
+                                    msa_q_row_idx,
+                                    next_tile_base,
+                                    next_tile_tokens,
+                                    msa_live_limit,
+                                )
+                                k_fill_zero = True
+                            else:
+                                k_valid_rows = next_tile_tokens
+                                k_fill_zero = False
                             self._async_copy_paged_tile_permuted_128b(
                                 mKBytes,
                                 mPageTable,
@@ -7031,9 +7200,9 @@ class PagedForwardKernel:
                                 Int32(consume_stage_idx * k_stage_bytes),
                                 lane,
                                 warp_linear_idx,
-                                next_tile_tokens,
+                                k_valid_rows,
                                 self.traits.upcast_stride_k,
-                                False,
+                                k_fill_zero,
                             )
                             cute.arch.cp_async_commit_group()
                         if const_expr(not self.use_paged_v_tma):
@@ -7053,7 +7222,7 @@ class PagedForwardKernel:
                                 Int32(consume_stage_idx * v_stage_bytes),
                                 lane,
                                 warp_linear_idx,
-                                next_tile_tokens,
+                                next_v_tile_tokens,
                                 self.traits.upcast_stride_v,
                                 True,
                             )
@@ -7082,7 +7251,7 @@ class PagedForwardKernel:
                             Int32(consume_stage_idx * v_stage_bytes),
                             lane,
                             warp_linear_idx,
-                            next_tile_tokens,
+                            next_v_tile_tokens,
                             self.traits.upcast_stride_v,
                             True,
                         )
@@ -7107,7 +7276,7 @@ class PagedForwardKernel:
                             Int32(consume_stage_idx * v_stage_bytes),
                             lane,
                             warp_linear_idx,
-                            next_tile_tokens,
+                            next_v_tile_tokens,
                             self.traits.upcast_stride_v,
                             True,
                         )

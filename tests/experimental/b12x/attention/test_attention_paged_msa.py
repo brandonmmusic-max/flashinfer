@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import pytest
 import torch
@@ -175,7 +176,7 @@ def _run_msa_decode(
     return out, _lse_base2_to_natural(lse_base2)
 
 
-def _run_msa_extend(
+def _msa_extend_run(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -187,7 +188,8 @@ def _run_msa_extend(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     msa_union_tile: bool | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    replay: bool = False,
+) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
     plan = create_paged_plan(
         q,
         k_cache,
@@ -243,7 +245,64 @@ def _run_msa_extend(
         k_descale=k_descale,
         v_descale=v_descale,
     )
-    out, lse_base2 = paged_attention_forward(binding=binding)
+    if replay:
+        # CUDA-graph replay mode: capture the prepared call once on the
+        # current cache state, then execute through graph.replay(). The
+        # graph reads the live cache buffers, so cache poisoning between
+        # replays must produce the same result as in direct mode.
+        torch.cuda.synchronize()
+        warmup = torch.cuda.Stream()
+        warmup.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup):
+            paged_attention_forward(binding=binding)
+        torch.cuda.current_stream().wait_stream(warmup)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out_g, lse_g = paged_attention_forward(binding=binding)
+
+        def run() -> tuple[torch.Tensor, torch.Tensor]:
+            graph.replay()
+            torch.cuda.synchronize()
+            return out_g, lse_g
+
+    else:
+
+        def run() -> tuple[torch.Tensor, torch.Tensor]:
+            out, lse_base2 = paged_attention_forward(binding=binding)
+            torch.cuda.synchronize()
+            return out, lse_base2
+
+    return run
+
+
+def _run_msa_extend(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    *,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    msa_union_tile: bool | None = None,
+    replay: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    run = _msa_extend_run(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        msa_union_tile=msa_union_tile,
+        replay=replay,
+    )
+    out, lse_base2 = run()
     return out, _lse_base2_to_natural(lse_base2)
 
 
@@ -635,6 +694,147 @@ def test_msa_extend_eager_fp8_kv_matches_reference_varlen(
         v_descale=v_descale,
         msa_union_tile=msa_union_tile,
     )
+    ref, ref_lse = msa_attention_reference(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    torch.testing.assert_close(lse, ref_lse, rtol=5e-2, atol=5e-2)
+    cosine = torch.nn.functional.cosine_similarity(
+        out.to(torch.float32).reshape(-1),
+        ref.to(torch.float32).reshape(-1),
+        dim=0,
+    ).item()
+    assert cosine >= 0.995
+
+
+@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("topk", [2, 16])
+@pytest.mark.parametrize(
+    "kv_fp8,page_size,msa_union_tile",
+    [
+        (False, 64, None),
+        (True, 64, None),
+        (False, 128, None),
+        (False, 128, False),
+        (True, 128, None),
+    ],
+)
+def test_msa_extend_ignores_nonfinite_cache_tail(
+    kv_fp8: bool, page_size: int, msa_union_tile: bool | None, topk: int, replay: bool
+) -> None:
+    require_b12x()
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
+        q_seqlens=[37, 300, 5],
+        cache_seqlens=[129, 1000, 2311],
+        page_size=page_size,
+        q_heads=64,
+        kv_heads=4,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        seed=1310,
+    )
+    # topk=2 with block 0 forced selects {0, local block}: non-contiguous
+    # selections whose last block is the partial one.
+    q2k_indices = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        num_kv_heads=4,
+        topk=topk,
+        seed=53,
+        force_block0=True,
+        poison_padding=True,
+    )
+    q2k_indices = torch.nn.functional.pad(q2k_indices, (0, 16 - topk), value=-1)
+    descales = {}
+    if kv_fp8:
+        k_cache, v_cache, k_descale, v_descale = quantize_paged_kv_cache_e4m3(
+            k_cache, v_cache, page_table, cache_seqlens
+        )
+        descales = {"k_descale": k_descale, "v_descale": v_descale}
+
+    run = _msa_extend_run(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        msa_union_tile=msa_union_tile,
+        replay=replay,
+        **descales,
+    )
+    out, lse_base2 = run()
+    clean_out, clean_lse = out.clone(), _lse_base2_to_natural(lse_base2).clone()
+    assert torch.isfinite(clean_out).all()
+
+    for request_idx, cache_len in enumerate(cache_seqlens.tolist()):
+        tail = cache_len % page_size
+        if tail == 0:
+            continue
+        page = int(page_table[request_idx, (cache_len - 1) // page_size])
+        for cache in (k_cache, v_cache):
+            if kv_fp8:
+                cache.view(torch.uint8)[page, tail:] = 0x7F
+            else:
+                cache[page, tail:] = float("nan")
+
+    poison_out, poison_lse_base2 = run()
+    assert torch.equal(poison_out, clean_out)
+    assert torch.equal(_lse_base2_to_natural(poison_lse_base2), clean_lse)
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_msa_extend_page64_dead_subpage_clean_run(replay: bool) -> None:
+    # Page 64 + union tile: the last union block's second subpage can lie
+    # entirely past the request, and the kernel then reads the page table one
+    # column past the request's row.  On unfixed code this run aborts with
+    # CUDA_ERROR_ILLEGAL_ADDRESS (FP8).  The fix must keep the run clean and
+    # leave the output on the visible extent unchanged.
+    require_b12x()
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
+        q_seqlens=[5],
+        cache_seqlens=[2311],
+        page_size=64,
+        q_heads=64,
+        kv_heads=4,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        seed=1310,
+    )
+    q2k_indices = make_msa_q2k_indices(
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        num_kv_heads=4,
+        topk=16,
+        seed=53,
+        force_block0=True,
+        poison_padding=True,
+    )
+    k_fp8, v_fp8, k_descale, v_descale = quantize_paged_kv_cache_e4m3(
+        k_cache, v_cache, page_table, cache_seqlens
+    )
+    out, lse = _run_msa_extend(
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q2k_indices,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        replay=replay,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
     ref, ref_lse = msa_attention_reference(
         q,
         k_fp8,
