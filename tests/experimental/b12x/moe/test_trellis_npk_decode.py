@@ -587,6 +587,6 @@ def test_npk_tile_times_released_scale_matches_reference() -> None:
     )
     # Every row, bitwise, with the plane row-for-row against the tile: the
     # decode reproduces the recorded one-tile dump exactly (tile sha a2baee9b...) and
-    # the plane byte is the row's own, which is the pairing the arm now uses.
+    # the plane byte is the row's own, which is the pairing the arm uses.
     assert torch.equal(picked, plane[:16, 0])
     assert torch.equal(scaled, reference), (scaled - reference).abs().max()

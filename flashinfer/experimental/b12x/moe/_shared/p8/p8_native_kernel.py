@@ -1061,14 +1061,13 @@ class P8NativeTPMoE:
                     config=config,
                 )
             return out
-        # Every stored rate now has a fused grouped owner, the M32-or-M64/N128
+        # Every stored rate has a fused grouped owner, the M32-or-M64/N128
         # arm the tile policy or the raced configuration selects, so a non-K4
         # layer at M>1 runs the same native path as K4 rather than looping the
-        # M1 kernel row by row. The row-by-row fallback is deliberately gone: a
-        # rate without a grouped specialization must fail closed instead of
-        # silently serving at a fraction of the speed.
+        # M1 kernel row by row. A rate without a grouped specialization fails
+        # closed instead of silently serving at a fraction of the speed.
         if self.scale_component is not None and not self.full_coupled and m != 1:
-            raise RuntimeError("P8 scale sandwich currently supports M=1 only")
+            raise RuntimeError("P8 scale sandwich supports M=1 only")
         spec = self.launch_spec(config)
         materialized, small_m = _select_arm(spec, m)
         arm = self._compile(spec, materialized, small_m=small_m, expected_m=m)

@@ -449,7 +449,7 @@ def test_plans_select_the_monolithic_trellis_arm(
     assert not _w4a8_dynamic_materialized_enabled(
         **arguments, trellis_codebook="procedural_npk"
     )
-    # Omitted codebook (the W4A16/QMMA callers' default) keeps the old answer.
+    # Omitted codebook (the W4A16/QMMA callers' default) matches the lut_e4m3 answer.
     assert _w4a8_dynamic_materialized_enabled(**arguments)
 
 
@@ -580,7 +580,7 @@ def test_missing_compander_is_required_for_the_canonical_law() -> None:
 
 
 def test_alias_law_implies_the_compander_and_takes_declared_geometry() -> None:
-    """GLM-5.3 sidecars: the old label, and no geometry fields at all."""
+    """GLM-5.3 sidecars: the alias label, and no geometry fields at all."""
 
     tensors, metadata = _sidecar()
     glm = {

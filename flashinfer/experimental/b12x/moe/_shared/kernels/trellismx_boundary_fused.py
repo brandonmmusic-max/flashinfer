@@ -357,9 +357,8 @@ class TrellisMxFusedBoundary:
     def __call__(self, x, suh, payload, scales, values, stream):
         tokens = cute.size(x, 0)
         chunks = self.hidden // _CHUNK
-        # Grid: one CTA per (token, 512-value chunk) rather than the earlier
-        # one CTA per token, which left the GPU nearly idle at decode sizes (one
-        # token now runs eight CTAs instead of one).
+        # Grid: one CTA per (token, 512-value chunk), so each token launches
+        # hidden // 512 CTAs and decode sizes keep the GPU occupied.
         self.kernel(x, suh, payload, scales, values).launch(
             grid=(tokens, chunks, 1),
             block=[_THREADS, 1, 1],

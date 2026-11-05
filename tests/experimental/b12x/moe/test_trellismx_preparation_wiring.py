@@ -948,7 +948,7 @@ def test_plan_bind_and_capture_need_no_eager_call() -> None:
     graph.replay()
     torch.cuda.synchronize()
     replayed = output.clone()
-    # The first eager call, now that the graph exists, is the bitwise reference.
+    # With the graph captured, the first eager call is the bitwise reference.
     fused_moe.run(binding=binding)
     torch.cuda.synchronize()
     assert torch.equal(replayed, output), "capture and eager disagree"

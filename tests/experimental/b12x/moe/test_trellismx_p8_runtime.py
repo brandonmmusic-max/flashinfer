@@ -658,7 +658,7 @@ def test_compile_cache_closure_covers_the_p8_kernels() -> None:
         "w4a8_phase2",
     ):
         assert kernels + leaf in launch, leaf
-    # The H128 helper is the shared one now, not a copy under the P8 tree.
+    # The H128 helper is the shared one, not a copy under the P8 tree.
     assert "b12x.moe._shared.kernels.w4a8_trellis_decode" in launch
     # The kernel body and the NPK state law are the shared modules, so the P8
     # programs' identity follows them.
@@ -1259,7 +1259,7 @@ def test_in_tree_runtime_rejects_unusable_routing_tensors(gpu_layer3) -> None:
 def test_the_route_partial_sum_needs_no_clear(gpu_layer3, capacity, rows) -> None:
     """A poisoned arena serves the same bytes as a zeroed one.
 
-    The call no longer clears the m * top-k * hidden FP32 per-route partial
+    The call does not clear the m * top-k * hidden FP32 per-route partial
     sum, because the split FC2 owners write every element of it before the
     reducer reads it. Poisoning the whole arena with 0xFF first leaves nothing
     to read but what the call itself writes, so the output must be
@@ -2194,9 +2194,8 @@ def test_the_autotuner_races_the_p8_launch_configurations(gpu_layer3, tmp_path) 
         ).item()
         assert cosine >= 0.9998, (config, cosine)
 
-    # The session's own selection cache keeps this race cold. A shared cache
-    # would restore the winner an earlier run recorded and measure nothing,
-    # which is what a second run of this test used to observe.
+    # The session's own selection cache keeps this race cold: a shared cache
+    # would restore a recorded winner and measure nothing.
     with PreparationSession(
         device=device, autotune=True, compile_workers=0, cache_dir=cache
     ) as session:

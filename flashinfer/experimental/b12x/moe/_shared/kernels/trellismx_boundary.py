@@ -123,7 +123,7 @@ input_boundary_quantized) because it is identical for every expert.  For the
 declared FP32 order to survive, the kernel must satisfy all three of:
 
   (1) A operands are consumed at the precision the boundary produced.  The
-      current phase-1 path loads bf16 and re-casts
+      phase-1 path loads bf16 and re-casts
       `cutlass.Float16(a_input[...].to(f32)).to(f32)`; feeding it the boundary's
       fp32 output adds a rounding the order does not declare.  Either read the
       fp32 buffer directly, or consume `input_boundary_quantized`'s E4M3

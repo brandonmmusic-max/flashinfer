@@ -183,7 +183,7 @@ def test_npk_fp16_decode_is_bitwise_the_law() -> None:
 
 
 def test_the_compander_is_not_the_mcg_arm() -> None:
-    """The new branch is the mcg law *plus* the doubling; without it the values halve."""
+    """The compander law is the mcg law *plus* the doubling; without the doubling the values halve."""
 
     rows = 32
     generator = torch.Generator().manual_seed(3)
@@ -192,7 +192,7 @@ def test_the_compander_is_not_the_mcg_arm() -> None:
     for index in range(rows):
         doubled = _law_fp16(int(win_a[index]), int(win_b[index]))
         halved = np.array([np.float16(v / 2) for v in doubled], dtype=np.float16)
-        # the mcg arm stops one doubling short, so its value is half of ours
+        # the mcg arm stops one doubling short, so its value is half of the compander law's
         assert np.allclose(
             doubled.astype(np.float32),
             2.0 * halved.astype(np.float32),

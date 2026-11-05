@@ -14443,7 +14443,7 @@ def _trellismx_smallm_plan(
 
     The plan holds no mutable buffer: every binding carves its own from the
     caller's scratch (``TPMoEScratchPlan.bind``), so calls and captured replays
-    on one bundle no longer share storage. The compiled programs are shared,
+    on one bundle do not share storage. The compiled programs are shared,
     which is safe: they are read-only.
     """
 
@@ -14525,7 +14525,7 @@ def _run_trellismx_fast_path(binding: TPMoEFP4Binding) -> torch.Tensor | None:
         )
     if binding.implementation == P8_BACKEND:
         raise RuntimeError(
-            "this binding was planned for a P8 runtime that its experts no longer own"
+            "this binding was planned for a P8 runtime that its experts do not own"
         )
     _validate_trellismx_binding(binding, top_k=binding.num_topk)
     m = int(binding.a.shape[0])

@@ -403,7 +403,7 @@ def test_shared_w13_with_a_different_bundle_is_rejected(fake_backend, changed) -
     ), "the two bundles must share the W13 carrier"
     with pytest.raises(TrellisMxP8IncompatibleError):
         attach_trellismx_p8_runtime(sibling, runtime, backend=fake_backend.backend)
-    # The original still attaches, and the sibling keeps its own arms.
+    # The prepared bundle still attaches, and the sibling keeps its own arms.
     attached = attach_trellismx_p8_runtime(
         prepared, runtime, backend=fake_backend.backend
     )
@@ -1074,7 +1074,7 @@ def test_a_bound_call_runs_the_attached_runtime(fake_backend) -> None:
     ((x, weights, ids, out),) = runtime.calls
     assert x is binding.a and ids is binding.topk_ids and out is binding.output
     # A bundle without the runtime does not reach it.
-    with pytest.raises(RuntimeError, match="no longer own"):
+    with pytest.raises(RuntimeError, match="do not own"):
         _impl.b12x_moe_fp4(
             binding=_binding(prepared._impl, implementation="trellismx_p8")
         )

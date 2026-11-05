@@ -1349,7 +1349,7 @@ def test_trellismx_source_rejects_foreign_metadata(name: str) -> None:
         device=torch.device("cpu"),
     )
     # The baseline must prepare at all; otherwise every rejection below is a
-    # rejection of the wrong thing (that is how earlier metadata bugs first looked).
+    # rejection of the wrong thing, which is how a metadata bug looks.
     prepare_trellismx_experts(
         {key: torch.from_numpy(tensor) for key, tensor in tensors.items()},
         metadata,

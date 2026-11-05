@@ -51,9 +51,10 @@ def enable_down_remainder(backend, phases: str = "both") -> None:
 
 
 def enable_rowpack(backend, input_hop: bool = False) -> None:
-    """D-x2-RP: upgrade direct (M<=16) phase kernels to their static RP classes. No smem change.
+    """Direct (M<=16) rowpack variant: the direct phase kernels become their static RP classes;
+    shared memory is unchanged.
 
-    input_hop (D-x2-RP2): FC1 becomes the RP2 class and the backend's input prologue also writes x_lo.
+    input_hop (the RP2 variant): FC1 becomes the RP2 class and the backend's input prologue also writes x_lo.
     """
     if input_hop:
         backend.p8_input_rowpack = True

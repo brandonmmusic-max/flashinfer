@@ -968,10 +968,10 @@ def _trellis_kernel_options(plan) -> tuple[str | None, bool, bool]:
     """Codebook and coupled-boundary flags the routed kernel must be built with.
 
     ``plan.trellis_codebook`` is validated against the source format when the
-    plan is built, but nothing used to hand it to a kernel constructor, so a
-    ``trellismx`` plan compiled a kernel whose ``trellis_codebook`` was the
-    default ``lut_e4m3``: the procedural-NPK payload was then decoded through
-    the LUT table, which is a silent wrong answer, not a crash.
+    plan is built; this helper hands it to the kernel constructor. A
+    ``trellismx`` plan whose kernel is built with the default ``lut_e4m3``
+    codebook silently decodes the procedural-NPK payload through the LUT table
+    instead of crashing.
 
     The two coupled-boundary flags follow the same source format, because
     ``coupled-h512-h128-suh-svh-v1`` is what ``trellismx`` means: the

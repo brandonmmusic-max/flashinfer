@@ -69,7 +69,7 @@ class P8CoupledPrefillFC1Kernel(P8H128FC1Kernel):
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        """FC1-only376-CTA grid for188-SM target; other phase grids unchanged."""
+        """FC1-only 376-CTA grid for the 188-SM target; other phase grids are unchanged."""
 
         self.kernel(
             cute.recast_tensor(packed_a_storage, cutlass.Uint32),

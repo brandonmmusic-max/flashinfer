@@ -75,9 +75,9 @@ __b12x_source_dependencies__ = (
 )
 
 # Exact float32 encodings used by torch's terminal ``/ sqrt(N)`` in the
-# full-coupled CPU reference.  The previous input owner multiplied by the
-# reciprocal twice (H128 then H4), which is algebraically equivalent but can
-# move an E4M3 tie by one code.  Keep these as divisors and use div.rn.f32.
+# full-coupled CPU reference.  Multiplying by the reciprocal twice (H128 then
+# H4) is algebraically equivalent but can move an E4M3 tie by one code, so keep
+# these as divisors and use div.rn.f32.
 _P8_SQRT128_F32 = 11.313708305358887  # 0x413504f3
 _P8_SQRT512_F32 = 22.627416610717773  # 0x41b504f3
 

@@ -1884,7 +1884,7 @@ class W4A16FusedMoeKernel:
                     # TrellisMX's ``silu-cap10`` is exactly the gated cap the
                     # ordinary activation path already applies (gate capped at
                     # +limit, up clamped to +-limit, before the sigmoid). With
-                    # no limit configured this is the previous plain silu.
+                    # no limit configured this is plain silu.
                     ag0, au0 = self._clamp_swiglu_inputs(a0, a1)
                     ag1, au1 = self._clamp_swiglu_inputs(a2, a3)
                     bg0, bu0 = self._clamp_swiglu_inputs(b0, b1)
