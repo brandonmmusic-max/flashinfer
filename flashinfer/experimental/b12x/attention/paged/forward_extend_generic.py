@@ -63,7 +63,7 @@ from b12x._lib.intrinsics.memory import (
 )
 
 from ._selected_forward_config import SELECTION_WIDTH
-from .forward_paged import _mask_pv_bf16_pair, _max_nan_f32
+from .forward_paged import _mask_pv_bf16_pair_windowed, _max_nan_f32
 from .traits import PagedForwardTraits
 from ._controls import paged_control
 
@@ -2134,6 +2134,7 @@ def _literal_pv_mma_into_ofrag_bf16_packed(
     mma_d_base: cutlass.Constexpr = 0,
     *,
     valid_rows,
+    window_lo,
 ):
     if const_expr(apply_v_scale):
         v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
@@ -2180,10 +2181,10 @@ def _literal_pv_mma_into_ofrag_bf16_packed(
             key = (
                 row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
             )
-            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+            b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+            b1 = _mask_pv_bf16_pair_windowed(b1, key + Int32(8), valid_rows, window_lo)
+            b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+            b3 = _mask_pv_bf16_pair_windowed(b3, key + Int32(8), valid_rows, window_lo)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 if const_expr(apply_v_scale):
                     d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
@@ -2253,6 +2254,7 @@ def _literal_pv_mma_into_ofrag_fp8_quarter_repack(
     v_scale,
     *,
     valid_rows,
+    window_lo,
 ):
     for quarter in cutlass.range_constexpr(4):
         cute.arch.sync_threads()
@@ -2278,6 +2280,7 @@ def _literal_pv_mma_into_ofrag_fp8_quarter_repack(
             True,
             mma_d_base=quarter * 4,
             valid_rows=valid_rows,
+            window_lo=window_lo,
         )
 
 
@@ -2300,6 +2303,7 @@ def _literal_pv_mma_into_ofrag_plane_bf16_packed(
     debug_regs: cute.Tensor | None = None,
     *,
     valid_rows,
+    window_lo,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     for mma_kv in cutlass.range_constexpr(num_mma_kv):
@@ -2345,10 +2349,10 @@ def _literal_pv_mma_into_ofrag_plane_bf16_packed(
             key = (
                 row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
             )
-            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+            b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+            b1 = _mask_pv_bf16_pair_windowed(b1, key + Int32(8), valid_rows, window_lo)
+            b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+            b3 = _mask_pv_bf16_pair_windowed(b3, key + Int32(8), valid_rows, window_lo)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2453,6 +2457,7 @@ def _literal_pv_mma_into_ofrag_fp8_raw(
     debug_regs: cute.Tensor | None = None,
     *,
     valid_rows,
+    window_lo,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     v_offset = _permuted_offset_128b(
@@ -2503,10 +2508,10 @@ def _literal_pv_mma_into_ofrag_fp8_raw(
             key = (
                 row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
             )
-            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+            b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+            b1 = _mask_pv_bf16_pair_windowed(b1, key + Int32(8), valid_rows, window_lo)
+            b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+            b3 = _mask_pv_bf16_pair_windowed(b3, key + Int32(8), valid_rows, window_lo)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2559,6 +2564,7 @@ def _literal_pv_mma_into_ofrag_fp8_raw_m16n16_b8(
     v_scale,
     *,
     valid_rows,
+    window_lo,
 ):
     """Use SM120's byte ldmatrix form to avoid software FP8 transpose."""
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
@@ -2598,10 +2604,10 @@ def _literal_pv_mma_into_ofrag_fp8_raw_m16n16_b8(
             key = (
                 row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
             )
-            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+            b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+            b1 = _mask_pv_bf16_pair_windowed(b1, key + Int32(8), valid_rows, window_lo)
+            b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+            b3 = _mask_pv_bf16_pair_windowed(b3, key + Int32(8), valid_rows, window_lo)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2648,6 +2654,7 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
     debug_regs: cute.Tensor | None = None,
     *,
     valid_rows,
+    window_lo,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     upcast_stride_full = upcast_stride_plane * Int32(2)
@@ -2705,10 +2712,10 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
             key = (
                 row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
             )
-            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+            b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+            b1 = _mask_pv_bf16_pair_windowed(b1, key + Int32(8), valid_rows, window_lo)
+            b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+            b3 = _mask_pv_bf16_pair_windowed(b3, key + Int32(8), valid_rows, window_lo)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2757,6 +2764,7 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
     v_scale,
     *,
     valid_rows,
+    window_lo,
 ):
     unit_scale = Uint32(0x7F7F7F7F)
     mask16 = Uint32(0xFFFF)
@@ -2855,10 +2863,16 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
                 + mma_pair * 32
                 + (lane % 4) * 2
             )
-            b0_k0 = _mask_pv_bf16_pair(b0_k0, key, valid_rows)
-            b1_k0 = _mask_pv_bf16_pair(b1_k0, key + Int32(8), valid_rows)
-            b0_k1 = _mask_pv_bf16_pair(b0_k1, key + Int32(16), valid_rows)
-            b1_k1 = _mask_pv_bf16_pair(b1_k1, key + Int32(24), valid_rows)
+            b0_k0 = _mask_pv_bf16_pair_windowed(b0_k0, key, valid_rows, window_lo)
+            b1_k0 = _mask_pv_bf16_pair_windowed(
+                b1_k0, key + Int32(8), valid_rows, window_lo
+            )
+            b0_k1 = _mask_pv_bf16_pair_windowed(
+                b0_k1, key + Int32(16), valid_rows, window_lo
+            )
+            b1_k1 = _mask_pv_bf16_pair_windowed(
+                b1_k1, key + Int32(24), valid_rows, window_lo
+            )
             b0_k0 = frag_layout_swizzle_16b_to_8b_trans(b0_k0)
             b1_k0 = frag_layout_swizzle_16b_to_8b_trans(b1_k0)
             b0_k1 = frag_layout_swizzle_16b_to_8b_trans(b0_k1)
@@ -5777,6 +5791,24 @@ class PagedForwardKernel:
                 tile_tokens = cutlass.select_(
                     live_tokens < tile_tokens, live_tokens, tile_tokens
                 )
+            # The TMA staging path and the split windowed scan floor the window
+            # start to a page boundary, so a staged KV tile can begin below the
+            # oldest key any query row in the tile attends.  The PV B fragment
+            # is shared by every query row the warp feeds, so the bound is the
+            # window start of the first packed query row this warp owns,
+            # measured in tile-local keys.  Without a window, window_left is
+            # negative and the bound stays zero.
+            window_lo = Int32(0)
+            if const_expr(self.window_left >= 0):
+                warp_first_q_token = (packed_tile_start + warp_row_base) // group_size
+                window_lo = (
+                    cache_len
+                    - qo_len
+                    + warp_first_q_token
+                    - Int32(self.window_left)
+                    - tile_base
+                )
+                window_lo = cutlass.select_(window_lo > Int32(0), window_lo, Int32(0))
             if const_expr(self.use_kv_repack_fp16):
                 # Most full-prefill KV tiles precede the first causal limit in
                 # this packed Q tile.  Only the final causal/partial tile needs
@@ -6771,6 +6803,7 @@ class PagedForwardKernel:
                                     v_scale,
                                     mDebugU32,
                                     valid_rows=tile_tokens,
+                                    window_lo=window_lo,
                                 )
                             else:
                                 _literal_pv_mma_into_ofrag_fp8_raw(
@@ -6790,6 +6823,7 @@ class PagedForwardKernel:
                                     v_scale,
                                     mDebugU32,
                                     valid_rows=tile_tokens,
+                                    window_lo=window_lo,
                                 )
                         elif const_expr(self.use_paged_v_tma):
                             v_stage_plane_offset = Int32(
@@ -6828,6 +6862,7 @@ class PagedForwardKernel:
                                 v_scale,
                                 mDebugU32,
                                 valid_rows=tile_tokens,
+                                window_lo=window_lo,
                             )
                         else:
                             _literal_pv_mma_into_ofrag_bf16_packed(
@@ -6848,6 +6883,7 @@ class PagedForwardKernel:
                                 True,
                                 mDebugU32,
                                 valid_rows=tile_tokens,
+                                window_lo=window_lo,
                             )
                     _exit_thread()
 
@@ -6899,6 +6935,7 @@ class PagedForwardKernel:
                         self.traits.upcast_stride_v,
                         v_scale,
                         valid_rows=tile_tokens,
+                        window_lo=window_lo,
                     )
                 elif const_expr(self.kv_is_fp8):
                     v_smem_base_addr = shared_ptr_to_u32(
@@ -6918,6 +6955,7 @@ class PagedForwardKernel:
                             num_mma_kv,
                             v_scale,
                             valid_rows=tile_tokens,
+                            window_lo=window_lo,
                         )
                     elif const_expr(self.use_kv_repack):
                         if const_expr(self.use_kv_repack_fp16):
@@ -6935,6 +6973,7 @@ class PagedForwardKernel:
                                 v_scale,
                                 False,
                                 valid_rows=tile_tokens,
+                                window_lo=window_lo,
                             )
                         else:
                             _literal_pv_mma_into_ofrag_bf16_packed(
@@ -6951,6 +6990,7 @@ class PagedForwardKernel:
                                 v_scale,
                                 True,
                                 valid_rows=tile_tokens,
+                                window_lo=window_lo,
                             )
                     elif const_expr(self.use_paged_v_tma):
                         v_stage_plane_offset = Int32(
@@ -6980,6 +7020,7 @@ class PagedForwardKernel:
                             tc_upcast_stride_plane,
                             v_scale,
                             valid_rows=tile_tokens,
+                            window_lo=window_lo,
                         )
                     else:
                         if const_expr(self.use_m16n16_b8_fp8_pv):
@@ -6998,6 +7039,7 @@ class PagedForwardKernel:
                                 self.traits.upcast_stride_v,
                                 v_scale,
                                 valid_rows=tile_tokens,
+                                window_lo=window_lo,
                             )
                         else:
                             _literal_pv_mma_into_ofrag_fp8_raw(
@@ -7015,6 +7057,7 @@ class PagedForwardKernel:
                                 self.traits.upcast_stride_v,
                                 v_scale,
                                 valid_rows=tile_tokens,
+                                window_lo=window_lo,
                             )
                 else:
                     v_smem_base_addr = shared_ptr_to_u32(
@@ -7058,6 +7101,7 @@ class PagedForwardKernel:
                             tc_upcast_stride_plane,
                             v_scale,
                             valid_rows=tile_tokens,
+                            window_lo=window_lo,
                         )
                     else:
                         _literal_pv_mma_into_ofrag_bf16_packed(
@@ -7076,6 +7120,7 @@ class PagedForwardKernel:
                             v_scale,
                             True,
                             valid_rows=tile_tokens,
+                            window_lo=window_lo,
                         )
 
                 if const_expr(

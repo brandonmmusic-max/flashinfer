@@ -2164,6 +2164,7 @@ def _literal_pv_mma_into_ofrag_plane_bf16_row0_1x1(
     v_scale,
     *,
     valid_rows,
+    window_lo,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     v_row = row_base + warp_kv_idx * 16 + lane % 16
@@ -2208,14 +2209,14 @@ def _literal_pv_mma_into_ofrag_plane_bf16_row0_1x1(
         )
 
         key = row_base + warp_kv_idx * 16 + (lane % 4) * 2
-        b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-        b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-        b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-        b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
-        b4 = _mask_pv_bf16_pair(b4, key, valid_rows)
-        b5 = _mask_pv_bf16_pair(b5, key + Int32(8), valid_rows)
-        b6 = _mask_pv_bf16_pair(b6, key, valid_rows)
-        b7 = _mask_pv_bf16_pair(b7, key + Int32(8), valid_rows)
+        b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+        b1 = _mask_pv_bf16_pair_windowed(b1, key + Int32(8), valid_rows, window_lo)
+        b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+        b3 = _mask_pv_bf16_pair_windowed(b3, key + Int32(8), valid_rows, window_lo)
+        b4 = _mask_pv_bf16_pair_windowed(b4, key, valid_rows, window_lo)
+        b5 = _mask_pv_bf16_pair_windowed(b5, key + Int32(8), valid_rows, window_lo)
+        b6 = _mask_pv_bf16_pair_windowed(b6, key, valid_rows, window_lo)
+        b7 = _mask_pv_bf16_pair_windowed(b7, key + Int32(8), valid_rows, window_lo)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             o_frag[0, mma_d0, 0],
             o_frag[0, mma_d0, 1],
@@ -2288,6 +2289,7 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
     debug_regs: cute.Tensor | None = None,
     *,
     valid_rows,
+    window_lo,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     upcast_stride_full = upcast_stride_plane * Int32(2)
@@ -2349,10 +2351,14 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
                     + mma_kv * 16
                     + (lane % 4) * 2
                 )
-                b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-                b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-                b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-                b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+                b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+                b1 = _mask_pv_bf16_pair_windowed(
+                    b1, key + Int32(8), valid_rows, window_lo
+                )
+                b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+                b3 = _mask_pv_bf16_pair_windowed(
+                    b3, key + Int32(8), valid_rows, window_lo
+                )
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
                     o_frag[mma_q, mma_d, 1],
@@ -2402,6 +2408,7 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
     debug_regs: cute.Tensor | None = None,
     *,
     valid_rows,
+    window_lo,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     upcast_stride_full = upcast_stride_plane * Int32(2)
@@ -2463,10 +2470,14 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
                     + mma_kv * 16
                     + (lane % 4) * 2
                 )
-                b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-                b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-                b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-                b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+                b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+                b1 = _mask_pv_bf16_pair_windowed(
+                    b1, key + Int32(8), valid_rows, window_lo
+                )
+                b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+                b3 = _mask_pv_bf16_pair_windowed(
+                    b3, key + Int32(8), valid_rows, window_lo
+                )
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
                     o_frag[mma_q, mma_d, 1],
@@ -2517,6 +2528,7 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
     wide_fp8_plane: cutlass.Constexpr = False,
     *,
     valid_rows,
+    window_lo,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     upcast_stride_full = upcast_stride_plane * Int32(2)
@@ -2571,10 +2583,10 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
                 else _advance_offset_by_column_128b_2(v_offset_cur, mma_d // 2)
             )
         key = row_base + warp_kv_idx * 16 + (lane % 4) * 2
-        b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-        b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-        b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-        b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+        b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+        b1 = _mask_pv_bf16_pair_windowed(b1, key + Int32(8), valid_rows, window_lo)
+        b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+        b3 = _mask_pv_bf16_pair_windowed(b3, key + Int32(8), valid_rows, window_lo)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             o_frag[0, mma_d, 0],
             o_frag[0, mma_d, 1],
@@ -2617,6 +2629,7 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1_m16n16_b8(
     v_scale,
     *,
     valid_rows,
+    window_lo,
 ):
     """Load exact FP8 decode PV fragments with SM120 byte ldmatrix."""
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
@@ -2649,10 +2662,10 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1_m16n16_b8(
         b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_0)
         b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_1)
         key = row_base + warp_kv_idx * 16 + (lane % 4) * 2
-        b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
-        b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
-        b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
-        b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+        b0 = _mask_pv_bf16_pair_windowed(b0, key, valid_rows, window_lo)
+        b1 = _mask_pv_bf16_pair_windowed(b1, key + Int32(8), valid_rows, window_lo)
+        b2 = _mask_pv_bf16_pair_windowed(b2, key, valid_rows, window_lo)
+        b3 = _mask_pv_bf16_pair_windowed(b3, key + Int32(8), valid_rows, window_lo)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             o_frag[0, mma_d, 0],
             o_frag[0, mma_d, 1],
@@ -2696,6 +2709,7 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
     v_scale,
     *,
     valid_rows,
+    window_lo,
 ):
     unit_scale = Uint32(0x7F7F7F7F)
     mask16 = Uint32(0xFFFF)
@@ -2794,10 +2808,16 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
                 + mma_pair * 32
                 + (lane % 4) * 2
             )
-            b0_k0 = _mask_pv_bf16_pair(b0_k0, key, valid_rows)
-            b1_k0 = _mask_pv_bf16_pair(b1_k0, key + Int32(8), valid_rows)
-            b0_k1 = _mask_pv_bf16_pair(b0_k1, key + Int32(16), valid_rows)
-            b1_k1 = _mask_pv_bf16_pair(b1_k1, key + Int32(24), valid_rows)
+            b0_k0 = _mask_pv_bf16_pair_windowed(b0_k0, key, valid_rows, window_lo)
+            b1_k0 = _mask_pv_bf16_pair_windowed(
+                b1_k0, key + Int32(8), valid_rows, window_lo
+            )
+            b0_k1 = _mask_pv_bf16_pair_windowed(
+                b0_k1, key + Int32(16), valid_rows, window_lo
+            )
+            b1_k1 = _mask_pv_bf16_pair_windowed(
+                b1_k1, key + Int32(24), valid_rows, window_lo
+            )
             b0_k0 = frag_layout_swizzle_16b_to_8b_trans(b0_k0)
             b1_k0 = frag_layout_swizzle_16b_to_8b_trans(b1_k0)
             b0_k1 = frag_layout_swizzle_16b_to_8b_trans(b0_k1)
@@ -5911,6 +5931,24 @@ class PagedForwardKernel:
                 tile_tokens = cutlass.select_(
                     live_tokens < tile_tokens, live_tokens, tile_tokens
                 )
+            # The planner floors the request's sliding-window start to a page
+            # boundary, so the first staged KV tile can begin below the oldest
+            # key any query row in the tile attends.  The PV B fragment is
+            # shared by every query row the warp feeds, so the bound is the
+            # window start of the first packed query row this warp owns,
+            # measured in tile-local keys.  Without a window, window_left is
+            # negative and the bound stays zero.
+            window_lo = Int32(0)
+            if const_expr(self.window_left >= 0):
+                warp_first_q_token = (packed_tile_start + warp_row_base) // group_size
+                window_lo = (
+                    cache_len
+                    - qo_len
+                    + warp_first_q_token
+                    - Int32(self.window_left)
+                    - tile_base
+                )
+                window_lo = cutlass.select_(window_lo > Int32(0), window_lo, Int32(0))
             pipeline_k.consumer_wait(
                 k_consumer_state,
                 pipeline_k.consumer_try_wait(k_consumer_state),
@@ -6766,6 +6804,7 @@ class PagedForwardKernel:
                                 v_scale,
                                 mDebugU32,
                                 valid_rows=tile_tokens,
+                                window_lo=window_lo,
                             )
                         else:
                             v_stage_plane_offset = (
@@ -6810,7 +6849,7 @@ class PagedForwardKernel:
                                 v_scale,
                                 mDebugU32,
                                 valid_rows=tile_tokens,
-                                window_lo=Int32(0),
+                                window_lo=window_lo,
                             )
                     _exit_thread()
 
@@ -6849,6 +6888,7 @@ class PagedForwardKernel:
                         self.traits.upcast_stride_v,
                         v_scale,
                         valid_rows=tile_tokens,
+                        window_lo=window_lo,
                     )
                 elif const_expr(self.kv_is_fp8):
                     v_stage_plane_offset = (
@@ -6898,6 +6938,7 @@ class PagedForwardKernel:
                                         tc_upcast_stride_plane,
                                         v_scale,
                                         valid_rows=tile_tokens,
+                                        window_lo=window_lo,
                                     )
                                 else:
                                     _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
@@ -6926,6 +6967,7 @@ class PagedForwardKernel:
                                         consume_stage_idx,
                                         self.laguna_fp8_head_pair_wide_math,
                                         valid_rows=tile_tokens,
+                                        window_lo=window_lo,
                                     )
                             else:
                                 _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
@@ -6952,6 +6994,7 @@ class PagedForwardKernel:
                                     tc_upcast_stride_plane,
                                     v_scale,
                                     valid_rows=tile_tokens,
+                                    window_lo=window_lo,
                                 )
                         else:
                             _literal_pv_mma_into_ofrag_plane_fp8_raw(
@@ -6978,6 +7021,7 @@ class PagedForwardKernel:
                                 tc_upcast_stride_plane,
                                 v_scale,
                                 valid_rows=tile_tokens,
+                                window_lo=window_lo,
                             )
                     else:
                         _literal_pv_mma_into_ofrag_plane_fp8_raw(
@@ -7004,6 +7048,7 @@ class PagedForwardKernel:
                             tc_upcast_stride_plane,
                             v_scale,
                             valid_rows=tile_tokens,
+                            window_lo=window_lo,
                         )
                 else:
                     v_stage_plane_offset = (
@@ -7048,6 +7093,7 @@ class PagedForwardKernel:
                             tc_upcast_stride_plane,
                             v_scale,
                             valid_rows=tile_tokens,
+                            window_lo=window_lo,
                         )
                     else:
                         _literal_pv_mma_into_ofrag_plane_bf16_packed(
@@ -7084,7 +7130,7 @@ class PagedForwardKernel:
                             tc_upcast_stride_plane,
                             v_scale,
                             valid_rows=tile_tokens,
-                            window_lo=Int32(0),
+                            window_lo=window_lo,
                         )
 
                 pipeline_v.consumer_release(v_consumer_state)
@@ -8808,6 +8854,7 @@ class PagedFp8DecodeRawForwardKernel:
                         v_scale,
                         mDebugU32,
                         valid_rows=tile_tokens,
+                        window_lo=Int32(0),
                     )
                 _exit_thread()
             _literal_pv_mma_into_ofrag_plane_fp8_raw(
@@ -8828,6 +8875,7 @@ class PagedFp8DecodeRawForwardKernel:
                 tc_upcast_stride_plane,
                 v_scale,
                 valid_rows=tile_tokens,
+                window_lo=Int32(0),
             )
             consumer_state.advance()
             tile_base += self.stage_tile_rows
@@ -11100,6 +11148,7 @@ class PagedFp8ExtendRawForwardKernel:
                             tc_upcast_stride_plane,
                             v_scale,
                             valid_rows=tile_tokens,
+                            window_lo=Int32(0),
                         )
                         _literal_pv_mma_into_ofrag_plane_fp8_raw(
                             o_frag,
@@ -11123,6 +11172,7 @@ class PagedFp8ExtendRawForwardKernel:
                             tc_upcast_stride_plane,
                             v_scale,
                             valid_rows=tile_tokens,
+                            window_lo=Int32(0),
                         )
                     elif subtile_iter == 0:
                         _literal_update_mdo_states_fp32_pack_p(
@@ -11159,6 +11209,7 @@ class PagedFp8ExtendRawForwardKernel:
                             tc_upcast_stride_plane,
                             v_scale,
                             valid_rows=tile_tokens,
+                            window_lo=Int32(0),
                         )
 
             consumer_state.advance()
