@@ -14,7 +14,7 @@ from b12x.preparation import (
 from b12x.preparation._efficiency import capture_autotune_effort
 
 from ._tuning import PcieQuery, TUNING as NATIVE
-from ._joint_profile import JOINT_FAMILIES
+from ._joint_profile import JOINT_FAMILIES, profile_records
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -42,6 +42,23 @@ def _configs(query):
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
         if name in JOINT_FAMILIES:
+            cluster_size = call.get("joint_cluster_size", 1)
+            if cluster_size != 1:
+                from ._joint_profile import JOINT_MODES, validate_cluster_geometry
+
+                validate_cluster_geometry(blocks, threads, cluster_size)
+                modes = {value: mode for mode, value in JOINT_MODES.items()}
+                for mode, active in profile_records(
+                    name, blocks, cluster_size=cluster_size
+                ):
+                    yield CollectiveConfig(
+                        implementation=name,
+                        threads=threads,
+                        blocks=blocks,
+                        submode=modes[mode],
+                        active_blocks=active,
+                    )
+                continue
             for count_threads in (32, 64, 128, 256, 512):
                 for mode in JOINT_FAMILIES[name]:
                     units = int(call["size_packs"])
@@ -319,6 +336,8 @@ def _family_bucket(query):
                 if field in setup
             },
         )
+        if "joint_cluster_size" in call:
+            alternatives[name]["joint_cluster_size"] = call["joint_cluster_size"]
     if len(sizes) != 1:
         raise ValueError("collective alternatives disagree on payload size")
     size = sizes.pop()

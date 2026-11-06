@@ -1657,6 +1657,39 @@ class UnifiedDecodeKernel:
                                 st_shared_u32(
                                     kv_rope_b + entry * rope_stride + offset, Uint32(0)
                                 )
+                elif cutlass.const_expr(
+                    t.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT)
+                ):
+                    # Zero payload and scales: zero probabilities do not mask NaNs.
+                    for part in cutlass.range_constexpr(
+                        (t.bi * 4 + self.math_threads - 1) // self.math_threads
+                    ):
+                        entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
+                        if entry < Int32(t.bi) and tok_buf_view[entry] < Int32(0):
+                            for chunk in cutlass.range_constexpr(
+                                staged_kv_stride // 16
+                            ):
+                                offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                st_shared_u32(
+                                    kv_fp8_b + entry * Int32(staged_kv_stride) + offset,
+                                    Uint32(0),
+                                )
+                            if cutlass.const_expr(
+                                t.scale_format == ScaleFormat.NVFP4_E4M3
+                                and t.d_rope > 0
+                            ):
+                                for chunk in cutlass.range_constexpr(
+                                    t.d_rope * 2 // 16
+                                ):
+                                    offset = (tid % Int32(4)) * Int32(4) + Int32(
+                                        chunk * 16
+                                    )
+                                    st_shared_u32(
+                                        kv_rope_b
+                                        + entry * Int32(t.d_rope * 2)
+                                        + offset,
+                                        Uint32(0),
+                                    )
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
 
                 # P10f: GLM keeps RAW e4m3 K/V (no S0b dequant+requant -- that

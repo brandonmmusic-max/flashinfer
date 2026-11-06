@@ -121,7 +121,7 @@ def test_layout_places_variable_length_area_after_two_shot():
         lib = load()
     except RuntimeError as exc:  # no C compiler or libibverbs headers
         pytest.skip(str(exc))
-    assert lib.roce_abi_version() == ABI_VERSION == 10
+    assert lib.roce_abi_version() == ABI_VERSION == 11
     piped = Layout(4, 2 << 20, 64 << 20)
     assert piped.varlen_bytes == 0
     assert piped.varlen_recv_off == piped.varlen_flag_off == piped.total_bytes

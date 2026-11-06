@@ -72,9 +72,38 @@ def _validate_query(query: PcieQuery, device) -> None:
         raise ValueError(f"{query.surface} supports world sizes {worlds}")
     if not 0 <= query.rank < query.world_size:
         raise ValueError("rank must belong to the caller's process group")
+    if "joint_cluster_size" in query.call:
+        from ._joint_profile import profile_index, validate_cluster_geometry
+
+        call = query.call
+        if (
+            not query.surface.endswith(".all_reduce")
+            or call.get("transport") not in ("joint_latency", "joint_bandwidth")
+            or call.get("dtype") != "bfloat16"
+            or not call.get("stage_input")
+        ):
+            raise ValueError(
+                "joint cluster geometry requires a staged joint BF16 all-reduce"
+            )
+        validate_cluster_geometry(
+            call["blocks"], call["threads"], call["joint_cluster_size"], device
+        )
+        if call["blocks"] > query.setup.get("joint_max_blocks", 0):
+            raise ValueError("joint cluster grid exceeds the prepared channel capacity")
+        profile_index(
+            call["transport"],
+            call["blocks"],
+            call["submode"],
+            call["active_blocks"],
+            cluster_size=call["joint_cluster_size"],
+        )
     if query.surface.endswith(".all_gather_heads"):
         transport = query.call.get("gather_transport", "barrier")
-        if transport not in ("barrier", "word_exchange"):
+        from ._gather_preparation import GATHER_MODES, validate_query as validate_gather
+
+        if transport in GATHER_MODES:
+            validate_gather(query)
+        elif transport not in ("barrier", "word_exchange"):
             raise ValueError("unknown DCP gather transport")
         if transport == "word_exchange":
             from math import prod
@@ -110,6 +139,6 @@ def _validate_query(query: PcieQuery, device) -> None:
         )
 
 
-TUNING = replace(TUNING, query_schema_version=40, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=42, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]

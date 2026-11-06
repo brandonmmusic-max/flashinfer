@@ -60,6 +60,15 @@ def plan(
     if not isinstance(query, PcieQuery):
         raise TypeError("query must be PcieQuery")
     TUNING.validate_query(query, None)
+    from ._gather_preparation import GATHER_MODES
+
+    if (
+        query.surface.endswith(".all_gather_heads")
+        and query.call.get("gather_transport") in GATHER_MODES
+    ):
+        return _provider(query.surface).plan(
+            query, runtime=runtime, invocation=invocation, override=override
+        )
     if (
         runtime is not None
         and query.world_size <= 8

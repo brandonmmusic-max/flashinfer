@@ -145,7 +145,7 @@ class DenseMlaMergeKernel:
             if lane == Int32(0):
                 inverse = Float32(0.0)
                 lse = Float32(-Float32.inf)
-                if merged_sum > Float32(0.0):
+                if merged_sum != Float32(0.0):
                     inverse = Float32(1.0) / merged_sum
                     lse = (merged_max + log2_approx(merged_sum)) * Float32(
                         0.6931471805599453
@@ -166,7 +166,7 @@ class DenseMlaMergeKernel:
                 # Capture-static tail splits deliberately leave their partial
                 # vectors undefined and publish -inf LSE.  Do not load those
                 # vectors: NaN * 0 would otherwise poison the merged output.
-                if weight > Float32(0.0):
+                if weight != Float32(0.0):
                     partial_offset = (
                         (Int64(query) * Int64(partial_output.shape[1]) + Int64(head))
                         * Int64(self.num_splits)

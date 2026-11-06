@@ -55,9 +55,9 @@ def cache_identity(
         return {
             "schema_version": 23,
             "tuning_cache_version": version,
-            "measurement": "stream_gated_events_v1"
+            "measurement": "stream_gated_events_v2"
             if cache_policy == "cold"
-            else "stream_gated_events_v1_warm",
+            else "stream_gated_events_v2_warm",
             "namespace": dict(namespace),
             "compute_capability": [int(properties.major), int(properties.minor)],
             "sm_count": int(properties.multi_processor_count),

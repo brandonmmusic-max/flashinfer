@@ -40,6 +40,13 @@ per call. Without one, automatic NVFP4 preparation uses A16 arithmetic.
 Global scales must be finite and strictly positive; reconstructed weights must
 fit BF16. Quantized activation execution requires K divisible by 128 and N by 8.
 
+For a prepared NVFP4 projection, ``source_activation="swiglu_bf16"`` declares
+contiguous BF16 rows containing gate first, then up, each with logical width K.
+SiLU rounds to BF16 before multiplying by up; the product also rounds to BF16.
+Preparation races A16 with a materialized activation against quantized execution,
+including both separate activation packing and fused SwiGLU packing. Activation
+storage is part of prepared scratch; ordinary source rows retain identity semantics.
+
 MXFP4 packed weights use ``pack_weight(..., recipe="mxfp4")`` with swizzled
 K/32 E8M0 scales. BF16 source rows are quantized to MXFP4 through caller-owned
 workspace; A16 arithmetic is unsupported. Stored K must be divisible by 256,

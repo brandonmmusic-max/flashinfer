@@ -76,7 +76,7 @@ def test_external_schedule_requires_vector_live_metadata(monkeypatch):
 
     schedule = PrefillSchedule(
         counts=(8, 8, 8, 8, 5, 3, 1, 2, 1),
-        geometry=(2, 1, 1, 1, 16, 16, 128, True, -1, True, 128),
+        geometry=(2, 1, 1, 1, 16, 16, 128, True, -1, True, 128, False),
         device=torch.device("cpu"),
     )
     backing = torch.empty(9 * 256 + 255, dtype=torch.uint8)

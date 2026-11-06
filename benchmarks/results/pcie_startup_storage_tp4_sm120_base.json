@@ -1,0 +1,170 @@
+{
+  "arm": "base",
+  "revision": "dc374043340660a8917238e41d4fbed2e2a0a0ee",
+  "source": "/data/flare-kv-startup-review-20261104/fi-memory-base",
+  "torch": "2.14.1+cu132",
+  "cuda": "13.2",
+  "sizes_bytes": [
+    4112,
+    163840,
+    327680,
+    1310720
+  ],
+  "profiles": [
+    [
+      "payload_rsag",
+      42
+    ],
+    [
+      "bulk_push",
+      8
+    ],
+    [
+      "pull",
+      7
+    ]
+  ],
+  "threads": 512,
+  "physical_blocks": 64,
+  "world_size": 4,
+  "resident_weight_bytes_per_rank": 536870912,
+  "measurement": "live graphs after validated replay, synchronization, GC, and empty_cache; resident weights precede baseline",
+  "ranks": [
+    {
+      "rank": 0,
+      "before": {
+        "torch_live_bytes": 557593600,
+        "torch_reserved_bytes": 559939584,
+        "cuda_free_bytes": 100657922048,
+        "cuda_total_bytes": 102071664640
+      },
+      "after": {
+        "torch_live_bytes": 841660416,
+        "torch_reserved_bytes": 884998144,
+        "cuda_free_bytes": 100186062848,
+        "cuda_total_bytes": 102071664640
+      },
+      "torch_live_delta_bytes": 284066816,
+      "cuda_free_decrease_bytes": 471859200,
+      "producer_deduplicated_resident_bytes": 283808444,
+      "producer_persistent_allocations": 62,
+      "graph_replay_status": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "winners": [
+        65578,
+        65578,
+        65578,
+        131080
+      ],
+      "eviction_aliases_weights": false,
+      "eviction_allocations": 1,
+      "fixture_arenas": 4
+    },
+    {
+      "rank": 1,
+      "before": {
+        "torch_live_bytes": 557593600,
+        "torch_reserved_bytes": 559939584,
+        "cuda_free_bytes": 100657922048,
+        "cuda_total_bytes": 102071664640
+      },
+      "after": {
+        "torch_live_bytes": 841660416,
+        "torch_reserved_bytes": 884998144,
+        "cuda_free_bytes": 100186062848,
+        "cuda_total_bytes": 102071664640
+      },
+      "torch_live_delta_bytes": 284066816,
+      "cuda_free_decrease_bytes": 471859200,
+      "producer_deduplicated_resident_bytes": 283808444,
+      "producer_persistent_allocations": 62,
+      "graph_replay_status": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "winners": [
+        65578,
+        65578,
+        65578,
+        131080
+      ],
+      "eviction_aliases_weights": false,
+      "eviction_allocations": 1,
+      "fixture_arenas": 4
+    },
+    {
+      "rank": 2,
+      "before": {
+        "torch_live_bytes": 557593600,
+        "torch_reserved_bytes": 559939584,
+        "cuda_free_bytes": 100657922048,
+        "cuda_total_bytes": 102071664640
+      },
+      "after": {
+        "torch_live_bytes": 841660416,
+        "torch_reserved_bytes": 884998144,
+        "cuda_free_bytes": 100186062848,
+        "cuda_total_bytes": 102071664640
+      },
+      "torch_live_delta_bytes": 284066816,
+      "cuda_free_decrease_bytes": 471859200,
+      "producer_deduplicated_resident_bytes": 283808444,
+      "producer_persistent_allocations": 62,
+      "graph_replay_status": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "winners": [
+        65578,
+        65578,
+        65578,
+        131080
+      ],
+      "eviction_aliases_weights": false,
+      "eviction_allocations": 1,
+      "fixture_arenas": 4
+    },
+    {
+      "rank": 3,
+      "before": {
+        "torch_live_bytes": 557593600,
+        "torch_reserved_bytes": 559939584,
+        "cuda_free_bytes": 100657922048,
+        "cuda_total_bytes": 102071664640
+      },
+      "after": {
+        "torch_live_bytes": 841660416,
+        "torch_reserved_bytes": 884998144,
+        "cuda_free_bytes": 100186062848,
+        "cuda_total_bytes": 102071664640
+      },
+      "torch_live_delta_bytes": 284066816,
+      "cuda_free_decrease_bytes": 471859200,
+      "producer_deduplicated_resident_bytes": 283808444,
+      "producer_persistent_allocations": 62,
+      "graph_replay_status": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "winners": [
+        65578,
+        65578,
+        65578,
+        131080
+      ],
+      "eviction_aliases_weights": false,
+      "eviction_allocations": 1,
+      "fixture_arenas": 4
+    }
+  ]
+}

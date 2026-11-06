@@ -1,4 +1,4 @@
-"""Measure joint BF16 collective profiles across transfer sizes under torchrun."""
+"""Measure collective profiles across transfer sizes under torchrun."""
 
 from __future__ import annotations
 
@@ -38,6 +38,28 @@ def parser():
         description=__doc__,
         epilog="Render an existing report without GPUs: "
         "python -m b12x.tools.collective_ladder plot REPORT.jsonl",
+    )
+    result.add_argument(
+        "--operation", choices=("all_reduce", "all_gather"), default="all_reduce"
+    )
+    result.add_argument(
+        "--row-bytes", type=byte_size, help="local column-gather row width in bytes"
+    )
+    result.add_argument(
+        "--gather-kernel",
+        choices=("static", "runtime", "compare"),
+        default="runtime",
+        help="all-gather kernel candidates (default: runtime)",
+    )
+    result.add_argument(
+        "--gather-proposal",
+        type=Path,
+        help="measure supplied gather geometries, profiles, and optional reference configurations",
+    )
+    result.add_argument(
+        "--gather-capacity-bytes",
+        type=byte_size,
+        help="preserve channel capacity when measuring a subset of gather sizes",
     )
     result.add_argument(
         "--output", type=Path, help="incremental JSONL measurement report"
@@ -140,6 +162,19 @@ def arguments(argv=None):
                 "--sizes cannot be combined with custom range bounds or spacing"
             )
         args.sizes = tuple(sorted(set(args.sizes)))
+    if args.operation == "all_gather":
+        if args.alias or args.row_bytes is None:
+            command.error("all-gather requires --row-bytes and disjoint buffers")
+        if args.sizes is not None and any(size % args.row_bytes for size in args.sizes):
+            command.error("explicit gather sizes must contain complete rows")
+        if args.sizes is None and args.maximum_bytes < args.row_bytes:
+            command.error("maximum gather size must contain at least one row")
+    elif args.row_bytes is not None:
+        command.error("--row-bytes requires --operation all_gather")
+    if args.gather_proposal is not None and args.operation != "all_gather":
+        command.error("--gather-proposal requires --operation all_gather")
+    if args.gather_capacity_bytes is not None and args.operation != "all_gather":
+        command.error("--gather-capacity-bytes requires --operation all_gather")
     args.inplace = args.alias
     return args
 
@@ -257,7 +292,22 @@ def run(args):
             args.minimum_bytes, args.maximum_bytes, args.points_per_doubling
         )
     )
-    args.max_bytes = max(args.sizes)
+    if args.operation == "all_gather":
+        args.sizes = tuple(
+            sorted(
+                {
+                    max(args.row_bytes, round(size / args.row_bytes) * args.row_bytes)
+                    for size in args.sizes
+                }
+            )
+        )
+    args.max_bytes = args.gather_capacity_bytes or max(args.sizes)
+    if args.max_bytes < max(args.sizes) or (
+        args.operation == "all_gather" and args.max_bytes % args.row_bytes
+    ):
+        raise ValueError(
+            "gather capacity must cover every measured size in complete rows"
+        )
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     dist.init_process_group("gloo", timeout=timedelta(hours=12))
     rank = dist.get_rank()
@@ -272,7 +322,12 @@ def run(args):
     replay_expected = {}
     replay_sources = {}
     try:
-        collector = JointCollector(args)
+        if args.operation == "all_gather":
+            from b12x.tools._collective_ladder_gather import GatherCollector
+
+            collector = GatherCollector(args)
+        else:
+            collector = JointCollector(args)
         catalogs = {size: collector.catalog(size) for size in args.sizes}
         import flashinfer
 
@@ -303,6 +358,12 @@ def run(args):
                 for size, configs in catalogs.items()
             ],
         )
+        if args.operation == "all_gather":
+            metadata.update(operation="all_gather", row_bytes=args.row_bytes)
+            if args.gather_capacity_bytes is not None:
+                metadata["capacity_bytes"] = args.gather_capacity_bytes
+            if args.gather_kernel != "static":
+                metadata["gather_kernel"] = args.gather_kernel
         metadata = json.loads(json.dumps(metadata))
         init_error = None
         if rank == 0:
@@ -410,7 +471,7 @@ def run(args):
                     now = time.monotonic()
                     if now >= next_progress:
                         print(
-                            f"joint ladder: {len(measured_sizes)}/{len(args.sizes)} sizes; "
+                            f"{args.operation} ladder: {len(measured_sizes)}/{len(args.sizes)} sizes; "
                             f"{len(measured_configs)} configurations; {trial.phase}; "
                             f"charged {now - started - excluded:.1f}/"
                             f"{args.budget_seconds:.1f} s; compilation {excluded:.1f} s",
@@ -511,6 +572,25 @@ def run(args):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "recommend-gather":
+        command = argparse.ArgumentParser(
+            prog="python -m b12x.tools.collective_ladder recommend-gather"
+        )
+        command.add_argument("--switched", type=Path, nargs="+", required=True)
+        command.add_argument("--host", type=Path, nargs="+", required=True)
+        command.add_argument("--output", type=Path, required=True)
+        command.add_argument("--switched-margin", type=float, default=0.02)
+        args = command.parse_args(argv[1:])
+        from b12x.tools._collective_ladder_merge import gather_recommendations
+
+        result = gather_recommendations(
+            args.switched, args.host, switched_margin=args.switched_margin
+        )
+        with args.output.open("x") as output:
+            json.dump(result, output, indent=2, allow_nan=False)
+            output.write("\n")
+        print(args.output)
+        return
     if argv and argv[0] == "plot":
         command = argparse.ArgumentParser(
             prog="python -m b12x.tools.collective_ladder plot",

@@ -74,6 +74,7 @@ def _make_nvfp4_weights(
     hidden_size: int = _K,
     intermediate_size: int = _N,
     logical_intermediate_size: int | None = None,
+    varied_scales: bool = False,
 ) -> _Weights:
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
@@ -109,6 +110,27 @@ def _make_nvfp4_weights(
         dtype=torch.float32,
         device=device,
     ).to(torch.float8_e4m3fn)
+    if varied_scales:
+        # Exact E4M3 multiples of 2^-5 that differ across expert, row, and K
+        # block, so a permuted scale layout changes the output.
+        levels = (
+            torch.tensor(
+                (1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0),
+                dtype=torch.float32,
+                device=device,
+            )
+            * 2.0**-5
+        )
+
+        def varied(experts: int, rows: int, blocks: int) -> torch.Tensor:
+            expert = torch.arange(experts, device=device).view(-1, 1, 1)
+            row = torch.arange(rows, device=device).view(1, -1, 1)
+            block = torch.arange(blocks, device=device).view(1, 1, -1)
+            index = (expert + 3 * row + 5 * block) % levels.numel()
+            return levels[index].to(torch.float8_e4m3fn)
+
+        w1_logical_scale = varied(*w1_logical_scale.shape)
+        w2_logical_scale = varied(*w2_logical_scale.shape)
     if logical_intermediate_size is not None:
         logical_n = int(logical_intermediate_size)
         if not (0 < logical_n <= intermediate_size and logical_n % 16 == 0):
@@ -889,6 +911,70 @@ def test_standard_moe_nvfp4_n16_tail_dynamic_live_graph_oracle(
         initial_reference=initial_reference,
         changed_reference=changed_reference,
         context=f"standard-moe-dynamic-n{intermediate_size}-m{tile_m}",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+
+
+@pytest.mark.parametrize("varied_scales", [False, True])
+@pytest.mark.parametrize("intermediate_size", [128, 160])
+def test_standard_moe_nvfp4_m16_four_warp_dynamic_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    intermediate_size: int,
+    varied_scales: bool,
+) -> None:
+    """Compile and replay the four-N-warp NVFP4 M16 dynamic tuning candidate.
+
+    N=160 prepares separate W13 halves rather than swapped FC1; the swapped FC1
+    fragment with this atom is covered by the CSF inline-scale four-warp cases
+    in test_nvfp4_csf.py.
+    """
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(
+        device,
+        seed=207,
+        intermediate_size=intermediate_size,
+        varied_scales=varied_scales,
+    )
+    initial = _make_inputs(device, m=16, seed=208, route_shift=0)
+    changed = _make_inputs(device, m=16, seed=209, route_shift=2)
+    initial_reference = _nvfp4_oracle(
+        weights, initial, intermediate_size=intermediate_size
+    )
+    changed_reference = _nvfp4_oracle(
+        weights, changed, intermediate_size=intermediate_size
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        decode_config=MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="triton",
+            max_active_clusters=None,
+            dynamic_tile_m=16,
+            dynamic_mma_warps=4,
+            dynamic_route_mode="grouped",
+        ),
+    )
+    launch_plan = case.scratch_plan.launch_plan
+    assert launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    assert launch_plan.execution.tile_m == 16
+    assert launch_plan.decode_config.dynamic_mma_warps == 4
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context=(
+            f"standard-moe-dynamic-nvfp4-m16-four-warp-n{intermediate_size}"
+            f"{'-varied-scales' if varied_scales else ''}"
+        ),
         min_cos=0.999,
         max_normalized_rmse=0.03,
     )

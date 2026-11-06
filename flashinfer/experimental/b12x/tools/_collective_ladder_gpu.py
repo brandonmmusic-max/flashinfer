@@ -27,10 +27,7 @@ class JointCollector:
         import torch
         import torch.distributed as dist
         from b12x.comm.pcie import AllReduce
-        from b12x.comm.pcie._joint_startup_cute import SIGNAL_BYTES, SCRATCH_BYTES
-        from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
         from b12x.preparation import PreparationSession, PreparedCall
-        from b12x.sequence._shared.disk_table import _tensor_from_pointer
 
         if not dist.is_initialized() or dist.get_backend() != "gloo":
             raise ValueError(
@@ -138,13 +135,21 @@ class JointCollector:
         self._plans = plans
         self._catalogs[self.max_bytes] = configs
 
+        self._initialize_timing(next(iter(self._states.values())).runtime)
+
+    def _initialize_timing(self, runtime):
+        import torch
+        from b12x.comm.pcie._joint_startup_cute import SIGNAL_BYTES, SCRATCH_BYTES
+        from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
+        from b12x.sequence._shared.disk_table import _tensor_from_pointer
+
+        actions = ("reset", "validate", "begin", "end")
         from b12x.comm.pcie._joint_startup_cute import timing_launcher
 
         self._timers = {
             action: timing_launcher(self.world, self.rank, action, 1, self.device.index)
             for action in actions
         }
-        runtime = next(iter(self._states.values())).runtime
         self._shared = PCIeOneshotAllReduce._allocate_shared_buffer(
             runtime.exchange_group, SCRATCH_BYTES, zero_fill=True, ipc=runtime._ipc
         )
@@ -166,7 +171,7 @@ class JointCollector:
         )
         self._status = torch.full((1,), -1, dtype=torch.int32, device=self.device)
         self._invalid = torch.zeros((), dtype=torch.int32, device=self.device)
-        self._mismatch = torch.empty_like(self.inputs.source, dtype=torch.bool)
+        self._mismatch = torch.empty_like(self.inputs.out, dtype=torch.bool)
         self._profiles = torch.zeros(1, dtype=torch.uint32, device=self.device)
         self._eviction = self._eviction_sum = None
         if self.cache_policy == "cold":
@@ -344,10 +349,29 @@ class JointCollector:
             workspace.capacity_packs,
         )
 
+    def _select(self, config):
+        from b12x.comm.pcie._joint_profile import selected_profile
+
+        state = self._states[self._geometry(config)]
+        state.selector.fill_(
+            selected_profile(
+                config["implementation"],
+                config["blocks"],
+                config["submode"],
+                config["active_blocks"],
+            )
+        )
+        return state
+
+    def _output_count(self, count):
+        return count
+
+    def _capture(self):
+        return self.manager.capture()
+
     def measure(self, size, configs, rounds=3):
         """Return six per-invocation rank maxima per round from three fixtures."""
         import torch
-        from b12x.comm.pcie._joint_profile import selected_profile
         from b12x.comm.pcie.pcie_oneshot import _require_collective_contract
 
         if type(rounds) is not int or not 1 <= rounds <= self._MAX_ROUNDS:
@@ -371,23 +395,12 @@ class JointCollector:
         )
         output = []
         count = size // 2
-        source, target = self.inputs.source[:count], self.inputs.out[:count]
+        output_count = self._output_count(count)
+        source, target = self.inputs.source[:count], self.inputs.out[:output_count]
         self._stream.wait_stream(torch.cuda.current_stream(self.device))
         for begin in range(0, len(configs), self._BATCH):
             batch = configs[begin : begin + self._BATCH]
             values_by_config = [[] for _ in batch]
-
-            def select(config):
-                state = self._states[self._geometry(config)]
-                state.selector.fill_(
-                    selected_profile(
-                        config["implementation"],
-                        config["blocks"],
-                        config["submode"],
-                        config["active_blocks"],
-                    )
-                )
-                return state
 
             def produce(case, state=None):
                 source.copy_(self.inputs.reference.seeds[case][:count])
@@ -399,17 +412,17 @@ class JointCollector:
             def enqueue(chunk_rounds):
                 self._timing("reset", 0, self._profiles)
                 for config in batch:
-                    state = select(config)
+                    state = self._select(config)
                     for case in range(3):
                         produce(case)
                         self._invoke(state, size)
                         torch.ne(
                             target,
-                            self.inputs.reference.expected[case][:count],
-                            out=self._mismatch[:count],
+                            self.inputs.reference.expected[case][:output_count],
+                            out=self._mismatch[:output_count],
                         )
                         torch.sum(
-                            self._mismatch[:count],
+                            self._mismatch[:output_count],
                             dim=0,
                             dtype=torch.int32,
                             out=self._invalid,
@@ -424,7 +437,7 @@ class JointCollector:
                     order = order[offset:] + order[:offset]
                     for case in range(3):
                         for index in order:
-                            state = select(batch[index])
+                            state = self._select(batch[index])
                             produce(case, state)
                             # Consecutive reductions exercise both shared-buffer slots.
                             for invocation in range(2):
@@ -443,11 +456,11 @@ class JointCollector:
                 produce(0)
                 torch.ne(
                     target,
-                    self.inputs.reference.expected[0][:count],
-                    out=self._mismatch[:count],
+                    self.inputs.reference.expected[0][:output_count],
+                    out=self._mismatch[:output_count],
                 )
                 torch.sum(
-                    self._mismatch[:count],
+                    self._mismatch[:output_count],
                     dim=0,
                     dtype=torch.int32,
                     out=self._invalid,
@@ -465,7 +478,7 @@ class JointCollector:
                 try:
                     with (
                         self.session.capture(),
-                        self.manager.capture(),
+                        self._capture(),
                         torch.cuda.graph(graph, stream=self._stream),
                     ):
                         enqueue(chunk_rounds)

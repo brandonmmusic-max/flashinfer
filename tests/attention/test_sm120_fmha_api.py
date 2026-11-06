@@ -127,3 +127,55 @@ def test_skip_softmax_threshold_load_follows_pdl_dependency_wait():
     wait = kernel_source.index("cute.arch.griddepcontrol_wait()")
     threshold_load = kernel_source.index("skip_softmax_threshold[batch_idx]")
     assert wait < threshold_load
+
+
+@pytest.mark.parametrize("capability", [(12, 0), (12, 1)])
+def test_paged_layout_and_output_gate_have_distinct_specializations(
+    monkeypatch, capability
+):
+    pytest.importorskip("cutlass.experimental")
+    from flashinfer.cute_dsl.attention.fmha.sm120.compile import (
+        compile_sm120_fmha_fp8_paged_kernel,
+    )
+    from flashinfer.jit import cute_dsl_core
+
+    observed = []
+
+    def build(module_name, kernel_name, compile_fn, **kwargs):
+        observed.append(kernel_name)
+        return kernel_name
+
+    compile_sm120_fmha_fp8_paged_kernel.cache_clear()
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: capability
+    )
+    monkeypatch.setattr(cute_dsl_core, "build_and_load_cute_dsl_kernel", build)
+    common = dict(
+        in_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16,
+        num_qo_heads=24,
+        num_kv_heads=4,
+        head_dim=256,
+        is_causal=True,
+        kv_tile=128,
+        q_tile=128,
+        num_tokens_per_page=128,
+        device=torch.device("cuda"),
+    )
+    try:
+        for layout in ("HND", "NHD"):
+            for gated in (False, True):
+                result = compile_sm120_fmha_fp8_paged_kernel(
+                    **common, kv_layout=layout, with_output_gate=gated
+                )
+                assert result.startswith(f"paged_{layout.lower()}_")
+                assert result.endswith(f"_gate{int(gated)}")
+                assert (
+                    compile_sm120_fmha_fp8_paged_kernel(
+                        **common, kv_layout=layout, with_output_gate=gated
+                    )
+                    == result
+                )
+        assert len(observed) == len(set(observed)) == 4
+    finally:
+        compile_sm120_fmha_fp8_paged_kernel.cache_clear()

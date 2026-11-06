@@ -487,6 +487,7 @@ class PCIeAllReduce:
         invocation: FrozenMapping = FrozenMapping(),
         override: PcieConfig | CollectiveConfig | None = None,
         joint_only: bool = False,
+        joint_cluster_size: int = 1,
         **call,
     ) -> Plan:
         """Select an existing native channel once, then declare its plan.
@@ -494,8 +495,17 @@ class PCIeAllReduce:
         Semantic channels must already exist. This does not construct transports,
         register inputs, allocate workspace, or compile any program. Joint kernels
         require explicit ``joint_only=True``; ordinary plans use static transports.
+        ``joint_cluster_size=8`` admits phased profiles in a 64-CTA, 512-thread
+        cluster launch. The default retains the ordinary query and launch policy.
         """
         from ._preparation import plan, query_from_runtime
+
+        if type(joint_cluster_size) is not int or joint_cluster_size not in (1, 8):
+            raise ValueError("joint cluster size must be 1 or 8")
+        if joint_cluster_size != 1 and (not joint_only or operation != "all_reduce"):
+            raise ValueError(
+                "clustered joint planning requires joint_only=True and plain all_reduce"
+            )
 
         if operation not in (
             "all_reduce",
@@ -556,6 +566,26 @@ class PCIeAllReduce:
                         )
                     if default not in alternatives:
                         default = next(iter(alternatives))
+                    if joint_cluster_size != 1:
+                        from dataclasses import replace
+
+                        alternatives = {
+                            name: (
+                                replace(
+                                    native,
+                                    call=FrozenMapping(
+                                        {
+                                            **native.call,
+                                            "joint_cluster_size": joint_cluster_size,
+                                            "threads": 512,
+                                            "blocks": 64,
+                                        }
+                                    ),
+                                ),
+                                runtime,
+                            )
+                            for name, (native, runtime) in alternatives.items()
+                        }
                 return collective_plan(
                     alternatives,
                     default=default,

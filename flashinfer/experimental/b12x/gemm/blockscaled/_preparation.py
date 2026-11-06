@@ -87,6 +87,23 @@ def _short_dense_lowering(query, config, device):
     )
 
 
+def _pad_activation_scale_rows(query, lowering):
+    # Compact staging reads scale rows 0-15; inactive output rows are discarded.
+    return not (
+        query.recipe == "nvfp4"
+        and lowering is not None
+        and lowering.m <= 16
+        and lowering.mma_tiler_mn in ((16, 32), (16, 64))
+        and lowering.tile_k == 1024
+        and lowering.load_path == "tma"
+        and not lowering.swap_ab
+        and not lowering.fused_quant
+        and not lowering.direct_m1_wo_a_inputs
+        and not lowering.programmatic_serialization
+        and not lowering.quantize_c
+    )
+
+
 @program_cache(scope="preparation")
 def compile_packed(
     query_payload,
@@ -105,6 +122,19 @@ def compile_packed(
     fp4 = query.recipe in ("nvfp4", "mxfp4")
     group = 16 if query.recipe == "nvfp4" else 32
     with torch.cuda.device(ordinal):
+        activation_program = {}
+        if query.source_activation == "swiglu_bf16" and not config.fuse_swiglu:
+            from b12x.norm.hyperconnection import _cute as activation
+
+            activation_program["swiglu"] = activation._compile(
+                ("blockscaled_swiglu_bf16", query.in_features),
+                activation._Pointwise(
+                    "swiglu", cutlass.BFloat16, query.in_features, float("inf"), True
+                ),
+                3,
+                torch.device("cuda", ordinal),
+                runtime_int64s=1,
+            )
         if config.mode == "a16":
             if config.tile_n == 4:
                 from ._iq2_xs_gemv import compile_gemv
@@ -153,7 +183,7 @@ def compile_packed(
                 input_k=query.in_features,
                 device_ordinal=ordinal,
             )
-            programs = {"gemm": gemm}
+            programs = {"gemm": gemm, **activation_program}
             if slices > 1:
                 programs["reduce"] = _reduce.compile_reduce(
                     query.out_features, slices, ordinal
@@ -188,6 +218,7 @@ def compile_packed(
                     ).items()
                 }
             )
+        programs.update(activation_program)
         if functional_mxfp8_quantization(query, config):
             from b12x._lib.quant import mxfp8_rows
 
@@ -218,6 +249,13 @@ def compile_packed(
                 RECIPROCAL=query.global_scale_kind == "reciprocal",
                 GROUP=group,
                 CHUNKS=16,
+                SWIGLU=config.fuse_swiglu,
+                PAD_SCALE_ROWS=_pad_activation_scale_rows(
+                    query,
+                    _module__lib_dense_gemm_preparation._DenseLowering.from_dict(
+                        dense_payload
+                    ),
+                ),
                 grid=(
                     query.num_tokens,
                     triton.cdiv(query.padded_in_features // group, 16),
@@ -243,16 +281,28 @@ def _mxfp8_bases_nbytes(query):
     return rows * k + rows * scale_columns + tiles * 32 * 4 * 4
 
 
-def _owned_bytes(query, config):
+def _owned_bytes(query, config, device=None):
     if query.workspace_form != "owned":
         return 0
-    owned = _workspace_bytes(query, config)
+    owned = _workspace_bytes(query, config, device)
     if functional_mxfp8_quantization(query, config):
         owned += _mxfp8_bases_nbytes(query)
     return owned
 
 
-def _workspace_bytes(query, config):
+def _activation_bytes(query, config):
+    if query.source_activation == "swiglu_bf16" and not config.fuse_swiglu:
+        return triton.cdiv(query.num_tokens * query.in_features * 2, 256) * 256
+    return 0
+
+
+def _workspace_bytes(query, config, device=None):
+    return _activation_bytes(query, config) + _projection_workspace_bytes(
+        query, config, device
+    )
+
+
+def _projection_workspace_bytes(query, config, device):
     if config.mode == "a16":
         slices = effective_a16_config(query, config)[2]
         partials = (
@@ -262,28 +312,34 @@ def _workspace_bytes(query, config):
             return max(partials, query.out_features * query.padded_in_features * 2)
         return partials
     if functional_mxfp8_quantization(query, config):
-        if config.dense_config is not None and not query.codegen["split_k_atomic"]:
-            slices = config.dense_config["split_k_slices"]
+        if not query.codegen["split_k_atomic"] or not query.allow_bf16_atomic_reduction:
+            slices = _quantized_workspace_slices(query, config, device)
             if slices > 1:
                 return slices * query.num_tokens * query.out_features * 4
         return 0
-    return _quantized_layout(query, config)[-1]
+    return _quantized_layout(query, config, device)[-1]
 
 
-def _quantized_layout(query, config):
+def _quantized_workspace_slices(query, config, device):
+    if config.dense_config is not None:
+        return config.dense_config["split_k_slices"] or 1
+    if query.codegen["split_k_atomic"] and query.allow_bf16_atomic_reduction:
+        return 1
+    from b12x.gemm._preparation import _default_lowering
+
+    inner = quantized_query(query, expected_m=quantized_expected_m(query))
+    return _default_lowering(inner, device).policy.split_k_slices
+
+
+def _quantized_layout(query, config, device):
     from ._a16 import _layout
 
-    slices = (
-        1
-        if config.dense_config is None
-        else (config.dense_config["split_k_slices"] or 1)
-    )
     return _layout(
         query.num_tokens,
         query.out_features,
         query.padded_in_features,
         query.recipe in ("nvfp4", "mxfp4"),
-        (64, 64, slices),
+        (64, 64, _quantized_workspace_slices(query, config, device)),
         group=16 if query.recipe == "nvfp4" else 32,
     )
 
@@ -357,9 +413,12 @@ class _PackedExecutionState:
         iq2 = q.recipe in BLOCK_CODECS
         if source.device != self.device or source.dtype != torch.bfloat16:
             raise ValueError("packed source differs from prepared dtype/device")
-        if source.ndim < 2 or source.shape[-1] != q.in_features:
+        source_width = q.in_features * (
+            2 if q.source_activation == "swiglu_bf16" else 1
+        )
+        if source.ndim < 2 or source.shape[-1] != source_width:
             raise ValueError("packed source logical K differs from preparation")
-        m = source.numel() // q.in_features
+        m = source.numel() // source_width
         if m and (m > q.num_tokens or (q.expected_m is not None and m != q.num_tokens)):
             raise ValueError(
                 "packed execution exceeds its capacity or differs from its exact M"
@@ -465,6 +524,36 @@ class _PackedExecutionState:
                     raise ValueError(
                         "workspace must not overlap packed operands/output"
                     )
+            if nvfp4 and config.mode == "quantized":
+                _check_tensor(
+                    "activation scale", activation_scale, self.device, torch.float32
+                )
+                if activation_scale.numel() != 1:
+                    raise ValueError("activation global scale must be scalar")
+                if _overlap(out, activation_scale) or _overlap(
+                    workspace, activation_scale
+                ):
+                    raise ValueError(
+                        "activation scale must not overlap output/workspace"
+                    )
+            activation_bytes = _activation_bytes(q, config)
+            if activation_bytes:
+                from b12x.norm.hyperconnection._cute import _pointer
+
+                activated = (
+                    workspace[: m * q.in_features * 2]
+                    .view(torch.bfloat16)
+                    .view(m, q.in_features)
+                )
+                self.programs["swiglu"](
+                    _pointer(source),
+                    _pointer(source),
+                    _pointer(activated),
+                    m * q.in_features,
+                    current_cuda_stream(),
+                )
+                source = activated
+                workspace = workspace[activation_bytes:]
             if (
                 config.mode == "a16"
                 and "dequant" in self.programs
@@ -524,18 +613,6 @@ class _PackedExecutionState:
                         current_cuda_stream(),
                     )
                 return out
-            if nvfp4:
-                _check_tensor(
-                    "activation scale", activation_scale, self.device, torch.float32
-                )
-                if activation_scale.numel() != 1:
-                    raise ValueError("activation global scale must be scalar")
-                if _overlap(out, activation_scale) or _overlap(
-                    workspace, activation_scale
-                ):
-                    raise ValueError(
-                        "activation scale must not overlap output/workspace"
-                    )
             sf_start, alpha_start, partial_start, needed = self.offsets
             packed_values = workspace[: m * stored_k].view(
                 torch.uint8 if fp4 else torch.float8_e4m3fn
@@ -555,6 +632,8 @@ class _PackedExecutionState:
                 q.global_scale_kind == "reciprocal",
                 group,
                 16,
+                config.fuse_swiglu,
+                _pad_activation_scale_rows(q, core.lowering),
             )
             grid = (m, triton.cdiv(q.padded_in_features // group, 16), 1)
             self.programs["quantize"][grid](
@@ -625,7 +704,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
     def memory(config, device):
         from b12x.preparation import current_plan, current_prepared_state
 
-        needed = _workspace_bytes(query, config)
+        needed = _workspace_bytes(query, config, device.identity)
         scratch = (
             (
                 scratch_buffer_spec(
@@ -638,7 +717,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             else ()
         )
         persistent = []
-        owned = _owned_bytes(query, config)
+        owned = _owned_bytes(query, config, device.identity)
         if owned:
             existing = current_prepared_state()
             resident = 0 if existing is None else min(owned, existing.owned_nbytes)
@@ -717,9 +796,9 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         offsets = (
             None
             if config.mode == "a16" or functional_mxfp8_quantization(query, config)
-            else _quantized_layout(query, config)
+            else _quantized_layout(query, config, device.identity)
         )
-        needed = _workspace_bytes(query, config)
+        needed = _workspace_bytes(query, config, device.identity)
         workspace = bases = None
         if query.workspace_form == "owned":
             from b12x.preparation import current_prepared_state
@@ -797,6 +876,8 @@ def _query_bf16_from_call(
     source,
     weight,
     *,
+    allow_bf16_atomic_reduction=True,
+    source_activation="identity",
     activation_mode="auto",
     activation_global_scale=None,
     out=None,
@@ -813,7 +894,8 @@ def _query_bf16_from_call(
         raise ValueError(
             "packed BF16 queries require a BF16 source with at least two dimensions"
         )
-    if source.shape[-1] != weight.in_features or values.shape[0] != weight.out_features:
+    source_width = weight.in_features * (2 if source_activation == "swiglu_bf16" else 1)
+    if source.shape[-1] != source_width or values.shape[0] != weight.out_features:
         raise ValueError("packed source/weight logical geometry disagrees")
     if source.device != values.device:
         raise ValueError("packed source and weight devices differ")
@@ -833,11 +915,13 @@ def _query_bf16_from_call(
         else "nvfp4"
         if fp4
         else "mxfp8",
-        num_tokens=source.numel() // weight.in_features,
+        num_tokens=source.numel() // source_width,
         in_features=weight.in_features,
         padded_in_features=weight.padded_in_features,
         out_features=weight.out_features,
         activation_mode=activation_mode,
+        source_activation=source_activation,
+        allow_bf16_atomic_reduction=allow_bf16_atomic_reduction,
         activation_scale_available=activation_global_scale is not None,
         global_scale_kind=weight.global_scale_kind if fp4 else "none",
         source_contiguous=source.is_contiguous(),
@@ -1389,7 +1473,7 @@ class _PackedRegimeState:
         )
 
     def resolve(self, source: torch.Tensor) -> _PackedExecutionState:
-        rows = source.numel() // self.capacity.query.in_features
+        rows = source.numel() // source.shape[-1]
         if rows > self.capacity.query.num_tokens:
             raise ValueError(
                 f"packed execution rows {rows} exceed capacity "
@@ -1466,6 +1550,7 @@ def query_from_call(
     source,
     weight,
     *,
+    source_activation="identity",
     activation_mode="auto",
     activation_global_scale=None,
     out=None,
@@ -1487,17 +1572,22 @@ def query_from_call(
         and isinstance(source, torch.Tensor)
         and source.dtype == torch.bfloat16
     ):
+        allow_bf16_atomic_reduction = options.pop("allow_bf16_atomic_reduction", True)
         if options or alpha is not None or out_dtype not in (None, torch.bfloat16):
             raise ValueError("unsupported packed BF16 declaration options")
         return _query_bf16_from_call(
             source,
             weight,
             activation_mode=activation_mode,
+            source_activation=source_activation,
+            allow_bf16_atomic_reduction=allow_bf16_atomic_reduction,
             activation_global_scale=activation_global_scale,
             out=out,
             workspace=workspace,
             expected_m=expected_m,
         )
+    if source_activation != "identity":
+        raise ValueError("source activation requires a packed BF16 NVFP4 projection")
     if isinstance(source, tuple) and isinstance(weight, tuple) and source[0].ndim == 3:
         from b12x.gemm._tuning import query_from_call as dense_query
 

@@ -60,6 +60,7 @@ __all__ = [
     "joint_finalist_policy",
     "joint_startup_spec",
     "prepare_joint_startup_tuner",
+    "StartupTuningStorage",
     "Plan",
     "PcieConfig",
     "PcieQuery",
@@ -88,4 +89,5 @@ from ._joint_startup import (
     joint_finalist_policy,
     joint_startup_spec,
     prepare_joint_startup_tuner,
+    StartupTuningStorage,
 )

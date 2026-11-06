@@ -352,9 +352,9 @@ def online_softmax(
     new_max1 = fmax_f32(global_max[1], block_max1)
     alpha0 = Float32(0.0)
     alpha1 = Float32(0.0)
-    if global_sum[0] > Float32(0.0):
+    if global_sum[0] != Float32(0.0):
         alpha0 = exp2_approx(global_max[0] - new_max0)
-    if global_sum[1] > Float32(0.0):
+    if global_sum[1] != Float32(0.0):
         alpha1 = exp2_approx(global_max[1] - new_max1)
     block_scale0 = exp2_approx(block_max0 - new_max0)
     block_scale1 = exp2_approx(block_max1 - new_max1)
@@ -741,7 +741,7 @@ def write_partial_or_final(
         row_sum = row_sum1
 
     inverse = Float32(0.0)
-    if row_sum > Float32(0.0):
+    if row_sum != Float32(0.0):
         inverse = Float32(1.0) / row_sum
     scale = inverse
     if cutlass.const_expr(fp8):
@@ -783,7 +783,7 @@ def write_partial_or_final(
 
         if local_warp == Int32(0) and tid == Int32(0):
             lse = Float32(-Float32.inf)
-            if row_sum > Float32(0.0):
+            if row_sum != Float32(0.0):
                 lse = log2_approx(row_sum) + row_max
                 if cutlass.const_expr(not has_splits):
                     lse = lse * Float32(ln2)

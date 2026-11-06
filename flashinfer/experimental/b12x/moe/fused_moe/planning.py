@@ -60,6 +60,12 @@ class ActivationSpec:
     for an explicit hybrid ``bind(a4_prefill=True)`` selection; zero
     disables the constraint. Larger calls retain ``mode``.
 
+    ``a4_prefill=True`` retains calibrated A4 prefill on packed NVFP4 A16
+    weights. Calls select it with ``bind(a4_prefill=True)``. Explicit True
+    uses one activation plane and eight warps, independently of environment
+    controls. False disables this capability; None preserves environment-based
+    preparation. Explicit enablement requires compatible geometry and scales.
+
     ``swiglu_clamp_after_silu`` clamps SiLU(gate) instead of gate before
     multiplying by the symmetrically clamped up branch. It specializes the
     A4 and A16 kernels at compile time; the default clamps gate before SiLU.
@@ -79,6 +85,7 @@ class ActivationSpec:
     swiglu_beta: float | None = None
     rotation_dtype: torch.dtype | None = None
     a16_max_tokens: int = 0
+    a4_prefill: bool | None = None
     outer_scale: str = "expert"
 
     def __post_init__(self) -> None:
@@ -96,6 +103,10 @@ class ActivationSpec:
             raise TypeError("rotation_dtype must be torch.float16 or None")
         if type(self.a16_max_tokens) is not int or self.a16_max_tokens < 0:
             raise ValueError("a16_max_tokens must be a nonnegative integer")
+        if self.a4_prefill is not None and type(self.a4_prefill) is not bool:
+            raise TypeError("a4_prefill must be a boolean or None")
+        if self.a4_prefill is True and self.mode is not ActivationMode.A16:
+            raise ValueError("A4 prefill capability requires A16 weight preparation")
         if type(self.swiglu_clamp_after_silu) is not bool:
             raise TypeError("swiglu_clamp_after_silu must be a boolean")
         if self.swiglu_clamp_after_silu and (
@@ -502,6 +513,27 @@ def plan_weights(
     else:
         raise TypeError("source must be a PackedSource, TrellisConfig or TrellisSource")
 
+    if activation.a4_prefill is True:
+        from b12x.moe._shared.kernels.w4a16.prefill_a4 import a4_prefill_supported
+
+        if not (
+            isinstance(source, PackedSource)
+            and source.format.value == "modelopt_nvfp4"
+            and a4_prefill_supported(
+                prepared_layout=raw_plan.w4a16_weight_layout,
+                scale_format=raw_plan.w4a16_scale_format,
+                activation=activation.nonlinearity,
+                is_gated=activation.nonlinearity == "silu",
+                swiglu_limit=activation.swiglu_limit,
+                dtype=activation.io_dtype,
+                hidden_size=geometry.hidden_size,
+                intermediate_size=geometry.intermediate_size,
+            )
+        ):
+            raise ValueError(
+                "A4 prefill requires compatible packed NVFP4 BF16 SwiGLU weights"
+            )
+
     return WeightPlan(
         source=source,
         activation=activation,
@@ -629,7 +661,11 @@ def prepare_weights(
 
         keep_activation_scales = (
             plan.activation.mode is ActivationMode.A16
-            and a4_prefill_enabled()
+            and (
+                a4_prefill_enabled()
+                if plan.activation.a4_prefill is None
+                else plan.activation.a4_prefill
+            )
             and a4_prefill_supported(
                 prepared_layout=plan._impl.w4a16_weight_layout or "packed",
                 scale_format=plan._impl.w4a16_scale_format or "e4m3_k16",
@@ -643,14 +679,22 @@ def prepare_weights(
             and input_scale is not None
             and intermediate_scale is not None
             and all(
-                bool((torch.isfinite(scale) & (scale > 0)).all())
+                scale.numel() > 0 and bool((torch.isfinite(scale) & (scale > 0)).all())
                 for scale in (input_scale, intermediate_scale)
             )
             # Unit scales are the uncalibrated W4A16 placeholder.
-            and not all(
-                bool((scale == 1).all()) for scale in (input_scale, intermediate_scale)
+            and (
+                plan.activation.a4_prefill is True
+                or not all(
+                    bool((scale == 1).all())
+                    for scale in (input_scale, intermediate_scale)
+                )
             )
         )
+        if plan.activation.a4_prefill is True and not keep_activation_scales:
+            raise ValueError(
+                "A4 prefill requires finite positive input and intermediate calibration scales"
+            )
         if keep_activation_scales:
             # Shared input quantization uses the widest calibrated expert range.
             input_scale = (

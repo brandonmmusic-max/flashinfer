@@ -7,7 +7,9 @@ import cutlass.cute as cute
 import pytest
 import torch
 
+from b12x import gemm
 from b12x.gemm import tensor_fp8_linear
+from b12x.gemm.blockscaled._linear import _unit_scale_mma
 from b12x.preparation import PreparationSession, PreparedCall
 from b12x.preparation.types import require_prepared
 from b12x.gemm.tensor_fp8_linear import api as tensor_fp8_api
@@ -293,3 +295,120 @@ def test_prewarm_primes_dynamic_capacity_before_frozen_resolution() -> None:
             actual = tensor_fp8_linear.mm(source[:rows], packed)
             reference = source[:rows].float() @ weight.float().T * scale
             torch.testing.assert_close(actual.float(), reference, atol=2e-3, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "rows,k,n",
+    [
+        (8, 5120, 6144),
+        (16, 5120, 6144),
+        (32, 5120, 6144),
+        (64, 5120, 6144),
+        (3, 256, 132),
+    ],
+)
+def test_plain_fp8_swapped_tma_mutable_graph(rows, k, n) -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    source = (torch.randn((rows, k), device=device) * 20).to(torch.float8_e4m3fn)
+    weight = (torch.randn((n, k), device=device) * 20).to(torch.float8_e4m3fn)
+    original = source.float()
+    alpha = torch.tensor([0.017 * 0.031], device=device)
+    sfa = _unit_scale_mma(rows, k, device).zero_()
+    sfb = _unit_scale_mma(n, k, device).zero_()
+    output = torch.empty((rows, n), device=device, dtype=torch.bfloat16)
+    workspace = torch.empty(0, device=device, dtype=torch.float32)
+    query = gemm.DenseGemmQuery(
+        recipe="tensor_fp8",
+        entry_point="gemm.mm",
+        weight_storage="native",
+        output_dtype="bfloat16",
+        batch=1,
+        max_rows=rows,
+        in_features=k,
+        out_features=n,
+        output_mode="provided",
+        alpha_mode="tensor",
+        workspace_form="provided",
+        workspace_nbytes=0,
+    )
+    config = gemm.DenseGemmConfig(
+        backend="cutedsl",
+        tile_m=64,
+        tile_n=16,
+        tile_k=128,
+        load_path="tma",
+        swap_ab=True,
+        split_k_slices=None,
+        large_m_unroll=False,
+        target_occupancy=None,
+    )
+    plan = gemm.plan(query, override=config)
+
+    def prepared_call(state):
+        return PreparedCall(
+            run=lambda: state.run(
+                source.view(rows, k, 1),
+                sfa,
+                weight.view(n, k, 1),
+                sfb,
+                alpha,
+                output.view(rows, n, 1),
+                workspace,
+                torch.bfloat16,
+                None,
+            ),
+            owners=(source, weight, sfa, sfb, alpha, output, workspace),
+        )
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
+        session.prepare(
+            (plan.request(name="swapped-plain-fp8", prepare_call=prepared_call),)
+        )
+
+        def run():
+            gemm.mm(
+                (source.view(rows, k, 1), sfa.view(torch.float8_e8m0fnu)),
+                (weight.view(n, k, 1), sfb.view(torch.float8_e8m0fnu)),
+                out=output.view(rows, n, 1),
+                alpha=alpha,
+                workspace=workspace,
+                plan=plan,
+            )
+
+        run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture():
+            with torch.cuda.graph(graph):
+                run()
+        session.freeze()
+        for factor in (1.0, -1.0, 0.5):
+            source.copy_((original * factor).to(source.dtype))
+            expected = (source.float() @ weight.float().T) * alpha
+            output.fill_(float("nan"))
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_stats()
+            graph.replay()
+            torch.cuda.synchronize()
+            after = torch.cuda.memory_stats()
+            for key in (
+                "allocation.all.allocated",
+                "allocation.all.freed",
+                "segment.all.allocated",
+                "segment.all.freed",
+            ):
+                assert before[key] == after[key]
+            actual = output.float()
+            assert (
+                torch.nn.functional.cosine_similarity(
+                    actual.flatten(), expected.flatten(), dim=0
+                )
+                >= 0.9999
+            )
+            torch.testing.assert_close(actual, expected, rtol=0.015, atol=0.03)
+        graph.reset()

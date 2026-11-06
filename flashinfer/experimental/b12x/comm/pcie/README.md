@@ -159,6 +159,59 @@ work before entering this method with identical arguments. A profile change
 cannot occur during capture or overlap graph replay. No topology is inferred
 from the profile; callers choose the prepared profile explicitly.
 
+### Cluster-scoped phased profiles
+
+Experimental cluster profiles opt in through
+`AllReduce.plan(..., joint_only=True, joint_cluster_size=8)`. The default is
+`joint_cluster_size=1`, which preserves ordinary queries and launch policy.
+Cluster plans require SM120/SM121, at least 64 SMs, 512 threads per CTA, and a
+fixed 64-CTA grid. Preparation checks that the compiled kernel can keep this
+grid resident with eight CTAs per cluster; unsupported geometry is rejected.
+
+`joint_latency` additionally admits `full_phased` and `payload_rsag_phased`;
+`joint_bandwidth` additionally admits `payload_rsag_phased`. These modes require
+exactly eight active CTAs: one complete cluster. All other clusters return
+before accessing IPC state. Each writer issues a system fence before the
+active cluster synchronizes and advances to its next peer destination.
+Ordinary modes retain active counts 1–64 and execute without cluster barriers.
+They still use the cluster launch geometry when selected on a cluster plan;
+this geometry can affect scheduling and does not guarantee zero overhead.
+Both paths use the same workspace layout, BF16 arithmetic, and aliasing contract.
+
+For an established joint channel, declare the geometry with the existing
+configuration type and submit the plan through the normal preparation batch:
+
+```python
+plan = runtime.plan(
+    inp,
+    out=out,
+    joint_only=True,
+    joint_cluster_size=8,
+    override=CollectiveConfig(
+        implementation="joint_bandwidth",
+        threads=512,
+        blocks=64,
+        submode="payload_rsag_phased",
+        active_blocks=8,
+    ),
+)
+```
+
+After preparation, a startup specification can retain ordinary alternatives
+alongside the phased profile:
+
+```python
+spec = joint_startup_spec(
+    plan,
+    profiles=(("payload_rsag_phased", 8), ("bulk_pull", 11), ("payload_rsag", 42)),
+)
+```
+
+The cluster dimension is immutable plan metadata, while the selected mode and
+active count remain device data. Startup selection and serving use the same
+compiled launcher. Cluster launches use ordinary CUDA graph kernel attributes,
+without cooperative launch or additional protocol counters.
+
 ### Captured startup mode selection
 
 `AllReduce.plan(...)` excludes joint kernels by default and retains static transport
@@ -179,8 +232,8 @@ grid. Multiple counts per mode are allowed; duplicate pairs are rejected.
 Collectively call `prepare_joint_startup_tuner(specs, cache_policy="cold")` before
 freezing kernel resolution. All specs in a producer must have the same semantic
 key, rank, and device. Each spec exposes its actual serving `selector` tensor.
-The producer retains its specs, private fixtures, timing storage, and compiled
-programs. Its IPC storage remains owned by the collective runtime.
+The producer retains its specs, fixtures, timing storage, and compiled programs.
+Its IPC storage remains owned by the collective runtime.
 
 Capture `producer.run()` into a separate startup graph. It times the same
 compiled collective launcher used by serving, with the measured CTA count for
@@ -198,10 +251,70 @@ replay equivalent startup graphs in the same order. Startup and serving must
 not execute concurrently on their shared collective workspace.
 
 Numerical checks run once for every mode and fixture before timing begins.
-Cold-cache producers share one eviction buffer per runtime; producers replay
-serially. `producer.memory_requirements()` reports resident fixtures, timing,
-status, and eviction storage through the preparation memory interface, with
-shared storage keys suitable for deduplication.
+By default, each runtime owns the fixture and cold-cache eviction storage
+shared by its startup producers. Share those allocations across runtimes in
+one preparation session by passing an explicit owner:
+
+```python
+from b12x.comm.pcie import StartupTuningStorage, prepare_joint_startup_tuner
+
+storage = StartupTuningStorage(runtime.device)
+producer = prepare_joint_startup_tuner(specs, cache_policy="cold", storage=storage)
+```
+
+An owner shares one scratch arena and row-prefix reference banks. Preparing a
+larger race rebinds existing fixtures until the first capture. After capture,
+larger races get private fixtures so recorded addresses remain valid. Races
+sharing an owner must replay serially, even when they use different runtimes.
+Races using one runtime also serialize access to its collective and timing IPC
+storage. Retain producers until replay drains; releasing the runtime, producers,
+and their owner releases the fixture and eviction tensors. Create a separate
+owner for each preparation session; no process-wide tensor pool retains model
+storage.
+
+Cold races can read existing resident model storage instead of allocating an
+eviction buffer. Before preparing or capturing those races, use:
+
+```python
+if resident_weights.numel() * resident_weights.element_size() >= storage.eviction_bytes:
+    storage.use_eviction(resident_weights)
+```
+
+The source must be a contiguous CUDA tensor on the owner's device, aligned to
+four bytes. The minimum size is twice that device's L2 cache or 64 MiB,
+whichever is larger. Registration creates tensor views without copying or
+allocating fallback eviction storage. A smaller model can retain the default
+eviction buffer by omitting registration. Registration after capture fails,
+including replacement by the same source.
+
+`producer.memory_requirements()` reports resident fixtures, timing, status, and
+owned eviction storage through the preparation memory interface, with shared
+storage keys suitable for deduplication. Registered external storage is
+excluded because its caller already accounts for it; the reduction scalar is
+still reported.
+
+### Retained startup memory check
+
+`benchmarks/pcie_startup_storage.py` measures live startup tensors and total
+CUDA memory after capture, validated replay, synchronization, and allocator
+cache release. It keeps the graphs alive and allocates the same 512 MiB resident
+weight tensor before each measurement. Four BF16 message sizes use one runtime;
+`--arm candidate` shares an explicit owner and reads the resident tensor for
+L2 eviction. `--arm base` uses the installed revision's default preparation API.
+
+Run from the desired FlashInfer checkout with its preparation environment and
+four unused GPUs:
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 python benchmarks/pcie_startup_storage.py \
+  --arm candidate --source . --output /tmp/pcie-startup-memory
+```
+
+To measure a baseline, run the same script with that checkout imported, pass its
+path as `--source`, and select `--arm base`. The script rejects an import from a
+different source tree. Recorded SM120 TP4 measurements are in
+`benchmarks/results/pcie_startup_storage_tp4_sm120_{base,shared}.json`. These
+measure retained startup memory, not inference latency.
 
 ### Standalone transfer-size search
 
@@ -210,6 +323,65 @@ shared storage keys suitable for deduplication.
 from 1 KiB through 8 MiB at 16 points per doubling. Each size recommends one
 confirmed full configuration, including compiled geometry and runtime profile.
 This tool does not change serving dispatch or preparation defaults.
+
+For column all-gather, pass `--operation all_gather --row-bytes BYTES`. Sizes
+count input bytes per rank and must contain complete rows. Automatic size
+ladders align their points to that row width. The collector supports TP2/TP4/TP8
+and uses exact row-major, rank-interleaved output checks.
+
+`--gather-kernel runtime` measures device-selected CTA counts in fixed-protocol
+kernels and a joint barrier/word-exchange kernel. The joint kernel supports
+TP2/TP4 payloads through 16 KiB per rank; larger payloads use barrier gather.
+It launches a fixed physical grid and thread count, with protocol and active
+CTA count read from one uint32 selector. Word exchange uses one warp per CTA;
+barrier gather uses the full CTA. Wide CTAs use predicated first-packet loads
+to overlap selector and payload fetches without reconverging before dispatch.
+Both protocols use the established channel's
+separate receive regions and counters. All ranks must execute the same profile
+and serialize calls sharing that channel.
+
+`--gather-kernel static` measures the separate kernels with host-selected grids.
+`--gather-kernel compare` includes both static and runtime candidates under the
+same timing protocol. These flags affect only all-gather collection. DCP plans
+with `gather_transport` set to `joint`, `selected_barrier`, or
+`selected_word_exchange` compile a fixed geometry and retain a device selector.
+Explicit profiles passed to `joint_startup_spec` use the shared captured startup
+tuner. Ordinary DCP plans retain their preparation-time selection policy.
+
+```sh
+torchrun --standalone --nproc-per-node=4 -m b12x.tools.collective_ladder \
+  --operation all_gather --row-bytes 128 --gather-kernel runtime \
+  --min-bytes 128 --max-bytes 8MiB --budget-seconds 600 \
+  --output gather-switched.jsonl --fresh
+
+python -m b12x.tools.collective_ladder recommend-gather \
+  --switched gather-switched.jsonl --host gather-host.jsonl \
+  --output gather-recommendations.json
+```
+
+`--gather-proposal PATH` restricts collection to the geometries and profiles in a
+recommendation JSON. Each bucket can also contain a `references` list of full
+configuration objects (`implementation`, `threads`, `blocks`, `submode`, and
+`active_blocks`) for balanced comparisons. Configurations must satisfy the
+kernel's protocol and grid limits; a supplied control may include idle CTAs.
+Use `--gather-capacity-bytes BYTES` when measuring a subset
+of sizes to preserve the full sweep's channel capacity. `--rounds 17` enforces
+at least 102 individual rank-maximum timings per measured candidate.
+
+Run collection separately for each topology and row width. Each input report must have complete results. Reports from the same devices,
+row width, channel capacity, and timing conditions are pooled before matching
+payload coverage between topology cohorts. Different machines remain separate
+cohorts. The merger produces `min_bytes` and one `buckets` list shared across
+all measured row widths. It chooses one compiled geometry
+per byte size, minimizing worst host cost among choices within 2% of the fastest
+runtime kernel on every switched report. `--switched-margin` sets that margin
+through 5%. If no shared geometry meets it, switched cost takes priority. The
+result retains the smallest measured profile menu that stays within the
+switched margin and within 5% of that geometry's best profile on each host
+cohort. If the compiled geometry cannot meet the switched margin, its fastest
+measured switched profiles are retained. Reported regret includes static baselines when supplied
+through comparison reports. The output describes measured recommendations;
+it does not install a serving ladder.
 
 Search covers every compiled geometry and submode at every size, then refines
 runtime profiles using neighboring measurements. Screening rounds scale inversely

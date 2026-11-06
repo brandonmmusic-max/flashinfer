@@ -4700,7 +4700,8 @@ class MoEDynamicKernelBackend:
         tCrSFB = self._dense_cls._partition_fragment_SFB(
             self, sSFB[None, None, 0], thr_mma, tidx
         )
-        if cutlass.const_expr(self.direct_sfb):
+        # The dense partition already separates N and K for four-N-warp NVFP4 atoms.
+        if cutlass.const_expr(self.direct_sfb and cute.rank(tCrSFB) == 2):
             tCrSFB = cute.make_tensor(
                 tCrSFB.iterator,
                 cute.make_layout(
@@ -4914,7 +4915,7 @@ class MoEDynamicKernelBackend:
                 thr_mma_fc1,
                 tidx,
             )
-            if cutlass.const_expr(self.fc1_direct_sfb):
+            if cutlass.const_expr(self.fc1_direct_sfb and cute.rank(tCrSFB_sw) == 2):
                 # Expose N/K modes for direct scale loads. Narrow N32 tiles
                 # cannot retile the generic SFB copy atom into this fragment.
                 tCrSFB_sw = cute.make_tensor(

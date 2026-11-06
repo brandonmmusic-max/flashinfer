@@ -129,7 +129,7 @@ def _quant_mode(experts: PreparedExperts, config: MoeDecodeConfig) -> str:
     return non_a16[0]
 
 
-def _control_snapshot() -> FrozenMapping:
+def _control_snapshot(a4_prefill: bool | None = None) -> FrozenMapping:
     """Capture host controls once while declaring the immutable query."""
     from . import _impl
     from b12x.moe._shared.kernels.w4a16.host import (
@@ -149,15 +149,19 @@ def _control_snapshot() -> FrozenMapping:
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
-    a4_enabled = a4_prefill_enabled()
+    a4_enabled = a4_prefill_enabled() if a4_prefill is None else a4_prefill
     return FrozenMapping(
         {
             "trellis_decode_table": trellis_decode_table(),
             "w4a16_small_m_occupancy": _w4a16_small_m_occupancy(),
             "w4a16_fp32_topk_weights": _FP32_TOPK_WEIGHTS,
             "w4a16_a4_prefill_enabled": a4_enabled,
-            "w4a16_a4_prefill_terms": a4_prefill_terms() if a4_enabled else 1,
-            "w4a16_a4_prefill_warps": a4_prefill_warps() if a4_enabled else 8,
+            "w4a16_a4_prefill_terms": (
+                a4_prefill_terms() if a4_enabled and a4_prefill is None else 1
+            ),
+            "w4a16_a4_prefill_warps": (
+                a4_prefill_warps() if a4_enabled and a4_prefill is None else 8
+            ),
             "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
             "w4a16_skip_empty_m_blocks": _impl.os.environ.get(
                 "B12X_W4A16_SKIP_EMPTY_M_BLOCKS", "1"
@@ -1494,13 +1498,22 @@ class _FusedMoeState:
         )
         if self.w4a16_launches is not None:
             kwargs["_w4a16_launches"] = self.w4a16_launches
-        return replace(
+        binding = replace(
             self.scratch.bind(**kwargs),
             compact_launches=self.compact_launches,
             output_layout=self.scratch.caps.output_layout,
             trellismx_smallm_tokens=self.trellismx_smallm_tokens,
             trellismx_smallm_plan=self.trellismx_smallm_plan,
         )
+        if (
+            self.experts.plan.activation.a4_prefill is not None
+            and kwargs["a4_prefill"] is True
+            and binding.a4_prefill_launches is None
+        ):
+            raise ValueError(
+                "A4 prefill has no compatible prepared launch for this binding"
+            )
+        return binding
 
     def run(self, binding):
         return binding.run()
@@ -1689,7 +1702,7 @@ def plan(
                 scale_expansion=scale_expansion,
             )
         _validate_trellismx_declaration(experts, capacity, routing, invocation)
-    controls = _control_snapshot()
+    controls = _control_snapshot(experts.plan.activation.a4_prefill)
     if experts._impl.source_format == "trellismx":
         from ._impl import _trellismx_smallm_policy
 

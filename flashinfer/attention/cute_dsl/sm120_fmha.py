@@ -423,12 +423,12 @@ def sm120_fmha_fp8_paged_prefill(
         dtype: ``float8_e4m3fn``.
     k_pool : torch.Tensor
         HND paged K pool, shape ``(num_pages, Hkv, num_tokens_per_page, D)``.
-        Same dtype as ``q``. Every slot, including unused page padding, must
-        contain a finite value. A plane view from a combined
+        Same dtype as ``q``. Slots beyond each request's logical K/V length
+        are ignored. A plane view from a combined
         ``(num_pages, 2, Hkv, num_tokens_per_page, D)`` cache is accepted.
     v_pool : torch.Tensor
         HND paged V pool, shape ``(num_pages, Hkv, num_tokens_per_page, D)``.
-        Same dtype and finite-value contract as ``k_pool``.
+        Same dtype and logical-length contract as ``k_pool``.
     o : torch.Tensor
         Output tensor, same shape as ``q``, written in-place.
         dtype: ``float16`` or ``bfloat16``.

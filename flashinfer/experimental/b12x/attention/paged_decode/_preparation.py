@@ -19,12 +19,12 @@ from b12x._lib.scratch import ScratchBufferSpec
 from b12x._lib.utils.device import current_cuda_stream
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 
-from ._tuning import TUNING, PagedDecodeConfig, PagedDecodeQuery
+from ._tuning import TUNING, PagedDecodeConfig, PagedDecodeQuery, _consumer_warps
 
 _FORWARD_ID = "attention.paged_decode.forward"
 _MERGE_ID = "attention.paged_decode.merge"
 _KV_WRITE_ID = "attention.paged_decode.kv_write"
-_COMPILE_VERSION = 1
+_COMPILE_VERSION = 2
 _KV_CUTE_DTYPE = {"bfloat16": cutlass.BFloat16, "float8_e4m3fn": cutlass.Uint8}
 
 # (name, rank, cutlass dtype or kv marker, assumed alignment) in launch order.
@@ -119,6 +119,7 @@ def _forward_kernel(query: PagedDecodeQuery, config: PagedDecodeConfig):
         stage_rows=config.stage_rows,
         num_stages=config.num_stages,
         min_tiles_per_split=config.min_tiles_per_split,
+        num_consumer_warps=_consumer_warps(query),
         head_dim_qk=query.head_dim_qk,
         head_dim_vo=query.head_dim_vo,
         page_size=query.page_size,

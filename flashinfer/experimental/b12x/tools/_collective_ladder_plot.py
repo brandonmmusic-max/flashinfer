@@ -68,7 +68,9 @@ def _heading(path, metadata, summary, rows):
     confirmed = sum(row is not None and row.get("confirmed", False) for row in rows)
     return (
         f"{path.name}\n{_device_label(metadata)}",
-        f"{metadata.get('dtype', '?')} · {metadata.get('cache_policy', '?')} cache · "
+        f"{metadata.get('operation', 'all_reduce')} · "
+        + (f"row {metadata['row_bytes']} B · " if "row_bytes" in metadata else "")
+        + f"{metadata.get('dtype', '?')} · {metadata.get('cache_policy', '?')} cache · "
         f"{'aliased' if metadata.get('alias') else 'disjoint'} buffers · "
         f"{confirmed}/{len(rows)} confirmed · {summary.get('status', '?')}",
     )
@@ -95,17 +97,33 @@ def _choice_figure(sizes, rows, heading, details):
     axes = [figure.add_subplot(grid[index]) for index in range(5)]
     handles = []
     palettes = (
-        ("#3366ad", "#e28c27"),
-        ("#4169a1", "#9561b1", "#49954a", "#169a9d", "#cc6a38"),
+        ("#3366ad", "#e28c27", "#3366ad", "#e28c27", "#49954a", "#4169a1", "#9561b1"),
+        ("#4169a1", "#9561b1", "#49954a", "#169a9d", "#cc6a38", "#4169a1", "#9561b1"),
     )
     orders = (
-        ("joint_latency", "joint_bandwidth"),
-        ("full", "payload_rsag", "bulk_push", "bulk_pull", "pull"),
+        (
+            "joint_latency",
+            "joint_bandwidth",
+            "gather_barrier",
+            "gather_word_exchange",
+            "gather_joint",
+            "gather_selected_barrier",
+            "gather_selected_word_exchange",
+        ),
+        (
+            "full",
+            "payload_rsag",
+            "bulk_push",
+            "bulk_pull",
+            "pull",
+            "barrier",
+            "word_exchange",
+        ),
     )
     for axis, field, title, palette, order in zip(
         axes,
         ("implementation", "submode"),
-        ("Compiled family", "Runtime mode"),
+        ("Compiled family", "Protocol / mode"),
         palettes,
         orders,
     ):
@@ -204,7 +222,7 @@ def _choice_figure(sizes, rows, heading, details):
     for axis in axes[:-1]:
         axis.tick_params(axis="x", labelbottom=False, length=0)
     axes[-1].set_xlabel("Exact measured payload · one column per bucket")
-    figure.suptitle(f"Joint PCIe all-reduce choices\n{heading}", fontsize=14, y=0.99)
+    figure.suptitle(f"PCIe collective choices\n{heading}", fontsize=14, y=0.99)
     figure.text(0.54, 0.87, details, ha="center", fontsize=10)
     figure.legend(
         handles=handles,
@@ -250,9 +268,15 @@ def _bucket_figure(sizes, rows, heading, details):
         text = f"#{index:03d}  {size:,} B\nNo recommendation"
         if row:
             config = row["config"]
-            family = {"joint_latency": "L", "joint_bandwidth": "B"}.get(
-                config["implementation"], config["implementation"]
-            )
+            family = {
+                "joint_latency": "L",
+                "joint_bandwidth": "B",
+                "gather_joint": "GJ",
+                "gather_barrier": "GB",
+                "gather_word_exchange": "GW",
+                "gather_selected_barrier": "GBD",
+                "gather_selected_word_exchange": "GWD",
+            }.get(config["implementation"], config["implementation"])
             face = "#e1ebf8" if family == "L" else "#faecd9"
             suffix = "" if row.get("confirmed", False) else " ?"
             hatch = None if not suffix else "///"

@@ -1134,7 +1134,10 @@ class B12XPagedAttentionScratch:
         ):
             self._cache_prefill_graph_replay_shape_from_plan()
 
-        from .graph_replay import update_prefill_graph_chunk_metadata
+        from .graph_replay import (
+            adaptive_verify_chunking,
+            update_prefill_graph_chunk_metadata,
+        )
 
         update_prefill_graph_chunk_metadata(
             _prepared=self._prepared_metadata_launchers,
@@ -1159,6 +1162,7 @@ class B12XPagedAttentionScratch:
             split_kv=bool(self._plan.split_kv),
             window_left=int(self._plan.window_left),
             msa_block_sparse=bool(self._plan.msa_block_sparse),
+            adaptive_chunking=adaptive_verify_chunking(self.mode, self._plan),
             fixed_kv_chunk_size=int(self._plan.kv_chunk_size),
         )
 

@@ -40,7 +40,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from . import _allgather_cute, _twoshot_cute, _varlen_cute
+from . import _allgather_cute, _scatter_gather_cute, _twoshot_cute, _varlen_cute
 from ._oneshot_cute import PACK_BYTES, get_launcher
 from ._proxy import Layout, Proxy, load as _load_proxy_library
 from ._routes import MAX_RAILS, local_endpoints, plan_routes
@@ -726,6 +726,10 @@ class RoceOneshotAllReduce:
                 get_launcher(*self._launcher_key(dtype))
                 if self.pipe_bytes:
                     _twoshot_cute.get_launcher(*self._twoshot_launcher_key(dtype))
+                    for operation in _scatter_gather_cute.OPERATIONS:
+                        _scatter_gather_cute.get_launcher(
+                            operation, *self._twoshot_launcher_key(dtype)
+                        )
             _allgather_cute.get_launcher(*self._gather_launcher_key())
             if self.max_varlen_bytes:
                 _varlen_cute.get_launcher(*self._varlen_launcher_key())
@@ -854,9 +858,20 @@ class RoceOneshotAllReduce:
             launcher = prepared.twoshot_launchers[inp.dtype]
         except KeyError as exc:
             raise ValueError("RoCE two-shot dtype differs from preparation") from exc
+        self._launch_pipelined(launcher, inp, out, nbytes, capturing)
+
+    def _launch_pipelined(
+        self,
+        launcher,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        nbytes: int,
+        capturing: bool,
+    ) -> None:
+        """Launch one pipelined kernel (two-shot, reduce-scatter or shard gather) over an ``nbytes`` message."""
         if inp.data_ptr() % PACK_BYTES or out.data_ptr() % PACK_BYTES:
             # The alignment scratch is sized for one-shot messages only.
-            raise ValueError("RoCE two-shot all-reduce needs 16-byte aligned tensors")
+            raise ValueError("RoCE pipelined collectives need 16-byte aligned tensors")
         chunk_packs, chunks = self._pipe_geometry(nbytes)
         base = self._region.data_ptr()
         self._order_stream(capturing)
@@ -877,6 +892,172 @@ class RoceOneshotAllReduce:
             self._poison_address,
             self.spin_limit,
             self._pipe_blocks,
+        )
+
+    # -- reduce-scatter and shard gather ------------------------------------------
+
+    def _shards_rows(self, inp: torch.Tensor, nbytes: int) -> bool:
+        """Rank-uniform eligibility of a row-sharded pipelined operation over an ``nbytes`` message.
+
+        The operand's rows (its first dimension) are split into ``world_size`` equal
+        contiguous shards; every row must hold whole 16-byte packs so each shard
+        starts on a pack.  Like ``should_allreduce``, this depends on dtype, shape,
+        contiguity and size only, never on the pointer value.
+        """
+        if self._closed or self._proxy is None:
+            raise RuntimeError("RoCE runtime is closed")
+        if not self.pipe_bytes or inp.dtype not in SUPPORTED_DTYPES or not inp.is_cuda:
+            return False
+        if inp.device != self.device or not inp.is_contiguous() or inp.dim() == 0:
+            return False
+        row_bytes = inp[0].numel() * inp.element_size() if inp.shape[0] else 0
+        return (
+            0 < nbytes <= self.pipe_bytes
+            and row_bytes > 0
+            and row_bytes % PACK_BYTES == 0
+        )
+
+    def should_reduce_scatter(self, inp: torch.Tensor) -> bool:
+        """Eligible: a whole message whose rows divide into ``world_size`` shards within ``pipe_bytes``."""
+        nbytes = inp.numel() * inp.element_size()
+        return self._shards_rows(inp, nbytes) and inp.shape[0] % self.world_size == 0
+
+    def should_gather_shards(self, inp: torch.Tensor) -> bool:
+        """Eligible: one rank's shard whose ``world_size``-fold gathered message fits ``pipe_bytes``."""
+        nbytes = inp.numel() * inp.element_size() * self.world_size
+        return self._shards_rows(inp, nbytes)
+
+    def reduce_scatter(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        plan,
+    ) -> torch.Tensor:
+        """Run a published prepared RoCE reduce-scatter: ``out`` is this rank's shard of the sum.
+
+        The sum of every rank's ``inp`` is split along dimension 0 into
+        ``world_size`` equal shards, rank ``r`` keeping shard ``r``, with the
+        arithmetic of the pipelined two-shot all-reduce (FP32 accumulation in
+        rank order), so a following ``gather_shards`` reproduces that
+        all-reduce's bits.  ``inp`` must satisfy ``should_reduce_scatter``.
+        """
+        from b12x.preparation.types import require_prepared
+
+        prepared = require_prepared(plan, "comm.roce", self.device)
+        if prepared.runtime is not self:
+            raise ValueError("RoCE plan belongs to another runtime")
+        return self._run_prepared_reduce_scatter(
+            inp, prepared=prepared, out=out, stream=stream
+        )
+
+    def gather_shards(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        plan,
+    ) -> torch.Tensor:
+        """Run a published prepared RoCE shard gather: ``out`` is every rank's ``inp`` along dimension 0.
+
+        The inverse of ``reduce_scatter``: ``out`` holds rank 0's shard, then
+        rank 1's, and so on, through the pipelined path.  ``inp`` must satisfy
+        ``should_gather_shards``.
+        """
+        from b12x.preparation.types import require_prepared
+
+        prepared = require_prepared(plan, "comm.roce", self.device)
+        if prepared.runtime is not self:
+            raise ValueError("RoCE plan belongs to another runtime")
+        return self._run_prepared_gather_shards(
+            inp, prepared=prepared, out=out, stream=stream
+        )
+
+    def _run_prepared_sharded(
+        self,
+        operation: str,
+        inp: torch.Tensor,
+        shape: tuple[int, ...],
+        nbytes: int,
+        *,
+        prepared: object,
+        out: Optional[torch.Tensor],
+        stream: object,
+    ) -> torch.Tensor:
+        """Run a materialized reduce-scatter or shard-gather launcher over an ``nbytes`` message."""
+        with self._lock:
+            self.check_health()
+            if out is None:
+                out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+            elif (
+                tuple(out.shape) != shape
+                or out.dtype != inp.dtype
+                or out.device != inp.device
+                or not out.is_contiguous()
+            ):
+                raise ValueError(
+                    f"out must be a contiguous tensor on the input's device of shape {shape}"
+                )
+            context = (
+                torch.cuda.stream(stream) if stream is not None else _nullcontext()
+            )
+            with torch.cuda.device(self.device), context:
+                capturing = torch.cuda.is_current_stream_capturing()
+                launcher = getattr(prepared, "scatter_gather_launchers", {}).get(
+                    (operation, inp.dtype)
+                )
+                if launcher is None:
+                    raise ValueError(
+                        f"RoCE {operation} of {inp.dtype} was not prepared"
+                    )
+                self._launch_pipelined(launcher, inp, out, nbytes, capturing)
+                self._mark_stream(capturing)
+        if not capturing:
+            self.check_health()
+        return out
+
+    def _run_prepared_reduce_scatter(
+        self,
+        inp: torch.Tensor,
+        *,
+        prepared: object,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        if not self.should_reduce_scatter(inp):
+            raise ValueError("input is not eligible for the RoCE reduce-scatter")
+        shape = (inp.shape[0] // self.world_size, *inp.shape[1:])
+        return self._run_prepared_sharded(
+            "reduce_scatter",
+            inp,
+            shape,
+            inp.numel() * inp.element_size(),
+            prepared=prepared,
+            out=out,
+            stream=stream,
+        )
+
+    def _run_prepared_gather_shards(
+        self,
+        inp: torch.Tensor,
+        *,
+        prepared: object,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        if not self.should_gather_shards(inp):
+            raise ValueError("input is not eligible for the RoCE shard gather")
+        shape = (inp.shape[0] * self.world_size, *inp.shape[1:])
+        return self._run_prepared_sharded(
+            "gather_shards",
+            inp,
+            shape,
+            inp.numel() * inp.element_size() * self.world_size,
+            prepared=prepared,
+            out=out,
+            stream=stream,
         )
 
     def _aligned_scratch(self, which: int, like: torch.Tensor) -> torch.Tensor:

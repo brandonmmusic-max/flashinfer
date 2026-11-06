@@ -3393,9 +3393,8 @@ def s7_epilogue(
     geometry is IDENTICAL for both, so only the per-row inverse-normalizer and the
     LSE fold diverge.
 
-    PARTIAL_WRITEBACK (DEFAULT, decode/split -- byte-identical to the prior decode
-    epilogue): write this SPLIT's NORMALIZED partial O + base-2 LSE in the exact
-    active split merge convention (SparseMLASplitDecodeMergeKernel in merge.py).
+    PARTIAL_WRITEBACK (DEFAULT, decode/split): write normalized per-split output
+    and base-2 LSE for SparseMLASplitDecodeMergeKernel in merge.py.
     The merge reduces over the split axis assuming each partial is the
     PER-SPLIT-NORMALIZED output (acc / this split's softmax sum) tagged with the
     split's base-2 LSE (log2(sum) + max). inv_g = 1/global_sum (0 if empty);
@@ -3423,7 +3422,7 @@ def s7_epilogue(
         s0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
         denom0 = global_sum[0] + _exp2_approx_ftz_f32(s0 - global_max[0])
         inv_g0 = Float32(0.0)
-        if denom0 > Float32(0.0):
+        if denom0 != Float32(0.0):
             if cutlass.const_expr(fast_rcp):
                 inv_g0 = rcp_approx_ftz(denom0)
             else:
@@ -3432,7 +3431,7 @@ def s7_epilogue(
         if cutlass.const_expr(valid_hpb > 8):
             s1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
             denom1 = global_sum[1] + _exp2_approx_ftz_f32(s1 - global_max[1])
-            if denom1 > Float32(0.0):
+            if denom1 != Float32(0.0):
                 if cutlass.const_expr(fast_rcp):
                     inv_g1 = rcp_approx_ftz(denom1)
                 else:
@@ -3441,12 +3440,12 @@ def s7_epilogue(
         # PARTIAL_WRITEBACK or FINAL_BF16-without-sink: il = 1/l (0 if empty).
         inv_g0 = Float32(0.0)
         inv_g1 = Float32(0.0)
-        if global_sum[0] > Float32(0.0):
+        if global_sum[0] != Float32(0.0):
             if cutlass.const_expr(fast_rcp):
                 inv_g0 = rcp_approx_ftz(global_sum[0])
             else:
                 inv_g0 = Float32(1.0) / global_sum[0]
-        if global_sum[1] > Float32(0.0):
+        if global_sum[1] != Float32(0.0):
             if cutlass.const_expr(fast_rcp):
                 inv_g1 = rcp_approx_ftz(global_sum[1])
             else:
@@ -3579,21 +3578,19 @@ def s7_epilogue(
             )
             store_idx += Int32(num_threads)
 
-    # base-2 LSE (warp 0, tid 0 owns one head pair via gid). The PARTIAL_WRITEBACK
-    # path is the EXACT prior decode epilogue (byte-identical IR); the FINAL_BF16 +
-    # sink fold is a const_expr-gated addition that is fully elided for decode.
+    # Base-2 LSE: only zero sums denote empty splits; NaNs reach the split merge.
     if warp_id == Int32(0) and tid == Int32(0):
         lse0 = Float32(_NEG_INF)
         lse1 = Float32(_NEG_INF)
-        if global_sum[0] > Float32(0.0):
+        if global_sum[0] != Float32(0.0):
             lse0 = _log2_approx_ftz_f32(global_sum[0]) + global_max[0]
-        if global_sum[1] > Float32(0.0):
+        if global_sum[1] != Float32(0.0):
             lse1 = _log2_approx_ftz_f32(global_sum[1]) + global_max[1]
         if cutlass.const_expr(epilogue_mode == EPILOGUE_FINAL_BF16 and has_attn_sink):
             # FlashMLA sink fold: lse += log2(1 + exp2(sink_log2 - lse)); empty ->
             # sink_log2 (prefill_kernel.cuh:548-560).
             sink0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
-            if lse0 > Float32(_NEG_INF):
+            if lse0 != Float32(_NEG_INF):
                 lse0 = lse0 + _log2_approx_ftz_f32(
                     Float32(1.0) + _exp2_approx_ftz_f32(sink0 - lse0)
                 )
@@ -3601,7 +3598,7 @@ def s7_epilogue(
                 lse0 = sink0
             if cutlass.const_expr(valid_hpb > 8):
                 sink1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
-                if lse1 > Float32(_NEG_INF):
+                if lse1 != Float32(_NEG_INF):
                     lse1 = lse1 + _log2_approx_ftz_f32(
                         Float32(1.0) + _exp2_approx_ftz_f32(sink1 - lse1)
                     )

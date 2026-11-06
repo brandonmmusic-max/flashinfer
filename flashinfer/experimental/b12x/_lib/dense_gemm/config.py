@@ -210,6 +210,7 @@ class _DenseGemmPolicy:
     split_k_slices: int
     split_k_atomic_bf16: bool
     large_m_unroll: bool
+    preserve_raster: bool = False
 
 
 def _max_active_clusters_for(
@@ -420,9 +421,9 @@ def _dense_gemm_policy_for(
             # unrolling and the unswizzled persistent scheduler.
             use_large_m_unroll = True
         elif expected_m >= 4096 and k >= 4096:
-            # At large M the 16-way persistent swizzle is the structural win
-            # for BK64. Coupling it off through large_m_unroll causes severe
-            # WO-B/Qwen cliffs (up to ~3x at M=8192).
+            # Keep two-way unroll as the large-M default. The prepared
+            # raster policy lets tuning compare four-way unroll without
+            # dropping persistent tile reuse.
             use_large_m_unroll = False
     if (
         generalize_block_fp8_split_k
@@ -445,6 +446,13 @@ def _dense_gemm_policy_for(
         split_k_atomic_bf16=(_B12X_DENSE_SPLITK_TURBO and allow_bf16_atomic_reduction),
         large_m_unroll=(
             ab_dtype == cutlass.Float8E4M3FN and use_large_m_unroll and l == 1
+        ),
+        preserve_raster=(
+            generalize_mxfp8_split_k
+            and mma_tiler_mn == (128, 128)
+            and tile_k == 64
+            and expected_m is not None
+            and expected_m >= 4096
         ),
     )
 

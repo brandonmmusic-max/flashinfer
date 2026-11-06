@@ -30,7 +30,7 @@ def test_warm_and_cold_selections_have_distinct_caches(tmp_path):
     cold = cache_identity({}, 0, cache_policy="cold")
     warm = cache_identity({}, 0, cache_policy="warm")
     assert default == cold
-    assert cold["measurement"] == "stream_gated_events_v1"
+    assert cold["measurement"] == "stream_gated_events_v2"
     cold_cache = SelectionCache(tmp_path, cold)
     warm_cache = SelectionCache(tmp_path, warm)
     assert cold_cache.path != warm_cache.path

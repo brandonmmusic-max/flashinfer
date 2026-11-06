@@ -17,13 +17,16 @@ from b12x.preparation._efficiency import (
 
 from ._kernel import SMEM_LIMIT, default_max_splits
 
-HEAD_DIMS = ((192, 128), (128, 128), (64, 64))
+HEAD_DIMS = ((256, 256), (192, 128), (128, 128), (64, 64))
 KV_DTYPES = ("bfloat16", "float8_e4m3fn")
 PAGE_SIZES = (64, 128)
-MAX_Q_PER_REQ = 8
+MAX_Q_PER_REQ = 16
 MAX_SPLITS = 128
 DESCALE_LAYOUTS = ("tensor", "request", "head")
-_CONSUMER_WARPS = 8
+
+
+def _consumer_warps(query):
+    return 4 if query.head_dim_vo == 256 else 8
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -111,21 +114,31 @@ def _head_split_choices(query: PagedDecodeQuery) -> tuple[int, ...]:
 
 def _rows_fit(query: PagedDecodeQuery, head_splits: int) -> bool:
     rows = (query.group_size // head_splits) * query.max_q_per_req
-    return (rows + 15) // 16 <= _CONSUMER_WARPS
+    return (rows + 15) // 16 <= _consumer_warps(query)
 
 
 def _stage_bytes(query: PagedDecodeQuery, stage_rows: int, num_stages: int) -> int:
     """Shared payload: the K/V stage ring, reused afterwards by the combine."""
     plane = stage_rows * 128  # one 128-byte TMA plane row per token
     if query.kv_dtype == "float8_e4m3fn":
-        planes = (query.head_dim_qk + 127) // 128 + 1
+        planes = (query.head_dim_qk + 127) // 128 + (query.head_dim_vo + 127) // 128
     else:
         planes = (query.head_dim_qk + query.head_dim_vo) // 64
     combine = (
-        _CONSUMER_WARPS * (query.head_dim_vo // 16) * 8 * 32
-        + 2 * _CONSUMER_WARPS * 2 * 32
+        _consumer_warps(query) * (query.head_dim_vo // 16) * 8 * 32
+        + 2 * _consumer_warps(query) * 2 * 32
     ) * 4
     return max(planes * num_stages * plane, combine)
+
+
+def _split_budget(query: PagedDecodeQuery, head_splits: int) -> int:
+    return default_max_splits(
+        query.max_batch,
+        query.num_kv_heads,
+        query.sm_count,
+        MAX_SPLITS,
+        head_splits=head_splits if query.head_dim_vo == 256 else 1,
+    )
 
 
 def default_config(query: PagedDecodeQuery, device=None) -> PagedDecodeConfig:
@@ -157,13 +170,7 @@ def default_config(query: PagedDecodeQuery, device=None) -> PagedDecodeConfig:
     )
     while stages > 2 and _stage_bytes(query, 16, stages) + 2048 > SMEM_LIMIT:
         stages -= 1
-    splits = (
-        default_max_splits(
-            query.max_batch, query.num_kv_heads, query.sm_count, MAX_SPLITS
-        )
-        if split
-        else 1
-    )
+    splits = _split_budget(query, hs) if split else 1
     return PagedDecodeConfig(
         split_kv=split,
         max_splits=splits,
@@ -218,7 +225,10 @@ def _parameters(query, device):
 
 def _materialize(query, device, choice):
     base = default_config(query, device)
-    return PagedDecodeConfig(**{**base.to_dict(), **dict(choice)})
+    config = {**base.to_dict(), **dict(choice)}
+    if query.head_dim_vo == 256 and config["split_kv"]:
+        config["max_splits"] = _split_budget(query, config["head_splits"])
+    return PagedDecodeConfig(**config)
 
 
 TUNING = TuningContract(
@@ -234,7 +244,7 @@ TUNING = TuningContract(
     validate_config=validate_config,
     default_config=default_config,
     knobs=(Knob(name="head_splits", values=None, binding=ParameterBinding.COMPILE),),
-    candidate_contract_version=2,
+    candidate_contract_version=6,
     parameters=_parameters,
     materialize=_materialize,
 )

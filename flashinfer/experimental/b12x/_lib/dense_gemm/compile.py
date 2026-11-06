@@ -408,6 +408,7 @@ class _DenseGemmLaunch:
             split_k_slices=policy.split_k_slices,
             split_k_atomic_bf16=policy.split_k_atomic_bf16,
             large_m_unroll=policy.large_m_unroll,
+            preserve_raster=policy.preserve_raster,
             # M=1 FP8 benefits from normal TMA loads for A/SFA on the
             # standalone tiny-M profile. Keep C on the direct epilogue path;
             # the normal TMA store did not beat it in the DSV4F TP=2 GPU5 run.
@@ -580,6 +581,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             split_k_slices=policy.split_k_slices,
             split_k_atomic_bf16=policy.split_k_atomic_bf16,
             large_m_unroll=policy.large_m_unroll,
+            preserve_raster=policy.preserve_raster,
             # The M=1 FP6 shape uses a 128-row MMA/TMA tile. In this lowering,
             # the narrow A/SFA/C tensor-map paths illegal-instruction instead
             # of relying on OOB handling, so keep them as explicit direct paths

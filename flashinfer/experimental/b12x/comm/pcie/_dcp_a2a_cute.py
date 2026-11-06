@@ -987,9 +987,52 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             signal14,
             signal15,
         )
+        gdim, _, _ = cute.arch.grid_dim()
+        self.gather(
+            local_input,
+            output,
+            staging,
+            signals,
+            batch,
+            local_heads,
+            packs_per_head,
+            slot_delta_256b,
+            Int32(gdim),
+        )
+
+    @cute.jit
+    def gather(
+        self,
+        local_input,
+        output,
+        staging,
+        signals,
+        batch,
+        local_heads,
+        packs_per_head,
+        slot_delta_256b,
+        gdim,
+    ):
+        (
+            staging0,
+            staging1,
+            staging2,
+            staging3,
+            staging4,
+            staging5,
+            staging6,
+            staging7,
+            staging8,
+            staging9,
+            staging10,
+            staging11,
+            staging12,
+            staging13,
+            staging14,
+            staging15,
+        ) = staging
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        gdim, _, _ = cute.arch.grid_dim()
         if cutlass.const_expr(self._device_slot_selection):
             generation = ld_relaxed_gpu_u32(
                 (signals[self._rank] + Int64(_GRAPH_EPOCH_INDEX)).toint()

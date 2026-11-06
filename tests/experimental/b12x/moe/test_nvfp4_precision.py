@@ -25,8 +25,11 @@ def weight_plan(**kwargs):
                 w13_layout=fused_moe.W13Layout.W13,
             ),
         ),
-        geometry=fused_moe.MoEGeometry(
-            num_experts=8, hidden_size=128, intermediate_size=128
+        geometry=kwargs.pop(
+            "geometry",
+            fused_moe.MoEGeometry(
+                num_experts=8, hidden_size=128, intermediate_size=128
+            ),
         ),
         activation=kwargs.pop(
             "activation",
@@ -64,6 +67,70 @@ def test_uniform_nvfp4_a16_requires_only_mma_packing():
                 required_packing=fused_moe.WeightPacking.SOURCE_NATIVE,
             ),
         )
+
+
+@pytest.mark.parametrize("value", [0, 1, "true"])
+def test_a4_prefill_preparation_requires_boolean_or_none(value):
+    with pytest.raises(TypeError, match="a4_prefill"):
+        replace(weight_plan().activation, mode="a16", a4_prefill=value)
+
+
+def test_a4_prefill_preparation_requires_compatible_packed_a16_weights():
+    activation = replace(weight_plan().activation, mode="a16", a4_prefill=True)
+    geometry = fused_moe.MoEGeometry(
+        num_experts=512, hidden_size=2560, intermediate_size=640
+    )
+    plan = weight_plan(activation=activation, geometry=geometry)
+    assert plan._impl.quant_modes == {"w4a16"}
+    assert plan.prepared_format.available_packings == {
+        fused_moe.WeightPacking.MMA_PACKED
+    }
+    with pytest.raises(ValueError, match="A16 weight preparation"):
+        replace(activation, mode="a4")
+    with pytest.raises(ValueError, match="compatible packed NVFP4"):
+        weight_plan(activation=activation)
+    with pytest.raises(ValueError, match="compatible packed NVFP4"):
+        weight_plan(
+            activation=activation,
+            geometry=geometry,
+            source=fused_moe.PackedSource(format="fp4_e8m0_k32"),
+        )
+    with pytest.raises(ValueError, match="uniform NVFP4 W4A16 requires mma_packed"):
+        weight_plan(
+            activation=activation,
+            geometry=geometry,
+            constraints=fused_moe.WeightPlanConstraints(
+                required_packing="source_native"
+            ),
+        )
+
+
+@pytest.mark.parametrize("invalid", ["missing", "zero", "nan", "empty"])
+def test_explicit_a4_prefill_rejects_missing_or_invalid_calibration(invalid):
+    plan = weight_plan(
+        activation=replace(weight_plan().activation, mode="a16", a4_prefill=True),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=8, hidden_size=256, intermediate_size=128
+        ),
+    )
+    scale = {
+        "missing": None,
+        "zero": torch.zeros(8),
+        "nan": torch.full((8,), torch.nan),
+        "empty": torch.empty(0),
+    }[invalid]
+    weights = fused_moe.PackedWeights(
+        w13=torch.empty((8, 256, 128), dtype=torch.uint8),
+        w2=torch.empty((8, 256, 64), dtype=torch.uint8),
+        w13_block_scales=torch.empty((8, 256, 16), dtype=torch.float8_e4m3fn),
+        w2_block_scales=torch.empty((8, 256, 8), dtype=torch.float8_e4m3fn),
+        w13_global_scales=torch.ones(8),
+        w2_global_scales=torch.ones(8),
+        input_scale=scale,
+        intermediate_scale=torch.ones(8),
+    )
+    with pytest.raises(ValueError, match="finite positive.*calibration"):
+        fused_moe.prepare_weights(plan=plan, weights=weights)
 
 
 @pytest.mark.parametrize(

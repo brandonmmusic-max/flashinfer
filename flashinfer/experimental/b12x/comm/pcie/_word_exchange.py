@@ -164,22 +164,57 @@ class WordExchange:
     def kernel(
         self, source, output, p0, p1, p2, p3, stride, offset, counter_offset, rows
     ):
+        grid_blocks, _, _ = cute.arch.grid_dim()
+        self.exchange(
+            source,
+            output,
+            p0,
+            p1,
+            p2,
+            p3,
+            stride,
+            offset,
+            counter_offset,
+            rows,
+            Int32(grid_blocks),
+        )
+
+    @cute.jit
+    def exchange(
+        self,
+        source,
+        output,
+        p0,
+        p1,
+        p2,
+        p3,
+        stride,
+        offset,
+        counter_offset,
+        rows,
+        grid_blocks,
+        prefetched=None,
+    ):
         data = (p0, p1, p2, p3)
         tx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
-        grid_blocks, _, _ = cute.arch.grid_dim()
         tx, bx = Int32(tx), Int32(bx)
         warp, lane = tx // Int32(32), tx % Int32(32)
         total = rows * Int32(self.row_words)
         count = (total + Int32(CHUNK_WORDS - 1)) // Int32(CHUNK_WORDS)
         local = data[self.rank].toint()
         first = bx * Int32(self.warps)
+        if cutlass.const_expr(prefetched is not None):
+            next_previous, next_first, next_second = prefetched
         while first < count:
             chunk = first + warp
             previous = Uint32(0)
             counter = counter_offset + Int64(chunk) * Int64(4)
             if chunk < count:
-                previous = _counter(local + counter)
+                if cutlass.const_expr(prefetched is not None):
+                    previous = next_previous
+                else:
+                    previous = _counter(local + counter)
             epoch = previous + Uint32(1)
             if previous == Uint32(0xFFFFFFFF):
                 for bank in cutlass.range_constexpr(2):
@@ -210,7 +245,10 @@ class WordExchange:
                 within = lane + Int32(item * 32)
                 word = chunk * Int32(CHUNK_WORDS) + within
                 if word < total:
-                    value = Uint32(cute.arch.load(source + Int64(word), Uint32))
+                    if cutlass.const_expr(prefetched is not None):
+                        value = next_first if item == 0 else next_second
+                    else:
+                        value = Uint32(cute.arch.load(source + Int64(word), Uint32))
                     packet = (Uint64(epoch) << Uint64(32)) | Uint64(value)
                     address_offset = Int64(
                         (chunk * Int32(self.world) + Int32(self.rank))
@@ -259,6 +297,19 @@ class WordExchange:
                     local + counter_offset + Int64(chunk) * Int64(4), epoch
                 )
             first += Int32(grid_blocks) * Int32(self.warps)
+            if cutlass.const_expr(prefetched is not None):
+                chunk = first + warp
+                word = chunk * Int32(CHUNK_WORDS) + lane
+                if chunk < count:
+                    next_previous = _counter(
+                        local + counter_offset + Int64(chunk) * Int64(4)
+                    )
+                if word < total:
+                    next_first = Uint32(cute.arch.load(source + Int64(word), Uint32))
+                if word + Int32(32) < total:
+                    next_second = Uint32(
+                        cute.arch.load(source + Int64(word + Int32(32)), Uint32)
+                    )
 
 
 @program_cache

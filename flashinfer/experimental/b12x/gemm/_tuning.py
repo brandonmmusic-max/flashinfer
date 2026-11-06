@@ -444,7 +444,9 @@ def knob_values(query):
         backend=("cutedsl",),
         tile_m=(16, 32, 64, 128),
         tile_n=(16, 32, 64, 128),
-        tile_k=(128, 256, 512)
+        tile_k=(128, 256, 512, 1024)
+        if query.recipe == "nvfp4"
+        else (128, 256, 512)
         if fp4
         else (64, 128, 256)
         if query.recipe in ("mxfp8", "tensor_fp8")
@@ -472,6 +474,50 @@ def validate_config(query, config, device):
             type(value) is type(allowed) and value == allowed for allowed in values
         ):
             raise ValueError(f"dense GEMM {name} is outside its recipe/caller domain")
+    if (
+        query.recipe == "nvfp4"
+        and (config.tile_m, config.tile_n) in ((16, 32), (16, 64))
+        and query.max_rows > 16
+    ):
+        raise ValueError("native FP4 M16 tiles require M<=16")
+    if (
+        query.recipe == "nvfp4"
+        and (config.tile_m, config.tile_n) == (16, 32)
+        and config.tile_k != 1024
+    ):
+        raise ValueError("native FP4 M16xN32 tiles require K1024 staging")
+    if (
+        query.recipe == "mxfp8"
+        and config.tile_k == 256
+        and (
+            query.max_rows > 16
+            or query.batch != 1
+            or (config.tile_m, config.tile_n) not in ((16, 64), (32, 64), (64, 64))
+            or config.load_path != "tma"
+            or config.swap_ab
+            or query.sfb_k_replicated
+        )
+    ):
+        raise ValueError(
+            "MXFP8 K256 requires single-batch M<=16, unswapped 16/32/64x64 "
+            "TMA tiles and independent scale blocks"
+        )
+    if config.tile_k == 1024 and (
+        query.recipe != "nvfp4"
+        or query.max_rows > 16
+        or query.batch != 1
+        or not (
+            (config.tile_m, config.tile_n) == (64, 64)
+            or (
+                (config.tile_m, config.tile_n) in ((16, 32), (16, 64))
+                and not config.swap_ab
+            )
+        )
+        or config.load_path != "tma"
+    ):
+        raise ValueError(
+            "NVFP4 K1024 requires single-batch M<=16 and supported TMA tiles"
+        )
     if config.programmatic_serialization and (
         config.load_path != "tma"
         or config.swap_ab
@@ -556,7 +602,7 @@ def validate_config(query, config, device):
         )
     if config.split_k_slices is not None and config.split_k_slices > 1:
         if (
-            query.max_rows > min(8, config.tile_m)
+            query.max_rows > min(16 if query.recipe == "mxfp8" else 8, config.tile_m)
             or query.batch != 1
             or config.swap_ab
             or query.in_features % (config.tile_k * config.split_k_slices)
@@ -736,13 +782,15 @@ TUNING = TuningContract(
     default_config=default_config,
     validate_query=_validate_query,
     validate_config=validate_config,
-    candidate_contract_version=8,
+    candidate_contract_version=36,
     knobs=(
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
         Knob(name="tile_m", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE),
         Knob(name="tile_n", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE),
         Knob(
-            name="tile_k", values=(64, 128, 256, 512), binding=ParameterBinding.COMPILE
+            name="tile_k",
+            values=(64, 128, 256, 512, 1024),
+            binding=ParameterBinding.COMPILE,
         ),
         Knob(
             name="load_path",

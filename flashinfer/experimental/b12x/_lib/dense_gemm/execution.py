@@ -399,9 +399,16 @@ def dense_gemm(
         not is_mxfp8 or plain_fp8 or block_fp8 or sf_dtype != "float8_e8m0fnu"
     ):
         raise ValueError("FP32 split-K reduction is qualified for MXFP8 only")
+    if (
+        ab_dtype == "float4_e2m1fn"
+        and sf_vec_size == 16
+        and mma_tiler_mn in ((16, 32), (16, 64))
+        and m > 16
+    ):
+        raise ValueError("native FP4 M16 tiles require M<=16")
     if _tile_k_override is not None:
         if ab_dtype == "float4_e2m1fn":
-            valid_tile_k = (128, 256, 512)
+            valid_tile_k = (128, 256, 512, 1024)
             format_name = "NVFP4"
         elif (
             ab_dtype == "float8_e4m3fn"
@@ -410,7 +417,7 @@ def dense_gemm(
             and sf_dtype == "float8_e8m0fnu"
             and sf_vec_size == 32
         ):
-            valid_tile_k = (64, 128)
+            valid_tile_k = (64, 128, 256)
             format_name = "MXFP8"
         else:
             raise ValueError(
@@ -418,14 +425,45 @@ def dense_gemm(
             )
         if _tile_k_override not in valid_tile_k or k % _tile_k_override:
             if format_name == "NVFP4":
-                requirement = "128, 256, or 512"
+                requirement = "128, 256, 512, or 1024"
             else:
-                requirement = "one of (64, 128)"
+                requirement = "one of (64, 128, 256)"
             raise ValueError(
                 f"{format_name} _tile_k_override must be {requirement} and divide "
                 f"logical K={k}, got {_tile_k_override}"
             )
+        if (
+            format_name == "MXFP8"
+            and _tile_k_override == 256
+            and (
+                m > 16
+                or l != 1
+                or mma_tiler_mn not in ((16, 64), (32, 64), (64, 64))
+                or load_path != "tma"
+                or swap_ab is not False
+                or sfb_k_replicated
+            )
+        ):
+            raise ValueError(
+                "MXFP8 K256 requires single-batch M<=16, unswapped 16/32/64x64 "
+                "TMA tiles and independent scale blocks"
+            )
+        if _tile_k_override == 1024 and (
+            sf_vec_size != 16
+            or m > 16
+            or l != 1
+            or not (
+                mma_tiler_mn == (64, 64)
+                or (mma_tiler_mn in ((16, 32), (16, 64)) and not swap_ab)
+            )
+            or load_path != "tma"
+        ):
+            raise ValueError(
+                "NVFP4 K1024 requires single-batch M<=16 and supported TMA tiles"
+            )
         tile_k = _tile_k_override
+    if ab_dtype == "float4_e2m1fn" and mma_tiler_mn == (16, 32) and tile_k != 1024:
+        raise ValueError("native FP4 M16xN32 tiles require K1024 staging")
     if _target_occupancy_override is not None:
         if ab_dtype != "float4_e2m1fn":
             raise ValueError(
@@ -705,9 +743,10 @@ def dense_gemm(
                 f"{_split_k_slices_override}"
             )
         if _split_k_slices_override > 1:
-            if m > 8 or m > mma_tiler_mn[0] or l != 1 or swap_ab:
+            row_limit = 16 if mxfp8_autotune else 8
+            if m > row_limit or m > mma_tiler_mn[0] or l != 1 or swap_ab:
                 raise ValueError(
-                    "split-K FP8 autotuning requires M<=8 within one M tile, "
+                    f"split-K FP8 autotuning requires M<={row_limit} within one M tile, "
                     f"L=1, and an unswapped plan; got M={m}, L={l}, "
                     f"tile={mma_tiler_mn}, swap_ab={swap_ab}"
                 )
@@ -737,6 +776,7 @@ def dense_gemm(
                 and allow_bf16_atomic_reduction
             ),
             large_m_unroll=policy.large_m_unroll,
+            preserve_raster=policy.preserve_raster,
         )
     if _large_m_unroll_override is not None:
         if not is_mxfp8 or is_mxfp6 or l != 1:
@@ -752,6 +792,7 @@ def dense_gemm(
             split_k_slices=policy.split_k_slices,
             split_k_atomic_bf16=policy.split_k_atomic_bf16,
             large_m_unroll=_large_m_unroll_override,
+            preserve_raster=policy.preserve_raster,
         )
     split_k_slices = policy.split_k_slices
     if swap_ab and split_k_slices != 1:
@@ -762,6 +803,7 @@ def dense_gemm(
             split_k_slices=1,
             split_k_atomic_bf16=False,
             large_m_unroll=policy.large_m_unroll,
+            preserve_raster=policy.preserve_raster,
         )
         split_k_slices = 1
     if is_mxfp6 and (policy.split_k_slices != 1 or policy.large_m_unroll):
@@ -995,6 +1037,7 @@ def dense_gemm(
             policy.split_k_slices,
             policy.split_k_atomic_bf16,
             policy.large_m_unroll,
+            policy.preserve_raster,
             load_path,
             swap_ab,
             sfb_k_reuse,
@@ -1104,6 +1147,7 @@ def dense_gemm(
             policy.split_k_slices,
             policy.split_k_atomic_bf16,
             policy.large_m_unroll,
+            policy.preserve_raster,
             load_path,
             swap_ab,
             sfb_k_reuse,

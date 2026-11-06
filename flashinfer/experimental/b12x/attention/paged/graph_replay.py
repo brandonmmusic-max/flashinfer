@@ -2098,6 +2098,15 @@ def update_prefill_graph_chunk_metadata(
     )
 
 
+def adaptive_verify_chunking(mode, plan):
+    return (
+        mode == "verify"
+        and plan.split_kv
+        and plan.window_left < 0
+        and not plan.msa_block_sparse
+    )
+
+
 def compile_graph_replay(binding: object) -> Mapping[str, object]:
     """Warm exactly the graph-replay scheduling kernels for a binding.
 
@@ -2371,7 +2380,7 @@ def compile_graph_replay(binding: object) -> Mapping[str, object]:
         PAGE_SIZE=int(scratch.page_size),
         WINDOW_LEFT=int(plan.window_left),
         SPLIT_KV=True,
-        ADAPTIVE_CHUNKING=False,
+        ADAPTIVE_CHUNKING=adaptive_verify_chunking(scratch.mode, plan),
         MSA_BLOCK_SPARSE=bool(plan.msa_block_sparse),
         FIXED_KV_CHUNK_SIZE=int(plan.kv_chunk_size),
         BLOCK_BATCH=triton.next_power_of_2(batch),

@@ -1665,3 +1665,46 @@ def test_a16_compute_warps_specialize_the_compile_key():
 def _patch_dense_compiler(monkeypatch, compile_fn):
     monkeypatch.setattr(dense_launch, "_get_compiled_dense_gemm", compile_fn)
     monkeypatch.setattr(dense_execution, "_get_compiled_dense_gemm", compile_fn)
+
+
+@pytest.mark.parametrize(
+    "expected_m,tile_k,generalize,expected",
+    [
+        (4096, 64, True, True),
+        (8, 64, True, False),
+        (4096, 128, True, False),
+        (4096, 64, False, False),
+    ],
+)
+def test_mxfp8_raster_policy_follows_prepared_geometry(
+    expected_m, tile_k, generalize, expected
+):
+    policies = {
+        _dense_gemm_policy_for(
+            m=live_m,
+            n=5120,
+            k=6144,
+            l=1,
+            ab_dtype=cutlass.Float8E4M3FN,
+            c_dtype=cutlass.BFloat16,
+            mma_tiler_mn=(128, 128),
+            cluster_shape_mn=(1, 1),
+            sm_count=LOW_SM,
+            tile_k=tile_k,
+            expected_m=expected_m,
+            generalize_mxfp8_split_k=generalize,
+        )
+        for live_m in (8, 4096)
+    }
+    assert len(policies) == 1
+    assert next(iter(policies)).preserve_raster is expected
+
+
+def test_raster_policy_participates_in_dense_compile_key():
+    from dataclasses import replace
+
+    policy = _DenseGemmPolicy(False, False, False, 1, False, True)
+    preserving = replace(policy, preserve_raster=True)
+    assert _compile_key_differences(
+        _bk64_launch(policy=policy), _bk64_launch(policy=preserving)
+    ) == [(policy, preserving)]

@@ -114,6 +114,17 @@ def compile_joint(family, world, rank, threads, max_blocks, ordinal):
     return get_joint_launcher(family, world, rank, threads, max_blocks, ordinal)
 
 
+@program_cache(scope="preparation")
+def compile_joint_cluster(
+    family, world, rank, threads, max_blocks, cluster_size, ordinal
+):
+    from ._joint_cluster_cute import get_joint_cluster_launcher
+
+    return get_joint_cluster_launcher(
+        family, world, rank, threads, max_blocks, cluster_size, ordinal
+    )
+
+
 class _JointExecutionState(_OneshotExecutionState):
     def __init__(self, query, runtime, launcher, workspace):
         self.query, self.runtime, self.launcher = query, runtime, launcher
@@ -121,9 +132,16 @@ class _JointExecutionState(_OneshotExecutionState):
         self._bound_input = None
         self.workspace = workspace
         call = query.call
-        self.profiles = profile_records(call["transport"], call["blocks"])
+        self.cluster_size = call.get("joint_cluster_size", 1)
+        self.profiles = profile_records(
+            call["transport"], call["blocks"], cluster_size=self.cluster_size
+        )
         selected = selected_profile(
-            call["transport"], call["blocks"], call["submode"], call["active_blocks"]
+            call["transport"],
+            call["blocks"],
+            call["submode"],
+            call["active_blocks"],
+            cluster_size=self.cluster_size,
         )
         self.selector = torch.tensor(
             [selected], dtype=torch.uint32, device=runtime.device
@@ -151,7 +169,11 @@ class _JointExecutionState(_OneshotExecutionState):
             owner="joint PCIe profile validation",
             exchange_group=self.runtime.exchange_group,
             setup=lambda: selected_profile(
-                call["transport"], call["blocks"], submode, active_blocks
+                call["transport"],
+                call["blocks"],
+                submode,
+                active_blocks,
+                cluster_size=self.cluster_size,
             ),
         )
         torch.cuda.synchronize(self.runtime.device)
@@ -164,6 +186,9 @@ class _JointExecutionState(_OneshotExecutionState):
                 call["blocks"],
                 submode,
                 active_blocks,
+            )
+            + (
+                () if self.cluster_size == 1 else (("cluster_size", self.cluster_size),)
             ),
         )
         self.selector.fill_(selected)
@@ -193,8 +218,16 @@ class _JointExecutionState(_OneshotExecutionState):
 
 def plan(query, *, runtime, override=None):
     call = query.call
+    cluster_size = call.get("joint_cluster_size", 1)
+    from ._joint_profile import validate_cluster_geometry
+
+    validate_cluster_geometry(call["blocks"], call["threads"], cluster_size)
     profile_index(
-        call["transport"], call["blocks"], call["submode"], call["active_blocks"]
+        call["transport"],
+        call["blocks"],
+        call["submode"],
+        call["active_blocks"],
+        cluster_size=cluster_size,
     )
     if call["dtype"] != "bfloat16" or not call["stage_input"]:
         raise ValueError("joint PCIe all-reduce requires staged BF16 input")
@@ -210,7 +243,20 @@ def plan(query, *, runtime, override=None):
     profiles_bytes = 4
 
     def materialize(selection, device):
-        launcher = load_programs(compile_joint(*args, device.ordinal))
+        if cluster_size == 1:
+            launcher = load_programs(compile_joint(*args, device.ordinal))
+        else:
+            from ._joint_cluster_cute import validate_cluster_residency
+
+            validate_cluster_geometry(
+                call["blocks"], call["threads"], cluster_size, device.identity
+            )
+            launcher = load_programs(
+                compile_joint_cluster(*args, cluster_size, device.ordinal)
+            )
+            validate_cluster_residency(
+                launcher, call["blocks"], call["threads"], cluster_size
+            )
         return _JointExecutionState(query, runtime, launcher, _workspace(runtime))
 
     return Plan(
@@ -219,8 +265,11 @@ def plan(query, *, runtime, override=None):
         override=override,
         _compile_jobs=lambda config, device: (
             CompileJob.create(
-                "b12x.comm.pcie._joint_preparation:compile_joint",
+                "b12x.comm.pcie._joint_preparation:compile_joint"
+                if cluster_size == 1
+                else "b12x.comm.pcie._joint_preparation:compile_joint_cluster",
                 *args,
+                *((cluster_size,) if cluster_size != 1 else ()),
                 CompileJob.DEVICE_ORDINAL,
             ),
         ),

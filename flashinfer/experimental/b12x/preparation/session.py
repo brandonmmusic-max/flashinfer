@@ -1333,6 +1333,10 @@ class PreparationJob:
             else contract.config_payload(configuration.pinned).to_dict(),
             "dependencies": dependencies,
             "candidate_programs": obligation.candidate_program_identity,
+            "measurement": {
+                "rounds": self.session.rounds,
+                "samples": self.session.samples,
+            },
         }
         if request.finalist_policy is not None:
             policy = request.finalist_policy
@@ -2533,8 +2537,6 @@ class PreparationJob:
                     local_candidates=len(local_candidates),
                     remaining=len(pending),
                 )
-                # The next batch's objects load while this batch measures.
-                self._prefetch(obligation, pending)
                 measure_started = time.perf_counter()
                 measurement = yield from self._measure(
                     trials,

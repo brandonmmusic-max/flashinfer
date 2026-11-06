@@ -21,6 +21,22 @@ from ..conftest import require_b12x
 # name: (q_heads, kv_heads, dim_qk, dim_vo, window_left, causal, sinks, fp8,
 #        max_batch, max_q_per_req, max_seq)
 CASES = {
+    "global_head256_batch1_bf16": (
+        24,
+        4,
+        256,
+        256,
+        -1,
+        True,
+        False,
+        False,
+        1,
+        16,
+        4112,
+    ),
+    "global_head256_batch1_fp8": (24, 4, 256, 256, -1, True, False, True, 1, 16, 4112),
+    "global_head256_bf16": (24, 4, 256, 256, -1, True, False, False, 2, 16, 4112),
+    "global_head256_fp8": (24, 4, 256, 256, -1, True, False, True, 2, 16, 4112),
     # Full-context GQA16 192/128 layer: split-KV at small batch.
     "global_verify": (16, 1, 192, 128, -1, True, False, False, 3, 8, 9000),
     "global_decode": (16, 1, 192, 128, -1, True, False, False, 24, 1, 5000),

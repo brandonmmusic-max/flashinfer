@@ -3051,6 +3051,23 @@ class UnifiedPrefillMGKernel:
                     if ci >= num_main_tiles:
                         index_base_ptr = get_ptr_as_int64(extra_row, split_cand_start)
 
+                if cutlass.const_expr(is_glm and not is_dsv41):
+                    entry = tid // Int32(4)
+                    if entry < Int32(t.bi):
+                        index = _ld_valid_global_index_i32(
+                            index_base_ptr, entry, split_cand_end - split_cand_start
+                        )
+                        if index < Int32(0):
+                            for chunk in cutlass.range_constexpr(
+                                L.kv_smem_stride // 16
+                            ):
+                                offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                st_shared_u32(
+                                    kv_fp8_b + entry * Int32(L.kv_smem_stride) + offset,
+                                    Uint32(0),
+                                )
+                    cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+
                 # Keep the rope operand anchored to the main-cache tensor. For
                 # dual-cache EXTRA tiles, a scalar byte delta re-points that
                 # operand at the extra cache without dynamically rebinding a

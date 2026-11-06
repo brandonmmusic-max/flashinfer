@@ -991,7 +991,13 @@ def blockscaled_mm(
 
             if _overlap(out, bias):
                 raise ValueError("out must not overlap bias")
-        if lhs.shape[-1] != rhs.in_features:
+        source_width = rhs.in_features * (
+            2
+            if plan is not None
+            and getattr(plan.query, "source_activation", "identity") == "swiglu_bf16"
+            else 1
+        )
+        if lhs.shape[-1] != source_width:
             raise ValueError("source logical K does not match the packed weight")
         from ._ops import linear
         from ._a16 import _weight_parts

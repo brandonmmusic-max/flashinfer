@@ -181,8 +181,9 @@ def _bind(xp, x, ids, wts, out, scratch, **kwargs):
 
 
 @pytest.mark.parametrize("tokens", (128, 4096))
+@pytest.mark.parametrize("explicit", (False, True))
 def test_declared_csf_precision_replays_after_scale_scratch_poisoning(
-    tokens, monkeypatch, tmp_path
+    tokens, explicit, monkeypatch, tmp_path
 ):
     device = require_b12x()
     from b12x.moe import fused_moe as moe
@@ -191,6 +192,18 @@ def test_declared_csf_precision_replays_after_scale_scratch_poisoning(
 
     _env(monkeypatch, True, 1)
     case = _make_case(16)
+    if explicit:
+        case["plan"] = moe.plan_weights(
+            source=case["plan"].source,
+            activation=replace(case["plan"].activation, a4_prefill=True),
+            geometry=case["plan"].geometry,
+        )
+        for name in (
+            "B12X_W4A16_A4_PREFILL",
+            "B12X_W4A16_A4_PREFILL_TERMS",
+            "B12X_W4A16_A4_PREFILL_WARPS",
+        ):
+            monkeypatch.setenv(name, "invalid")
     a1g, a2g = _scales(case)
     experts = _prepare(case, a1g, a2g, csf=True)
     x, ids, wts = _inputs(tokens, 24)
@@ -348,7 +361,7 @@ def _scales(case):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("terms", [1, 2])
+@pytest.mark.parametrize("terms,explicit", [(1, False), (2, False), (1, True)])
 @pytest.mark.parametrize(
     "hidden_size,intermediate_size,num_experts,top_k,swiglu_limit,after_silu",
     [
@@ -357,11 +370,13 @@ def _scales(case):
         (512, 256, 8, 2, 10.0, False),
         (512, 320, 8, 2, None, False),
         (2560, 320, 16, 10, None, False),
+        (2560, 640, 512, 10, None, False),
         (512, 256, 8, 2, 0.5, True),
     ],
 )
 def test_a4_prefill_matches_float64_emulation(
     terms,
+    explicit,
     hidden_size,
     intermediate_size,
     num_experts,
@@ -381,9 +396,17 @@ def test_a4_prefill_matches_float64_emulation(
             case["plan"].activation,
             swiglu_limit=swiglu_limit,
             swiglu_clamp_after_silu=after_silu,
+            a4_prefill=True if explicit else None,
         ),
         geometry=case["plan"].geometry,
     )
+    if explicit:
+        for name in (
+            "B12X_W4A16_A4_PREFILL",
+            "B12X_W4A16_A4_PREFILL_TERMS",
+            "B12X_W4A16_A4_PREFILL_WARPS",
+        ):
+            monkeypatch.setenv(name, "invalid")
     a1g, a2g = _scales(case)
     a1g = a1g * torch.linspace(0.9, 1.1, num_experts, device=a1g.device)
     a2g = a2g * torch.linspace(1.1, 0.9, num_experts, device=a2g.device)
@@ -449,6 +472,32 @@ def test_a4_prefill_requires_explicit_choice_and_calibrated_scales(monkeypatch):
             xp_plain, x, ids, wts, torch.empty_like(x), scratch_plain, a4_prefill=True
         )
         assert getattr(binding, "_impl", binding).a4_prefill_launches is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_explicit_a4_preparation_disable_rejects_a4_binding(monkeypatch):
+    require_b12x()
+    from b12x.moe import fused_moe as moe
+
+    _env(monkeypatch, True, 1)
+    case = _make_case(19)
+    case["plan"] = moe.plan_weights(
+        source=case["plan"].source,
+        activation=replace(case["plan"].activation, a4_prefill=False),
+        geometry=case["plan"].geometry,
+    )
+    experts = _prepare(case, *_scales(case))
+    assert not experts._impl.a4_prefill_scales
+    xp = _plan(experts, 128)
+    x, ids, wts = _inputs(128, 20)
+    scratch = tuple(
+        torch.empty(s.shape, dtype=s.dtype, device="cuda") for s in xp.scratch_specs()
+    )
+    out = torch.empty_like(x)
+    binding = _bind(xp, x, ids, wts, out, scratch, a4_prefill=False)
+    assert getattr(binding, "_impl", binding).a4_prefill_launches is None
+    with pytest.raises(ValueError, match="no compatible prepared launch"):
+        _bind(xp, x, ids, wts, out, scratch, a4_prefill=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -140,14 +140,11 @@ static bounce_ring_t* bounce_create(int device, unsigned depth, failure_t* failu
   ring->depth = depth;
   int error = posix_memalign((void**)&ring->buffers, IO_ALIGNMENT, BOUNCE_BYTES);
   if (error) goto failed;
-  if (!cuda_ok(cudaSetDevice(device), "select ring device", failure) ||
-      !cuda_ok(cudaHostRegister(ring->buffers, BOUNCE_BYTES, cudaHostRegisterDefault),
-               "pin checkpoint ring for CUDA copies", failure))
-    goto failed;
-  ring->registered = true;
-  if (!cuda_ok(cudaStreamCreateWithFlags(&ring->stream, cudaStreamNonBlocking),
-               "create checkpoint copy stream", failure))
-    goto failed;
+  /* Register the slots with io_uring before CUDA. io_uring takes a long-term pin, which
+     faults missing pages in outside CMA pageblocks and ZONE_MOVABLE and migrates present
+     pages out of them. The NVIDIA driver's pin is long-term only on x86: elsewhere, pages
+     it faults in can come from CMA, and a page it holds cannot migrate, so a later
+     io_uring registration fails with EFAULT. */
   error = io_uring_queue_init(BOUNCE_SLOTS, &ring->ring, 0);
   if (error < 0) {
     error = -error;
@@ -164,6 +161,14 @@ static bounce_ring_t* bounce_create(int device, unsigned depth, failure_t* failu
     error = -error;
     goto failed;
   }
+  if (!cuda_ok(cudaSetDevice(device), "select ring device", failure) ||
+      !cuda_ok(cudaHostRegister(ring->buffers, BOUNCE_BYTES, cudaHostRegisterDefault),
+               "pin checkpoint ring for CUDA copies", failure))
+    goto failed;
+  ring->registered = true;
+  if (!cuda_ok(cudaStreamCreateWithFlags(&ring->stream, cudaStreamNonBlocking),
+               "create checkpoint copy stream", failure))
+    goto failed;
   error = pthread_create(&ring->copier, NULL, bounce_copy_worker, ring);
   if (error) goto failed;
   ring->copier_started = true;

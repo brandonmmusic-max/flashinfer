@@ -255,13 +255,7 @@ def _state_merge_finite_normalized_lse_base2(
     other_o: cute.Tensor,
     other_lse: Float32,
 ) -> tuple[Float32, Float32]:
-    """Merge a normalized state when both the current input and its LSE are live.
-
-    The exact Laguna verifier schedule never exposes a neutral partial to the
-    merge kernel: inactive forward CTAs are outside ``num_index_sets`` and
-    every active chunk contains at least one visible key.  Keeping that fact
-    in the compiled entry removes two per-partial data-dependent branches.
-    """
+    """Merge normalized states whose partials each contain a visible key."""
     merged_m = attention_ops.fmax(state_m, other_lse)
     prev_scale = _exp2_approx_ftz_f32(state_m - merged_m)
     other_scale = _exp2_approx_ftz_f32(other_lse - merged_m)
@@ -894,10 +888,7 @@ class PagedPersistentMergeKernel:
                             bdy=self.bdy,
                             bytes_per_vec=bytes_per_vec,
                             num_smem_stages=self.num_smem_stages,
-                            finite_states=(
-                                self.analytic_laguna_verify_graph
-                                or self.finite_bf16_decode_graph
-                            ),
+                            finite_states=self.finite_bf16_decode_graph,
                             s_stage_partial=s_stage_partial,
                             s_stage_lse=s_stage_lse,
                             mV_partial=mV_partial,
@@ -921,10 +912,7 @@ class PagedPersistentMergeKernel:
                             bdy=self.bdy,
                             bytes_per_vec=bytes_per_vec,
                             num_smem_stages=self.num_smem_stages,
-                            finite_states=(
-                                self.analytic_laguna_verify_graph
-                                or self.finite_bf16_decode_graph
-                            ),
+                            finite_states=self.finite_bf16_decode_graph,
                             s_stage_partial=s_stage_partial,
                             s_stage_lse=s_stage_lse,
                             mV_partial=mV_partial,
@@ -948,10 +936,7 @@ class PagedPersistentMergeKernel:
                             bdy=self.bdy,
                             bytes_per_vec=bytes_per_vec,
                             num_smem_stages=self.num_smem_stages,
-                            finite_states=(
-                                self.analytic_laguna_verify_graph
-                                or self.finite_bf16_decode_graph
-                            ),
+                            finite_states=self.finite_bf16_decode_graph,
                             s_stage_partial=s_stage_partial,
                             s_stage_lse=s_stage_lse,
                             mV_partial=mV_partial,
@@ -975,10 +960,7 @@ class PagedPersistentMergeKernel:
                             bdy=self.bdy,
                             bytes_per_vec=bytes_per_vec,
                             num_smem_stages=self.num_smem_stages,
-                            finite_states=(
-                                self.analytic_laguna_verify_graph
-                                or self.finite_bf16_decode_graph
-                            ),
+                            finite_states=self.finite_bf16_decode_graph,
                             s_stage_partial=s_stage_partial,
                             s_stage_lse=s_stage_lse,
                             mV_partial=mV_partial,
@@ -1021,10 +1003,7 @@ class PagedPersistentMergeKernel:
                     head_dim=head_dim,
                     vec_size=self.vec_size,
                     bdy=self.bdy,
-                    finite_states=(
-                        self.analytic_laguna_verify_graph
-                        or self.finite_bf16_decode_graph
-                    ),
+                    finite_states=self.finite_bf16_decode_graph,
                 )
                 _state_normalize(state_o, state_d)
                 if const_expr(self.dtype is cutlass.BFloat16 and self.vec_size == 4):
@@ -1251,7 +1230,7 @@ class LagunaVerifierMergeKernel:
                     bdy=self.bdy,
                     bytes_per_vec=16,
                     num_smem_stages=self.num_smem_stages,
-                    finite_states=True,
+                    finite_states=False,
                     s_stage_partial=s_stage_partial,
                     s_stage_lse=s_stage_lse,
                     mV_partial=mV_partial,
@@ -1275,7 +1254,7 @@ class LagunaVerifierMergeKernel:
                     bdy=self.bdy,
                     bytes_per_vec=16,
                     num_smem_stages=self.num_smem_stages,
-                    finite_states=True,
+                    finite_states=False,
                     s_stage_partial=s_stage_partial,
                     s_stage_lse=s_stage_lse,
                     mV_partial=mV_partial,
@@ -1299,7 +1278,7 @@ class LagunaVerifierMergeKernel:
                     bdy=self.bdy,
                     bytes_per_vec=16,
                     num_smem_stages=self.num_smem_stages,
-                    finite_states=True,
+                    finite_states=False,
                     s_stage_partial=s_stage_partial,
                     s_stage_lse=s_stage_lse,
                     mV_partial=mV_partial,
@@ -1323,7 +1302,7 @@ class LagunaVerifierMergeKernel:
                     bdy=self.bdy,
                     bytes_per_vec=16,
                     num_smem_stages=self.num_smem_stages,
-                    finite_states=True,
+                    finite_states=False,
                     s_stage_partial=s_stage_partial,
                     s_stage_lse=s_stage_lse,
                     mV_partial=mV_partial,
@@ -1346,7 +1325,7 @@ class LagunaVerifierMergeKernel:
                 head_dim=self.head_dim,
                 vec_size=self.vec_size,
                 bdy=self.bdy,
-                finite_states=True,
+                finite_states=False,
             )
             _state_normalize(state_o, state_d)
             output_offset = (Int64(row_idx) * Int64(24) + Int64(head_idx)) * Int64(

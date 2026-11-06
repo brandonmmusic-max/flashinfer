@@ -131,6 +131,8 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             disjoint_output=not overlaps,
             word_aligned=value.data_ptr() % 4 == 0
             and (out is None or out.data_ptr() % 4 == 0),
+            pack_aligned=value.data_ptr() % 16 == 0
+            and (out is None or out.data_ptr() % 16 == 0),
         )
     elif surface.endswith("all_gather_pair"):
         first, second = (
@@ -346,6 +348,16 @@ def plan(
             raise ValueError("DCP query does not match its runtime owner")
     if invocation:
         raise ValueError("DCP invocation semantics belong in PcieQuery")
+
+    from ._gather_preparation import GATHER_MODES, plan as gather_plan
+
+    if (
+        query.surface.endswith(".all_gather_heads")
+        and query.call.get("gather_transport") in GATHER_MODES
+    ):
+        return gather_plan(
+            query, runtime=runtime, invocation=invocation, override=override
+        )
 
     def materialize(selection, device):
         launchers = load_programs(

@@ -63,7 +63,6 @@ if triton is not None and tl is not None:
             mask=valid,
             other=-float("inf"),
         )
-        vals = tl.where(vals != vals, -float("inf"), vals)
         lse_max = tl.max(vals, axis=0)
         safe_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
         lse_sum = tl.sum(tl.exp2(vals - safe_max), axis=0)
@@ -71,7 +70,6 @@ if triton is not None and tl is not None:
         out = lse_base2
         if natural_scale:
             out = out * 0.69314718055994530942
-        out = tl.where(lse_max == -float("inf"), -float("inf"), out)
         tl.store(out_lse_ptr + row * out_lse_stride_b + head * out_lse_stride_h, out)
 
 

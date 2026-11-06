@@ -1046,6 +1046,12 @@ class PCIeDCPA2A:
         )
         if threads != state.query.call["threads"]:
             raise ValueError("DCP threads differ from the prepared launcher")
+        from ._gather_preparation import SelectedGatherState
+
+        if isinstance(state, SelectedGatherState):
+            if block_limit != state.query.call["block_limit"]:
+                raise ValueError("DCP grid differs from the prepared gather")
+            return state.run_selected(local_input, out)
         if state.query.call.get("gather_transport") == "word_exchange":
             if str(local_input.dtype) != state.query.call["dtype"]:
                 raise ValueError(

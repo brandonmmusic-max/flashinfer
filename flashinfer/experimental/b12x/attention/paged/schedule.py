@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from b12x.preparation import require_prepared
-from .graph_replay import update_prefill_graph_chunk_metadata
+from .graph_replay import adaptive_verify_chunking, update_prefill_graph_chunk_metadata
 
 
 SCHEDULE_FIELDS = (
@@ -108,6 +108,7 @@ class PrefillSchedule:
             int(plan.window_left),
             bool(plan.msa_block_sparse),
             int(plan.kv_chunk_size),
+            adaptive_verify_chunking(caps.mode, plan),
         )
         return cls(schedule_counts(caps), geometry, caps.device, metadata)
 
@@ -137,9 +138,20 @@ class PrefillSchedule:
             raise ValueError(
                 "prepared prefill schedules require contiguous int32 live metadata"
             )
-        batch, q_tiles, chunks, rows, cta_q, gqa, page, split, window, msa, chunk = (
-            self.geometry
-        )
+        (
+            batch,
+            q_tiles,
+            chunks,
+            rows,
+            cta_q,
+            gqa,
+            page,
+            split,
+            window,
+            msa,
+            chunk,
+            adaptive,
+        ) = self.geometry
         update_prefill_graph_chunk_metadata(
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
@@ -155,6 +167,7 @@ class PrefillSchedule:
             window_left=window,
             msa_block_sparse=msa,
             fixed_kv_chunk_size=chunk,
+            adaptive_chunking=adaptive,
             _prepared=self.metadata,
         )
 

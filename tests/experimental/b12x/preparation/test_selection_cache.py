@@ -217,12 +217,15 @@ def test_decisions_track_silicon_rather_than_product_label(cache_device):
     assert cache_identity({"model": "a"}, 0) != cache_identity({"model": "a"}, 3)
 
 
+@pytest.mark.parametrize("previous_method", (None, "stream_gated_events_v1"))
 def test_stream_gated_measurement_keeps_prior_choices_in_a_separate_cache(
-    cache_device, tmp_path
+    cache_device, tmp_path, previous_method
 ):
     identity = cache_identity({}, 0)
-    assert identity["measurement"] == "stream_gated_events_v1"
+    assert identity["measurement"] == "stream_gated_events_v2"
     previous = {key: value for key, value in identity.items() if key != "measurement"}
+    if previous_method is not None:
+        previous["measurement"] = previous_method
     original = SelectionCache(tmp_path, previous)
     _save_choice(original)
     measured = SelectionCache(tmp_path, identity)

@@ -158,9 +158,13 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     with_lse: bool = False,
     balanced_scheduler: bool = False,
     enable_skip_softmax: bool = False,
+    kv_layout: str = "HND",
+    with_output_gate: bool = False,
 ):
     """Compile one sequence-length-independent packed-Q paged kernel."""
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
+    if kv_layout not in ("HND", "NHD"):
+        raise ValueError("kv_layout must be HND or NHD")
 
     from .fmha_prefill_fp8_tma import SM120FusedMultiHeadAttentionFP8ForwardTMA
 
@@ -177,6 +181,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         use_paged_kv=True,
         num_tokens_per_page=num_tokens_per_page,
         balanced_scheduler=balanced_scheduler,
+        paged_kv_layout=kv_layout,
     )
 
     sym_b = cute.sym_int()
@@ -197,6 +202,16 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         stride_order=(2, 1, 0),
         assumed_align=16,
     )
+    fake_output_gate = (
+        cute.runtime.make_fake_tensor(
+            out_ct,
+            (sym_total_q, num_qo_heads, head_dim),
+            stride=(cute.sym_int(), cute.sym_int(), 1),
+            assumed_align=16,
+        )
+        if with_output_gate
+        else None
+    )
     fake_lse = (
         make_fake_compact_tensor(
             cutlass.Float32,
@@ -208,7 +223,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         else None
     )
 
-    # HND paged KV pool: (num_pages, Hkv, num_tokens_per_page, D). Keep the
+    # Logical HND paged KV pool: (num_pages, Hkv, num_tokens_per_page, D). Keep the
     # outer page stride symbolic so a plane view from a combined
     # [num_pages, 2, Hkv, page_size, D] allocation has the same compiled ABI
     # as a standalone compact HND pool.
@@ -217,8 +232,8 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         (sym_num_pages, num_kv_heads, num_tokens_per_page, head_dim),
         stride=(
             cute.sym_int(),
-            num_tokens_per_page * head_dim,
-            head_dim,
+            num_tokens_per_page * head_dim if kv_layout == "HND" else head_dim,
+            head_dim if kv_layout == "HND" else num_kv_heads * head_dim,
             1,
         ),
         assumed_align=16,
@@ -228,8 +243,8 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         (sym_num_pages, num_kv_heads, num_tokens_per_page, head_dim),
         stride=(
             cute.sym_int(),
-            num_tokens_per_page * head_dim,
-            head_dim,
+            num_tokens_per_page * head_dim if kv_layout == "HND" else head_dim,
+            head_dim if kv_layout == "HND" else num_kv_heads * head_dim,
             1,
         ),
         assumed_align=16,
@@ -254,7 +269,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
 
     return cute.compile(
-        fmha,
+        fmha._launch if with_output_gate else fmha,
         fake_q,
         fake_k,
         fake_v,
@@ -270,6 +285,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         None,  # cu_seqlens_k
         cutlass.Int32(1),  # runtime max_seqlen_q placeholder
         True,  # use_pdl placeholder (runtime-dynamic)
+        *((fake_output_gate,) if with_output_gate else ()),
         options="--enable-tvm-ffi",
     )
 
@@ -351,21 +367,23 @@ def compile_sm120_fmha_fp8_paged_kernel(
     with_lse: bool = False,
     balanced_scheduler: bool = False,
     enable_skip_softmax: bool = False,
+    kv_layout: str = "HND",
+    with_output_gate: bool = False,
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
 
     from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
     device = torch.device(device)
-    if torch.cuda.get_device_capability(device) != (12, 0):
-        raise RuntimeError("SM120 PRIMS FMHA compilation requires SM120")
+    if torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
+        raise RuntimeError("Paged FP8 TMA FMHA compilation requires SM120 or SM121")
     kernel_name = (
-        f"paged_hnd_{_dtype_name(in_dtype)}_{_dtype_name(out_dtype)}"
+        f"paged_{kv_layout.lower()}_{_dtype_name(in_dtype)}_{_dtype_name(out_dtype)}"
         f"_hq{num_qo_heads}_hkv{num_kv_heads}_d{head_dim}"
         f"_causal{int(is_causal)}_kt{kv_tile}_qt{q_tile}"
         f"_page{num_tokens_per_page}_lse{int(with_lse)}"
         f"_balanced{int(balanced_scheduler)}"
-        f"_skip{int(enable_skip_softmax)}"
+        f"_skip{int(enable_skip_softmax)}_gate{int(with_output_gate)}"
     )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
@@ -384,6 +402,8 @@ def compile_sm120_fmha_fp8_paged_kernel(
             with_lse,
             balanced_scheduler,
             enable_skip_softmax,
+            kv_layout,
+            with_output_gate,
         ),
         extra_key_files=_cache_key_files(),
     )

@@ -63,6 +63,7 @@ from b12x._lib.intrinsics.memory import (
 )
 
 from ._selected_forward_config import SELECTION_WIDTH
+from .forward_paged import _mask_pv_bf16_pair, _max_nan_f32
 from .traits import PagedForwardTraits
 from ._controls import paged_control
 
@@ -748,7 +749,7 @@ def _apply_attention_sink_after_lse_scale(
         if sink_owner:
             old_m = m_frag[mma_q, row_slot]
             sink_m = Float32(mAttentionSinkBias[q_head_idx] * attention_ops.LOG2_E)
-            new_m = attention_ops.fmax(old_m, sink_m)
+            new_m = _max_nan_f32(old_m, sink_m)
             old_scale = (
                 Float32(0.0)
                 if old_m == -Float32.inf
@@ -1153,7 +1154,7 @@ def _donor_update_mdo_states_fp32_pack_p(
         m_prev = Float32(m_frag[0, row_slot])
         m_new = Float32(m_prev)
         for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
-            m_new = attention_ops.fmax(m_new, acc_S_mn[row_slot, c])
+            m_new = _max_nan_f32(m_new, acc_S_mn[row_slot, c])
         m_new = cute.arch.warp_reduction_max(m_new, threads_in_group=4)
 
         scale_term = (
@@ -2131,6 +2132,8 @@ def _literal_pv_mma_into_ofrag_bf16_packed(
     apply_v_scale: cutlass.Constexpr,
     debug_regs: cute.Tensor | None = None,
     mma_d_base: cutlass.Constexpr = 0,
+    *,
+    valid_rows,
 ):
     if const_expr(apply_v_scale):
         v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
@@ -2174,6 +2177,13 @@ def _literal_pv_mma_into_ofrag_bf16_packed(
                     debug_regs[dst_idx + 2] = b2
                 if dst_idx + 3 < dst_words:
                     debug_regs[dst_idx + 3] = b3
+            key = (
+                row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+            )
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 if const_expr(apply_v_scale):
                     d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
@@ -2241,6 +2251,8 @@ def _literal_pv_mma_into_ofrag_fp8_quarter_repack(
     num_mma_q,
     num_mma_kv,
     v_scale,
+    *,
+    valid_rows,
 ):
     for quarter in cutlass.range_constexpr(4):
         cute.arch.sync_threads()
@@ -2265,6 +2277,7 @@ def _literal_pv_mma_into_ofrag_fp8_quarter_repack(
             v_scale,
             True,
             mma_d_base=quarter * 4,
+            valid_rows=valid_rows,
         )
 
 
@@ -2285,6 +2298,8 @@ def _literal_pv_mma_into_ofrag_plane_bf16_packed(
     upcast_stride_plane,
     v_scale,
     debug_regs: cute.Tensor | None = None,
+    *,
+    valid_rows,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     for mma_kv in cutlass.range_constexpr(num_mma_kv):
@@ -2327,6 +2342,13 @@ def _literal_pv_mma_into_ofrag_plane_bf16_packed(
                     debug_regs[dst_idx + 2] = b2
                 if dst_idx + 3 < dst_words:
                     debug_regs[dst_idx + 3] = b3
+            key = (
+                row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+            )
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2429,6 +2451,8 @@ def _literal_pv_mma_into_ofrag_fp8_raw(
     upcast_stride_v,
     v_scale,
     debug_regs: cute.Tensor | None = None,
+    *,
+    valid_rows,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     v_offset = _permuted_offset_128b(
@@ -2476,6 +2500,13 @@ def _literal_pv_mma_into_ofrag_fp8_raw(
                     debug_regs[dst_idx + 2] = b2
                 if dst_idx + 3 < dst_words:
                     debug_regs[dst_idx + 3] = b3
+            key = (
+                row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+            )
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2526,6 +2557,8 @@ def _literal_pv_mma_into_ofrag_fp8_raw_m16n16_b8(
     num_mma_d_vo,
     upcast_stride_v,
     v_scale,
+    *,
+    valid_rows,
 ):
     """Use SM120's byte ldmatrix form to avoid software FP8 transpose."""
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
@@ -2562,6 +2595,13 @@ def _literal_pv_mma_into_ofrag_fp8_raw_m16n16_b8(
             )
             b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_0)
             b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_1)
+            key = (
+                row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+            )
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2606,6 +2646,8 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
     upcast_stride_plane,
     v_scale,
     debug_regs: cute.Tensor | None = None,
+    *,
+    valid_rows,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     upcast_stride_full = upcast_stride_plane * Int32(2)
@@ -2660,6 +2702,13 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
                 v_offset_cur = _advance_offset_by_column_128b_2(
                     v_offset_cur, mma_d // 2
                 )
+            key = (
+                row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+            )
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2706,6 +2755,8 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
     num_mma_d_vo,
     upcast_stride_v,
     v_scale,
+    *,
+    valid_rows,
 ):
     unit_scale = Uint32(0x7F7F7F7F)
     mask16 = Uint32(0xFFFF)
@@ -2798,10 +2849,25 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
                 b0_k1, b1_k1 = ldmatrix_m8n8x4_trans_right_half_b16(
                     _smem_addr_from_b128_offset(v_base_addr, v_offset_k1)
                 )
+            key = (
+                row_base
+                + warp_kv_idx * num_mma_kv * 16
+                + mma_pair * 32
+                + (lane % 4) * 2
+            )
+            b0_k0 = _mask_pv_bf16_pair(b0_k0, key, valid_rows)
+            b1_k0 = _mask_pv_bf16_pair(b1_k0, key + Int32(8), valid_rows)
+            b0_k1 = _mask_pv_bf16_pair(b0_k1, key + Int32(16), valid_rows)
+            b1_k1 = _mask_pv_bf16_pair(b1_k1, key + Int32(24), valid_rows)
             b0_k0 = frag_layout_swizzle_16b_to_8b_trans(b0_k0)
             b1_k0 = frag_layout_swizzle_16b_to_8b_trans(b1_k0)
             b0_k1 = frag_layout_swizzle_16b_to_8b_trans(b0_k1)
             b1_k1 = frag_layout_swizzle_16b_to_8b_trans(b1_k1)
+            # Pair K16 halves while keeping each register on one output column.
+            b0 = (b0_k0 & mask16) | ((b0_k1 & mask16) << shift16)
+            b1 = (b1_k0 & mask16) | ((b1_k1 & mask16) << shift16)
+            b2 = (b0_k0 >> shift16) | ((b0_k1 >> shift16) << shift16)
+            b3 = (b1_k0 >> shift16) | ((b1_k1 >> shift16) << shift16)
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
@@ -2813,8 +2879,8 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
                     a_regs[mma_q, 1],
                     a_regs[mma_q, 2],
                     a_regs[mma_q, 3],
-                    b0_k0,
-                    b0_k1,
+                    b0,
+                    b1,
                     unit_scale,
                     unit_scale,
                 )
@@ -2827,8 +2893,8 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
                     a_regs[mma_q, 1],
                     a_regs[mma_q, 2],
                     a_regs[mma_q, 3],
-                    b1_k0,
-                    b1_k1,
+                    b2,
+                    b3,
                     unit_scale,
                     unit_scale,
                 )
@@ -3037,23 +3103,19 @@ def _literal_update_mdo_states_fp32_pack_p(
             m_prev = Float32(m_frag[mma_q, row_slot])
             m_new = Float32(m_prev)
             for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                m_local = attention_ops.fmax(
-                    attention_ops.fmax(
+                m_local = _max_nan_f32(
+                    _max_nan_f32(
                         s_frag[mma_q, mma_kv, row_slot * 2 + 0],
                         s_frag[mma_q, mma_kv, row_slot * 2 + 1],
                     ),
-                    attention_ops.fmax(
+                    _max_nan_f32(
                         s_frag[mma_q, mma_kv, row_slot * 2 + 4],
                         s_frag[mma_q, mma_kv, row_slot * 2 + 5],
                     ),
                 )
-                m_new = attention_ops.fmax(m_new, m_local)
-            m_new = attention_ops.fmax(
-                m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2)
-            )
-            m_new = attention_ops.fmax(
-                m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1)
-            )
+                m_new = _max_nan_f32(m_new, m_local)
+            m_new = _max_nan_f32(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+            m_new = _max_nan_f32(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
             m_scaled = (
                 Float32(m_new * sm_scale_log2)
@@ -3776,6 +3838,41 @@ class PagedForwardKernel:
         return tile_token_base
 
     @cute.jit
+    def _msa_v_stage_valid_rows(
+        self,
+        mQ2KIndices: cute.Tensor | None,
+        mMSAUnionBlocks: cute.Tensor | None,
+        work_idx,
+        kv_head_idx,
+        q_row_idx,
+        tile_token_base,
+        packed_rows,
+        live_limit,
+    ):
+        # Valid-row count the V producer must pass for one stage tile.  The
+        # consumer trims the same packed span to the visible extent before
+        # masking scores; the producer has to trim identically so the
+        # zero-filled V copy covers rows past the visible length instead of
+        # loading them (P is exactly zero there, and 0 x NaN = NaN would
+        # otherwise reach the output accumulator).  live_limit is
+        # msa_tile_max_visible_len for union tiles, so only rows invalid for
+        # every query row of the tile are zeroed, and msa_visible_len for
+        # per-token selections.
+        if const_expr(self.msa_block_sparse):
+            tile_key_base = self._tile_key_base(
+                mQ2KIndices,
+                mMSAUnionBlocks,
+                work_idx,
+                kv_head_idx,
+                q_row_idx,
+                tile_token_base,
+            )
+            live_tokens = live_limit - tile_key_base
+            live_tokens = cutlass.select_(live_tokens < Int32(0), Int32(0), live_tokens)
+            return cutlass.select_(live_tokens < packed_rows, live_tokens, packed_rows)
+        return packed_rows
+
+    @cute.jit
     def _msa_union_row_has_block(
         self,
         mMSAUnionMasks: cute.Tensor | None,
@@ -3840,8 +3937,14 @@ class PagedForwardKernel:
                     if const_expr(self.msa_block_sparse)
                     else token_idx - page_iter * page_size
                 )
-            page_id = mPageTable[request_idx, page_iter]
-            row_valid = row_idx < valid_rows
+            if const_expr(self.msa_block_sparse and self.entries_per_block > 1):
+                row_valid = row_idx < valid_rows
+                page_id = Int32(0)
+                if row_valid:
+                    page_id = mPageTable[request_idx, page_iter]
+            else:
+                page_id = mPageTable[request_idx, page_iter]
+                row_valid = row_idx < valid_rows
             row_byte_base = (
                 (
                     Int64(Uint32(page_id)) * Int64(page_stride_bytes)
@@ -4340,6 +4443,11 @@ class PagedForwardKernel:
                     msa_visible_len,
                 )
             )
+            msa_live_limit = (
+                msa_tile_max_visible_len
+                if const_expr(self.msa_union_tile)
+                else msa_visible_len
+            )
             chunk_start = (
                 kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else Int32(0)
             )
@@ -4387,6 +4495,7 @@ class PagedForwardKernel:
             msa_tile_first_token = Int32(0)
             msa_tile_token_count = Int32(0)
             msa_tile_max_visible_len = Int32(0)
+            msa_live_limit = Int32(0)
             chunk_start = (
                 kv_window_start + kv_tile_idx * kv_chunk_size
                 if const_expr(self.split_kv)
@@ -5451,6 +5560,21 @@ class PagedForwardKernel:
                                 page_size,
                             )
                 if const_expr(not self.use_paged_k_tma):
+                    if const_expr(self.msa_block_sparse and self.entries_per_block > 1):
+                        k_valid_rows = self._msa_v_stage_valid_rows(
+                            mQ2KIndices,
+                            mMSAUnionBlocks,
+                            work_idx,
+                            kv_head_idx,
+                            msa_q_row_idx,
+                            prefetch_base,
+                            tile_tokens,
+                            msa_live_limit,
+                        )
+                        k_fill_zero = True
+                    else:
+                        k_valid_rows = tile_tokens
+                        k_fill_zero = False
                     self._async_copy_paged_tile_permuted_128b(
                         mKBytes,
                         mPageTable,
@@ -5467,12 +5591,22 @@ class PagedForwardKernel:
                         Int32(preload_stage_idx * k_stage_bytes),
                         lane,
                         warp_linear_idx,
-                        tile_tokens,
+                        k_valid_rows,
                         self.traits.upcast_stride_k,
-                        False,
+                        k_fill_zero,
                     )
                     cute.arch.cp_async_commit_group()
                 if const_expr(not self.use_paged_v_tma):
+                    v_valid_rows = self._msa_v_stage_valid_rows(
+                        mQ2KIndices,
+                        mMSAUnionBlocks,
+                        work_idx,
+                        kv_head_idx,
+                        msa_q_row_idx,
+                        prefetch_base,
+                        tile_tokens,
+                        msa_live_limit,
+                    )
                     self._async_copy_paged_tile_permuted_128b(
                         mVBytes,
                         mPageTable,
@@ -5489,7 +5623,7 @@ class PagedForwardKernel:
                         Int32(preload_stage_idx * v_stage_bytes),
                         lane,
                         warp_linear_idx,
-                        tile_tokens,
+                        v_valid_rows,
                         self.traits.upcast_stride_v,
                         True,
                     )
@@ -5514,6 +5648,21 @@ class PagedForwardKernel:
                     prefetch_base,
                     page_size,
                 )
+                if const_expr(self.msa_block_sparse and self.entries_per_block > 1):
+                    k_valid_rows = self._msa_v_stage_valid_rows(
+                        mQ2KIndices,
+                        mMSAUnionBlocks,
+                        work_idx,
+                        kv_head_idx,
+                        msa_q_row_idx,
+                        prefetch_base,
+                        tile_tokens,
+                        msa_live_limit,
+                    )
+                    k_fill_zero = True
+                else:
+                    k_valid_rows = tile_tokens
+                    k_fill_zero = False
                 self._async_copy_paged_tile_permuted_128b(
                     mKBytes,
                     mPageTable,
@@ -5530,9 +5679,19 @@ class PagedForwardKernel:
                     Int32(preload_stage_idx * k_stage_bytes),
                     lane,
                     warp_linear_idx,
-                    tile_tokens,
+                    k_valid_rows,
                     self.traits.upcast_stride_k,
-                    False,
+                    k_fill_zero,
+                )
+                v_valid_rows = self._msa_v_stage_valid_rows(
+                    mQ2KIndices,
+                    mMSAUnionBlocks,
+                    work_idx,
+                    kv_head_idx,
+                    msa_q_row_idx,
+                    prefetch_base,
+                    tile_tokens,
+                    msa_live_limit,
                 )
                 self._async_copy_paged_tile_permuted_128b(
                     mVBytes,
@@ -5550,7 +5709,7 @@ class PagedForwardKernel:
                     Int32(preload_stage_idx * v_stage_bytes),
                     lane,
                     warp_linear_idx,
-                    tile_tokens,
+                    v_valid_rows,
                     self.traits.upcast_stride_v,
                     True,
                 )
@@ -6341,16 +6500,6 @@ class PagedForwardKernel:
                             dst_word_offset,
                         )
                     _exit_thread()
-                if const_expr(self.kv_is_fp8 and self.traits.num_warps_kv > 1):
-                    if warp_kv_base >= tile_tokens:
-                        for mma_q in cutlass.range_constexpr(num_mma_q):
-                            for row_slot in cutlass.range_constexpr(2):
-                                m_frag[mma_q, row_slot] = Float32(-Float32.inf)
-                                d_frag[mma_q, row_slot] = Float32(1.0)
-                            for mma_d in cutlass.range_constexpr(num_mma_d_vo):
-                                for reg_id in cutlass.range_constexpr(8):
-                                    o_frag[mma_q, mma_d, reg_id] = Float32(0.0)
-
                 if const_expr(self.debug_dump_paged_kv_extend_state):
                     if (
                         work_idx == Int32(0)
@@ -6417,6 +6566,7 @@ class PagedForwardKernel:
 
                 next_tile_base = prefetch_base
                 next_tile_tokens = Int32(0)
+                next_v_tile_tokens = Int32(0)
                 next_page_idx = Int32(0)
                 if const_expr(not self.use_paged_k_tma):
                     # Every query warp reads the same K stage.  Do not let an
@@ -6430,6 +6580,16 @@ class PagedForwardKernel:
                                 chunk_end,
                             )
                             next_tile_tokens = next_tile_limit - next_tile_base
+                            next_v_tile_tokens = self._msa_v_stage_valid_rows(
+                                mQ2KIndices,
+                                mMSAUnionBlocks,
+                                work_idx,
+                                kv_head_idx,
+                                msa_q_row_idx,
+                                next_tile_base,
+                                next_tile_tokens,
+                                msa_live_limit,
+                            )
                             next_page_idx = self._tile_page_idx(
                                 mQ2KIndices,
                                 mMSAUnionBlocks,
@@ -6439,6 +6599,23 @@ class PagedForwardKernel:
                                 next_tile_base,
                                 page_size,
                             )
+                            if const_expr(
+                                self.msa_block_sparse and self.entries_per_block > 1
+                            ):
+                                k_valid_rows = self._msa_v_stage_valid_rows(
+                                    mQ2KIndices,
+                                    mMSAUnionBlocks,
+                                    work_idx,
+                                    kv_head_idx,
+                                    msa_q_row_idx,
+                                    next_tile_base,
+                                    next_tile_tokens,
+                                    msa_live_limit,
+                                )
+                                k_fill_zero = True
+                            else:
+                                k_valid_rows = next_tile_tokens
+                                k_fill_zero = False
                             self._async_copy_paged_tile_permuted_128b(
                                 mKBytes,
                                 mPageTable,
@@ -6455,9 +6632,9 @@ class PagedForwardKernel:
                                 Int32(consume_stage_idx * k_stage_bytes),
                                 lane,
                                 warp_linear_idx,
-                                next_tile_tokens,
+                                k_valid_rows,
                                 self.traits.upcast_stride_k,
-                                False,
+                                k_fill_zero,
                             )
                     elif const_expr(self.traits.num_warps_kv == 1):
                         if next_tile_base < chunk_end:
@@ -6467,6 +6644,16 @@ class PagedForwardKernel:
                                 chunk_end,
                             )
                             next_tile_tokens = next_tile_limit - next_tile_base
+                            next_v_tile_tokens = self._msa_v_stage_valid_rows(
+                                mQ2KIndices,
+                                mMSAUnionBlocks,
+                                work_idx,
+                                kv_head_idx,
+                                msa_q_row_idx,
+                                next_tile_base,
+                                next_tile_tokens,
+                                msa_live_limit,
+                            )
                             next_page_idx = self._tile_page_idx(
                                 mQ2KIndices,
                                 mMSAUnionBlocks,
@@ -6476,6 +6663,23 @@ class PagedForwardKernel:
                                 next_tile_base,
                                 page_size,
                             )
+                            if const_expr(
+                                self.msa_block_sparse and self.entries_per_block > 1
+                            ):
+                                k_valid_rows = self._msa_v_stage_valid_rows(
+                                    mQ2KIndices,
+                                    mMSAUnionBlocks,
+                                    work_idx,
+                                    kv_head_idx,
+                                    msa_q_row_idx,
+                                    next_tile_base,
+                                    next_tile_tokens,
+                                    msa_live_limit,
+                                )
+                                k_fill_zero = True
+                            else:
+                                k_valid_rows = next_tile_tokens
+                                k_fill_zero = False
                             self._async_copy_paged_tile_permuted_128b(
                                 mKBytes,
                                 mPageTable,
@@ -6492,9 +6696,9 @@ class PagedForwardKernel:
                                 Int32(consume_stage_idx * k_stage_bytes),
                                 lane,
                                 warp_linear_idx,
-                                next_tile_tokens,
+                                k_valid_rows,
                                 self.traits.upcast_stride_k,
-                                False,
+                                k_fill_zero,
                             )
 
                 if const_expr(self.use_paged_v_tma):
@@ -6566,6 +6770,7 @@ class PagedForwardKernel:
                                     tc_upcast_stride_plane,
                                     v_scale,
                                     mDebugU32,
+                                    valid_rows=tile_tokens,
                                 )
                             else:
                                 _literal_pv_mma_into_ofrag_fp8_raw(
@@ -6584,6 +6789,7 @@ class PagedForwardKernel:
                                     tc_upcast_stride_vo,
                                     v_scale,
                                     mDebugU32,
+                                    valid_rows=tile_tokens,
                                 )
                         elif const_expr(self.use_paged_v_tma):
                             v_stage_plane_offset = Int32(
@@ -6621,6 +6827,7 @@ class PagedForwardKernel:
                                 tc_upcast_stride_plane,
                                 v_scale,
                                 mDebugU32,
+                                valid_rows=tile_tokens,
                             )
                         else:
                             _literal_pv_mma_into_ofrag_bf16_packed(
@@ -6640,6 +6847,7 @@ class PagedForwardKernel:
                                 v_scale,
                                 True,
                                 mDebugU32,
+                                valid_rows=tile_tokens,
                             )
                     _exit_thread()
 
@@ -6690,6 +6898,7 @@ class PagedForwardKernel:
                         num_mma_d_vo,
                         self.traits.upcast_stride_v,
                         v_scale,
+                        valid_rows=tile_tokens,
                     )
                 elif const_expr(self.kv_is_fp8):
                     v_smem_base_addr = shared_ptr_to_u32(
@@ -6708,6 +6917,7 @@ class PagedForwardKernel:
                             num_mma_q,
                             num_mma_kv,
                             v_scale,
+                            valid_rows=tile_tokens,
                         )
                     elif const_expr(self.use_kv_repack):
                         if const_expr(self.use_kv_repack_fp16):
@@ -6724,6 +6934,7 @@ class PagedForwardKernel:
                                 tc_upcast_stride_vo,
                                 v_scale,
                                 False,
+                                valid_rows=tile_tokens,
                             )
                         else:
                             _literal_pv_mma_into_ofrag_bf16_packed(
@@ -6739,6 +6950,7 @@ class PagedForwardKernel:
                                 tc_upcast_stride_vo,
                                 v_scale,
                                 True,
+                                valid_rows=tile_tokens,
                             )
                     elif const_expr(self.use_paged_v_tma):
                         v_stage_plane_offset = Int32(
@@ -6767,6 +6979,7 @@ class PagedForwardKernel:
                             num_mma_d_vo,
                             tc_upcast_stride_plane,
                             v_scale,
+                            valid_rows=tile_tokens,
                         )
                     else:
                         if const_expr(self.use_m16n16_b8_fp8_pv):
@@ -6784,6 +6997,7 @@ class PagedForwardKernel:
                                 num_mma_d_vo,
                                 self.traits.upcast_stride_v,
                                 v_scale,
+                                valid_rows=tile_tokens,
                             )
                         else:
                             _literal_pv_mma_into_ofrag_fp8_raw(
@@ -6800,6 +7014,7 @@ class PagedForwardKernel:
                                 num_mma_d_vo,
                                 self.traits.upcast_stride_v,
                                 v_scale,
+                                valid_rows=tile_tokens,
                             )
                 else:
                     v_smem_base_addr = shared_ptr_to_u32(
@@ -6842,6 +7057,7 @@ class PagedForwardKernel:
                             num_mma_d_vo,
                             tc_upcast_stride_plane,
                             v_scale,
+                            valid_rows=tile_tokens,
                         )
                     else:
                         _literal_pv_mma_into_ofrag_bf16_packed(
@@ -6859,6 +7075,7 @@ class PagedForwardKernel:
                             tc_upcast_stride_vo,
                             v_scale,
                             True,
+                            valid_rows=tile_tokens,
                         )
 
                 if const_expr(
@@ -6950,6 +7167,23 @@ class PagedForwardKernel:
                                         page_size,
                                     )
                         if const_expr(not self.use_paged_k_tma):
+                            if const_expr(
+                                self.msa_block_sparse and self.entries_per_block > 1
+                            ):
+                                k_valid_rows = self._msa_v_stage_valid_rows(
+                                    mQ2KIndices,
+                                    mMSAUnionBlocks,
+                                    work_idx,
+                                    kv_head_idx,
+                                    msa_q_row_idx,
+                                    next_tile_base,
+                                    next_tile_tokens,
+                                    msa_live_limit,
+                                )
+                                k_fill_zero = True
+                            else:
+                                k_valid_rows = next_tile_tokens
+                                k_fill_zero = False
                             self._async_copy_paged_tile_permuted_128b(
                                 mKBytes,
                                 mPageTable,
@@ -6966,9 +7200,9 @@ class PagedForwardKernel:
                                 Int32(consume_stage_idx * k_stage_bytes),
                                 lane,
                                 warp_linear_idx,
-                                next_tile_tokens,
+                                k_valid_rows,
                                 self.traits.upcast_stride_k,
-                                False,
+                                k_fill_zero,
                             )
                             cute.arch.cp_async_commit_group()
                         if const_expr(not self.use_paged_v_tma):
@@ -6988,7 +7222,7 @@ class PagedForwardKernel:
                                 Int32(consume_stage_idx * v_stage_bytes),
                                 lane,
                                 warp_linear_idx,
-                                next_tile_tokens,
+                                next_v_tile_tokens,
                                 self.traits.upcast_stride_v,
                                 True,
                             )
@@ -7017,7 +7251,7 @@ class PagedForwardKernel:
                             Int32(consume_stage_idx * v_stage_bytes),
                             lane,
                             warp_linear_idx,
-                            next_tile_tokens,
+                            next_v_tile_tokens,
                             self.traits.upcast_stride_v,
                             True,
                         )
@@ -7042,7 +7276,7 @@ class PagedForwardKernel:
                             Int32(consume_stage_idx * v_stage_bytes),
                             lane,
                             warp_linear_idx,
-                            next_tile_tokens,
+                            next_v_tile_tokens,
                             self.traits.upcast_stride_v,
                             True,
                         )
@@ -7214,7 +7448,7 @@ class PagedForwardKernel:
                                     merged_m = part_m
                                     merged_d = part_d
                                 elif part_m != -Float32.inf:
-                                    new_m = attention_ops.fmax(merged_m, part_m)
+                                    new_m = _max_nan_f32(merged_m, part_m)
                                     merged_d = Float32(
                                         merged_d
                                         * _exp2_approx_ftz_f32(merged_m - new_m)

@@ -34,11 +34,25 @@ def _quantize(
     RECIPROCAL: tl.constexpr,
     GROUP: tl.constexpr,
     CHUNKS: tl.constexpr,
+    SWIGLU: tl.constexpr = False,
+    PAD_SCALE_ROWS: tl.constexpr = True,
 ):
     row = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1) * CHUNKS + tl.arange(0, CHUNKS)
     k = group[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
-    x = tl.load(X + row * INPUT_K + k, (row < M) & (k < INPUT_K), 0).to(tl.float32)
+    if SWIGLU:
+        gate = tl.load(X + row * (2 * INPUT_K) + k, (row < M) & (k < INPUT_K), 0).to(
+            tl.float32
+        )
+        up = tl.load(
+            X + row * (2 * INPUT_K) + INPUT_K + k, (row < M) & (k < INPUT_K), 0
+        ).to(tl.float32)
+        activated = (
+            (gate * tl.div_rn(1.0, 1.0 + tl.exp(-gate))).to(tl.bfloat16).to(tl.float32)
+        )
+        x = (activated * up).to(tl.bfloat16).to(tl.float32)
+    else:
+        x = tl.load(X + row * INPUT_K + k, (row < M) & (k < INPUT_K), 0).to(tl.float32)
     amax = tl.max(tl.abs(x), 1)
     if FP4:
         if GROUP == 32:
@@ -87,7 +101,7 @@ def _quantize(
         if (row == 0) & (tl.program_id(1) == 0):
             tl.store(ALPHA, 1.0)
     tl.store(S + _scale_offset(row, group, K // GROUP), sf_byte, group < K // GROUP)
-    if row == 0:
+    if PAD_SCALE_ROWS and row == 0:
         pad = (M // 128).to(tl.int64) * 128 + tl.arange(0, 128)
         tl.store(
             S + _scale_offset(pad[:, None], group[None, :], K // GROUP),

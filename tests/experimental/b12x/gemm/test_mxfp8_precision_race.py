@@ -225,3 +225,99 @@ def test_quantized_configuration_graph_output_and_scratch(provided, variant):
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
             assert_close(result, reference * sign)
         graph.reset()
+
+
+@pytest.mark.parametrize("atomic", [None, False])
+@pytest.mark.parametrize("provided", [False, True])
+@pytest.mark.parametrize("tile_k", [None, 128, 256])
+def test_packed_split_reduction_policy_capture(atomic, provided, tile_k):
+    from dataclasses import asdict
+    from b12x.gemm import DenseGemmConfig
+    from b12x.gemm.blockscaled._tuning import BlockscaledConfig
+
+    require_b12x()
+    m, n, k = 1, 16480, 5120
+    torch.manual_seed(9021)
+    source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.125
+    weight, decoded, _ = make_weight("mxfp8", n, k)
+    output = (
+        torch.empty(m, n, device="cuda", dtype=torch.bfloat16) if provided else None
+    )
+    options = {} if atomic is None else {"allow_bf16_atomic_reduction": atomic}
+    query = blockscaled.query_from_call(
+        source, weight, out=output, activation_mode="quantized", **options
+    )
+    assert query.allow_bf16_atomic_reduction is (atomic is None)
+    config = BlockscaledConfig(
+        mode="quantized",
+        dense_config=asdict(
+            DenseGemmConfig(
+                backend="cutedsl",
+                tile_m=64,
+                tile_n=64,
+                tile_k=tile_k,
+                load_path="tma",
+                swap_ab=False,
+                split_k_slices=4,
+                large_m_unroll=False,
+                target_occupancy=None,
+            )
+        ),
+    )
+    if tile_k is None:
+        config = BlockscaledConfig(mode="quantized")
+    plan = blockscaled.plan(query, override=config)
+    values, scales, gain, _ = _a16._weight_parts(weight)
+    with PreparationSession(
+        device=source.device, autotune=False, compile_workers=2
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="reduction-policy",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.run(source, values, scales, gain, out=output),
+                        owners=(source, weight, output),
+                    ),
+                ),
+            )
+        )
+        state = plan.prepared.state
+        assert state.dense.lowering.policy.split_k_atomic_bf16 is (atomic is None)
+        if atomic is False:
+            slices = state.dense.lowering.policy.split_k_slices
+            if slices > 1:
+                assert state.required_workspace >= slices * m * n * 4
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            result = blockscaled.mm(source, weight, out=output, plan=plan)
+        session.freeze()
+        for seed in (9021, 9022, 9023):
+            torch.manual_seed(seed)
+            source.normal_(0, 0.125)
+            encoded = quantize_mxfp8_rows_torch(source)
+            reference = (
+                dequantize_mxfp8_rows_torch(encoded.values, encoded.scale_rows)
+                @ decoded.T
+            )
+            result.fill_(float("nan"))
+            if state.workspace is not None:
+                state.workspace.fill_(255)
+            before = torch.cuda.memory_stats()
+            graph.replay()
+            torch.cuda.synchronize()
+            after = torch.cuda.memory_stats()
+            for key in (
+                "allocation.all.allocated",
+                "allocation.all.freed",
+                "segment.all.allocated",
+                "segment.all.freed",
+            ):
+                assert before[key] == after[key]
+            assert_close(result, reference)
+            if atomic is False:
+                first = result.clone()
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(result, first, rtol=0, atol=0)
+        graph.reset()

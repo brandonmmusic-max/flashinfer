@@ -769,6 +769,36 @@ def test_complete_race_cached_restart_and_disabled_precedence(tmp_path, monkeypa
     assert calls == [6, 6, 21, 27]
 
 
+@pytest.mark.parametrize("changed", ("rounds", "samples"))
+def test_completed_choices_preserve_measurement_settings(
+    tmp_path, monkeypatch, changed
+):
+    _deterministic_timer(monkeypatch)
+
+    def req():
+        return request(
+            name="race",
+            tuning=contract(),
+            benchmark=lambda state: PreparedCall(
+                run=lambda: state.value, produce=lambda: None
+            ),
+        )
+
+    settings = {"rounds": 3, "samples": 2}
+    with session(tmp_path, **settings) as engine:
+        assert engine.prepare((req(),)).selections["race"].source == "tuned"
+    with session(tmp_path, **settings) as engine:
+        assert engine.prepare((req(),)).selections["race"].source == "cached"
+    settings[changed] += 1
+    with session(tmp_path, **settings) as engine:
+        result = engine.prepare((req(),))
+        assert result.selections["race"].source == "tuned"
+        assert result.benchmarked_candidates == 3
+        assert result.restored_candidates == 0
+    with session(tmp_path, **settings) as engine:
+        assert engine.prepare((req(),)).selections["race"].source == "cached"
+
+
 def test_finalists_survive_cache_and_shared_aliases_without_changing_winner(
     tmp_path, monkeypatch
 ):
@@ -838,6 +868,51 @@ def test_race_batches_bound_residency_and_carry_the_champion(tmp_path, monkeypat
         assert result.coverage["batched"]["measured_count"] == 4
     assert batches == [(3, 6), (6, 12, 24)]
     assert sorted(trial_closed) == [3, 6, 12, 24]
+
+
+def test_prefetched_candidates_are_materialized_before_race_timing(
+    tmp_path, monkeypatch
+):
+    _deterministic_timer(monkeypatch)
+    pending_loads = set()
+    prefetched = []
+    original_prefetch = PreparationJob._prefetch
+    original_trial = PreparationJob._trial
+    original_measure = PreparationJob._measure
+
+    def prefetch(job, obligation, items):
+        indices = [index for index, _ in items[: job.session.race_batch]]
+        prefetched.extend(indices)
+        pending_loads.update(indices)
+        return original_prefetch(job, obligation, items)
+
+    def trial(job, obligation, index, assignment, config):
+        result = yield from original_trial(job, obligation, index, assignment, config)
+        pending_loads.discard(index)
+        return result
+
+    def measure(job, trials, **kwargs):
+        assert not pending_loads
+        return (yield from original_measure(job, trials, **kwargs))
+
+    monkeypatch.setattr(PreparationJob, "_prefetch", prefetch)
+    monkeypatch.setattr(PreparationJob, "_trial", trial)
+    monkeypatch.setattr(PreparationJob, "_measure", measure)
+    with session(tmp_path, race_batch=2) as engine:
+        result = engine.prepare(
+            (
+                request(
+                    name="batched",
+                    tuning=contract(values=(1, 2, 4, 8)),
+                    benchmark=lambda state: PreparedCall(
+                        run=lambda: state.value, produce=lambda: None
+                    ),
+                ),
+            )
+        )
+    assert prefetched == [0, 1, 2, 3]
+    assert result.benchmarked_candidates == 4
+    assert result.selections["batched"].config.width == 2
 
 
 def test_interrupted_race_restores_batches_and_retimes_the_champion(

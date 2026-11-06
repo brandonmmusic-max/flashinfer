@@ -337,6 +337,22 @@ def test_moe_a4_prefill_ignores_retired_token_threshold(enabled, monkeypatch):
         assert _preparation._control_snapshot() == baseline
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_explicit_moe_a4_preparation_ignores_environment_controls(enabled, monkeypatch):
+    from b12x.moe.fused_moe import _preparation
+
+    for name in (
+        "B12X_W4A16_A4_PREFILL",
+        "B12X_W4A16_A4_PREFILL_TERMS",
+        "B12X_W4A16_A4_PREFILL_WARPS",
+    ):
+        monkeypatch.setenv(name, "invalid")
+    controls = _preparation._control_snapshot(enabled)
+    assert controls["w4a16_a4_prefill_enabled"] is enabled
+    assert controls["w4a16_a4_prefill_terms"] == 1
+    assert controls["w4a16_a4_prefill_warps"] == 8
+
+
 @pytest.mark.parametrize("value", ["-1", "2", "true"])
 def test_moe_a4_prefill_enable_rejects_non_boolean_controls(value, monkeypatch):
     from b12x.moe.fused_moe import _preparation

@@ -30,6 +30,7 @@ from b12x.attention._shared.mla.traits import (
     resolve_unplanned_traits,
 )
 from b12x.testing.reference.helpers import dequantize_nvfp4_mla_nope
+from b12x.preparation import PreparedCall, PreparationSession
 
 from ..conftest import require_b12x as require_sm120
 
@@ -54,6 +55,30 @@ def _allocator_counters(device: torch.device) -> dict[str, int]:
     return {name: int(stats.get(name, 0)) for name in _ALLOCATOR_COUNTERS}
 
 
+@pytest.fixture
+def glm_next_preparation():
+    device = require_sm120()
+    with PreparationSession(device=device, compile_workers=0) as session:
+        yield session
+
+
+def _prepare_glm_next_cache_writer(session, latent, cache, slots):
+    writer = sparse_mla.plan_cache_writer(latent, cache, slots)
+    session.prepare(
+        (
+            writer.request(
+                name="glm-next-latent-cache",
+                prepare_call=lambda state: PreparedCall(
+                    run=lambda: state.run(latent, cache, slots),
+                    owners=(latent, cache, slots),
+                ),
+            ),
+        )
+    )
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer)
+    return writer
+
+
 def _glm_next_plan_and_binding(
     *,
     device: torch.device,
@@ -66,6 +91,7 @@ def _glm_next_plan_and_binding(
     page_size: int = _GLM_NEXT_PAGE_SIZE,
     return_lse: bool = False,
     lse_scale: str = "base2",
+    preparation: PreparationSession | None = None,
 ):
     is_nvfp4 = int(kv_cache.shape[-1]) == _GLM_NEXT_NVFP4_RECORD_BYTES
     plan = sparse_mla.plan(
@@ -94,9 +120,28 @@ def _glm_next_plan_and_binding(
         )
     )
     spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+    if preparation is not None:
+
+        def prepare_attention(state):
+            runtime = state.bind(
+                scratch=scratch,
+                q=q,
+                selected_indices=selected,
+                cache_seqlens_int32=cache_seqlens,
+                nsa_cache_seqlens_int32=active,
+                kv_cache=kv_cache,
+            )
+            return PreparedCall(
+                run=lambda: state.run(runtime, kv_cache=kv_cache), owners=(runtime,)
+            )
+
+        preparation.prepare(
+            (plan.request(name="glm-next-attention", prepare_call=prepare_attention),)
+        )
     binding = sparse_mla.bind(
         plan,
-        scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device),
+        scratch=scratch,
         q=q,
         selected_indices=selected,
         kv_cache=kv_cache,
@@ -1075,7 +1120,9 @@ def test_glm_next_prefill_routes_exact_or_aligned_selector_width(
 
 
 @torch.inference_mode()
-def test_glm_next_production_decode_matches_packed_record_oracle() -> None:
+def test_glm_next_production_decode_matches_packed_record_oracle(
+    glm_next_preparation,
+) -> None:
     device = require_sm120()
     generator = torch.Generator(device=device).manual_seed(20260827)
     rows, heads, num_records, width = 2, 8, 3 * _GLM_NEXT_PAGE_SIZE, 129
@@ -1097,7 +1144,7 @@ def test_glm_next_production_decode_matches_packed_record_oracle() -> None:
         device=device,
     )
     slots = torch.arange(num_records, dtype=torch.int64, device=device)
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    _prepare_glm_next_cache_writer(glm_next_preparation, latent, cache, slots)
 
     q = (
         torch.randn(
@@ -1123,7 +1170,9 @@ def test_glm_next_production_decode_matches_packed_record_oracle() -> None:
         active=active,
         cache_seqlens=cache_seqlens,
         return_lse=True,
+        preparation=glm_next_preparation,
     )
+    glm_next_preparation.freeze()
 
     actual, actual_lse = sparse_mla.run(binding)
     expected, expected_lse = sparse_mla_reference(
@@ -1143,7 +1192,9 @@ def test_glm_next_production_decode_matches_packed_record_oracle() -> None:
 
 
 @torch.inference_mode()
-def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
+def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle(
+    glm_next_preparation,
+) -> None:
     device = require_sm120()
     generator = torch.Generator(device=device).manual_seed(20260831)
     rows, heads, num_records, width = 2, 8, 3 * _GLM_NEXT_PAGE_SIZE, 129
@@ -1165,7 +1216,7 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
         device=device,
     )
     slots = torch.arange(num_records, dtype=torch.int64, device=device)
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    writer = _prepare_glm_next_cache_writer(glm_next_preparation, latent, cache, slots)
 
     q = (
         torch.randn(
@@ -1191,7 +1242,9 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
         active=active,
         cache_seqlens=cache_seqlens,
         return_lse=True,
+        preparation=glm_next_preparation,
     )
+    glm_next_preparation.freeze()
 
     actual, actual_lse = sparse_mla.run(binding)
     dequantized, _ = dequantize_nvfp4_mla_nope(
@@ -1213,8 +1266,8 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
     torch.testing.assert_close(actual_lse, expected_lse, rtol=0.0, atol=0.05)
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    with glm_next_preparation.capture(), torch.cuda.graph(graph):
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer)
         captured_output, captured_lse = sparse_mla.run(binding)
     assert captured_output.data_ptr() == actual.data_ptr()
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
@@ -1229,7 +1282,7 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
             torch.bfloat16
         )
     )
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer)
     dequantized, _ = dequantize_nvfp4_mla_nope(
         cache.view(num_records, _GLM_NEXT_NVFP4_RECORD_BYTES),
         latent_scale_offset=292,
@@ -1250,6 +1303,401 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
     assert _allocator_counters(device) == allocator_before
     _assert_glm_next_attention_close(captured_output, replay_expected)
     torch.testing.assert_close(captured_lse, replay_expected_lse, rtol=0.0, atol=0.05)
+    graph.reset()
+
+
+@pytest.mark.parametrize(
+    ("mode", "record_bytes", "heads"),
+    [
+        pytest.param("decode", 528, 8, id="decode-fp8-h8"),
+        pytest.param("decode", 528, 16, id="decode-fp8-h16"),
+        pytest.param("extend", 528, 8, id="extend-fp8-h8"),
+        pytest.param("extend", 528, 16, id="extend-fp8-h16"),
+        pytest.param("decode", 304, 8, id="decode-nvfp4-h8"),
+        pytest.param("decode", 304, 16, id="decode-nvfp4-h16"),
+        pytest.param("extend", 304, 8, id="extend-nvfp4-h8"),
+        pytest.param("extend", 304, 16, id="extend-nvfp4-h16"),
+    ],
+)
+@torch.inference_mode()
+def test_glm_next_ignores_nonfinite_unselected_records(
+    mode: str, record_bytes: int, heads: int
+) -> None:
+    _assert_glm_unselected_records_ignored(
+        mode=mode,
+        record_bytes=record_bytes,
+        heads=heads,
+        model_type=ModelType.GLM_NEXT,
+        latent_scale_per_token=record_bytes == _GLM_NEXT_NVFP4_RECORD_BYTES,
+    )
+
+
+@pytest.mark.parametrize(
+    "record_bytes",
+    (pytest.param(528, id="fp8"), pytest.param(304, id="nvfp4")),
+)
+@torch.inference_mode()
+def test_glm_next_natural_lse_ignores_nonfinite_unselected_records(
+    record_bytes: int,
+) -> None:
+    _assert_glm_unselected_records_ignored(
+        mode="decode",
+        record_bytes=record_bytes,
+        heads=8,
+        model_type=ModelType.GLM_NEXT,
+        latent_scale_per_token=record_bytes == _GLM_NEXT_NVFP4_RECORD_BYTES,
+        lse_scale="natural",
+    )
+
+
+@pytest.mark.parametrize("mode", ("decode", "extend"))
+@pytest.mark.parametrize("heads", (8, 16), ids=("h8", "h16"))
+@pytest.mark.parametrize(
+    ("record_bytes", "latent_scale_per_token"),
+    (
+        pytest.param(656, False, id="fp8-bf16rope"),
+        pytest.param(368, False, id="nvfp4-fp8rope-static"),
+        pytest.param(368, True, id="nvfp4-fp8rope-token-scale"),
+        pytest.param(432, False, id="nvfp4-bf16rope"),
+    ),
+)
+@torch.inference_mode()
+def test_glm_nsa_ignores_nonfinite_unselected_records(
+    mode: str, record_bytes: int, heads: int, latent_scale_per_token: bool
+) -> None:
+    _assert_glm_unselected_records_ignored(
+        mode=mode,
+        record_bytes=record_bytes,
+        heads=heads,
+        model_type=ModelType.GLM_NSA,
+        latent_scale_per_token=latent_scale_per_token,
+    )
+
+
+def _assert_glm_unselected_records_ignored(
+    *,
+    mode: str,
+    record_bytes: int,
+    heads: int,
+    model_type: ModelType,
+    latent_scale_per_token: bool,
+    lse_scale: str = "base2",
+) -> None:
+    device = require_sm120()
+    generator = torch.Generator(device=device).manual_seed(20261104)
+    rows, num_pages = 2, 4
+    width = 192 if mode == "decode" else 512
+    has_rope = model_type == ModelType.GLM_NSA
+    is_nvfp4 = record_bytes in (304, 368, 432)
+    fp8_rope = record_bytes == 368
+    head_dim = 576 if has_rope else _GLM_NEXT_HEAD_DIM
+    sm_scale = head_dim**-0.5 if has_rope else _GLM_NEXT_SM_SCALE
+    num_records = num_pages * _GLM_NEXT_PAGE_SIZE
+    latent = (
+        torch.randn(
+            (num_records, _GLM_NEXT_HEAD_DIM), generator=generator, device=device
+        )
+        / 4
+    ).to(torch.bfloat16)
+    cache = torch.zeros(
+        (num_pages, _GLM_NEXT_PAGE_SIZE, record_bytes),
+        dtype=torch.uint8,
+        device=device,
+    )
+    slots = torch.arange(num_records, dtype=torch.int64, device=device)
+    writer = None
+    if not has_rope:
+        writer = sparse_mla.plan_cache_writer(latent, cache, slots)
+    else:
+        rope = (
+            torch.randn((num_records, 64), generator=generator, device=device) / 4
+        ).to(torch.bfloat16)
+        if not is_nvfp4:
+            cache.copy_(pack_mla_kv_cache_reference(latent, rope).view_as(cache))
+        elif fp8_rope:
+            from b12x.attention._shared.mla.kv_cache import (
+                concat_and_cache_nvfp4_mla_fp8_rope,
+            )
+
+            concat_and_cache_nvfp4_mla_fp8_rope(
+                latent, rope, cache, slots, per_token_scale=latent_scale_per_token
+            )
+        else:
+            from b12x._lib.intrinsics.reference import pack_grouped_fp4_values
+            from b12x.testing.reference.helpers import ref_fp4_quant
+
+            quantized, scales = ref_fp4_quant(latent.float(), 1.0, block_size=16)
+            records = cache.view(num_records, record_bytes)
+            records[:, :256].copy_(
+                pack_grouped_fp4_values(quantized.unsqueeze(0)).squeeze(-1)
+            )
+            records[:, 256:288].copy_(scales.to(torch.float8_e4m3fn).view(torch.uint8))
+            records[:, 304:].copy_(rope.view(torch.uint8))
+    q = (
+        torch.randn((rows, heads, head_dim), generator=generator, device=device) / 4
+    ).to(torch.bfloat16)
+    physical_ids = (
+        torch.randperm(
+            num_records - _GLM_NEXT_PAGE_SIZE, generator=generator, device=device
+        )
+        + _GLM_NEXT_PAGE_SIZE
+    ).to(torch.int32)
+    selected = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+    selected[0, :129].copy_(physical_ids[:129])
+    active = torch.tensor([129, 0], dtype=torch.int32, device=device)
+    cache_seqlens = torch.tensor([num_records, 0], dtype=torch.int32, device=device)
+    plan = sparse_mla.plan(
+        sparse_mla.Caps(
+            device=device,
+            num_q_heads=heads,
+            max_q_rows=rows,
+            max_batch=rows,
+            max_width=width,
+            softmax_scale=sm_scale,
+            max_kv_rows=129,
+            kv_dtype=torch.uint8,
+            head_dim=head_dim,
+            v_head_dim=_GLM_NEXT_HEAD_DIM,
+            page_size=_GLM_NEXT_PAGE_SIZE,
+            model_type=model_type,
+            scale_format=(
+                ScaleFormat.NVFP4_E4M3 if is_nvfp4 else ScaleFormat.ARBITRARY_FP32
+            ),
+            cache_record_bytes=record_bytes,
+            fp8_rope=fp8_rope,
+            latent_scale_per_token=latent_scale_per_token,
+            mode=mode,
+            return_lse=True,
+            lse_scale=lse_scale,
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+
+    def prepare_attention(state):
+        runtime = state.bind(
+            scratch=scratch,
+            q=q,
+            selected_indices=selected,
+            cache_seqlens_int32=cache_seqlens,
+            nsa_cache_seqlens_int32=active,
+            kv_cache=cache,
+        )
+        return PreparedCall(
+            run=lambda: state.run(runtime, kv_cache=cache), owners=(runtime,)
+        )
+
+    requests = [
+        plan.request(
+            name="glm-unselected-records",
+            prepare_call=prepare_attention,
+        )
+    ]
+    if writer is not None:
+        requests.insert(
+            0,
+            writer.request(
+                name="glm-next-latent-cache",
+                prepare_call=lambda state: PreparedCall(
+                    run=lambda: state.run(latent, cache, slots),
+                    owners=(latent, cache, slots),
+                ),
+            ),
+        )
+    with PreparationSession(device=device, compile_workers=0) as session:
+        session.prepare(requests)
+        if writer is not None:
+            sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer)
+        clean_cache = cache.clone()
+        binding = sparse_mla.bind(
+            plan,
+            scratch=scratch,
+            q=q,
+            kv_cache=cache,
+            selected_indices=selected,
+            cache_lengths=cache_seqlens,
+            selected_lengths=active,
+        )
+        if not is_nvfp4:
+            dequantized = unpack_mla_kv_cache_reference(
+                clean_cache.view(num_records, 1, record_bytes)
+            )[:, 0]
+            poison_fields = ("payload", "scales")
+        else:
+            dequantized, _ = dequantize_nvfp4_mla_nope(
+                clean_cache.view(num_records, record_bytes),
+                latent_scale_offset=292 if latent_scale_per_token else None,
+            )
+            poison_fields = ("payload", "group_scales")
+            if latent_scale_per_token:
+                poison_fields += ("latent_scale",)
+            if has_rope:
+                records = clean_cache.view(num_records, record_bytes)
+                if fp8_rope:
+                    rope = records[:, 304:].contiguous().view(torch.float8_e4m3fn)
+                    rope_scale = records[:, 288:292].contiguous().view(torch.float32)
+                    rope = rope.float() * rope_scale
+                else:
+                    rope = records[:, 304:].contiguous().view(torch.bfloat16).float()
+                dequantized = torch.cat((dequantized, rope), dim=-1)
+        if has_rope:
+            poison_fields += ("rope",)
+            if fp8_rope:
+                poison_fields += ("rope_scale",)
+        poison_fields += ("both",)
+
+        sparse_mla.run(binding)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            captured_output, captured_lse = sparse_mla.run(binding)
+        session.freeze()
+        expected_cache = cache.clone()
+
+        def replay() -> torch.Tensor:
+            expected_cache.copy_(cache)
+            allocator_before = _allocator_counters(device)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert _allocator_counters(device) == allocator_before
+            assert torch.equal(cache, expected_cache), "attention modified its KV cache"
+            return captured_output
+
+        def poison(records: torch.Tensor, field: str) -> None:
+            if field in ("payload", "both"):
+                payload_bytes = 256 if is_nvfp4 else 512
+                records[:, :payload_bytes].fill_(0x7F)
+            if not is_nvfp4:
+                if field in ("scales", "both"):
+                    records[:, 512:528].view(torch.float32).fill_(float("nan"))
+            else:
+                if field in ("group_scales", "both"):
+                    records[:, 256:288].fill_(0x7F)
+                if latent_scale_per_token and field in ("latent_scale", "both"):
+                    records[:, 292:296].view(torch.float32).fill_(float("nan"))
+            if has_rope and field in ("rope", "both"):
+                rope_start = 304 if is_nvfp4 else 528
+                if fp8_rope:
+                    records[:, rope_start:].fill_(0x7F)
+                else:
+                    records[:, rope_start:].view(torch.bfloat16).fill_(float("nan"))
+            if fp8_rope and field in ("rope_scale", "both"):
+                records[:, 288:292].view(torch.float32).fill_(float("nan"))
+
+        failures = []
+        try:
+            for count in (1, 33, 63, 64, 65, 129, 0):
+                for hole in (False, True) if count > 1 else (False,):
+                    selected.fill_(-1)
+                    selected[0, :count].copy_(physical_ids[:count])
+                    if hole:
+                        selected[0, 1] = -1
+                    active[0] = count
+                    cache.copy_(clean_cache)
+                    clean = replay().clone()
+                    clean_lse = captured_lse.clone()
+                    case = (
+                        f"model_type={model_type} mode={mode} "
+                        f"record_bytes={record_bytes} heads={heads} "
+                        f"latent_scale_per_token={latent_scale_per_token} "
+                        f"lse_scale={lse_scale} "
+                        f"selected_count={count} hole={hole}"
+                    )
+                    assert torch.isfinite(clean).all(), (
+                        f"non-finite clean output: {case}"
+                    )
+                    assert torch.equal(replay(), clean), f"nonrepeatable output: {case}"
+                    assert torch.equal(captured_lse, clean_lse), (
+                        f"nonrepeatable LSE: {case}"
+                    )
+                    expected, expected_lse = _sparse_attention_reference(
+                        q_all=q,
+                        k_all=dequantized,
+                        v_all=dequantized[:, :_GLM_NEXT_HEAD_DIM],
+                        page_table_1=selected,
+                        active_token_counts=active,
+                        sm_scale=sm_scale,
+                        return_lse=True,
+                    )
+                    if lse_scale == "natural":
+                        expected_lse = expected_lse * 0.6931471805599453
+                    if count:
+                        _assert_glm_next_attention_close(clean, expected)
+                    else:
+                        assert torch.equal(clean, expected)
+                    assert torch.equal(
+                        torch.isneginf(clean_lse), torch.isneginf(expected_lse)
+                    ), f"incorrect empty-row LSE: {case}"
+                    torch.testing.assert_close(
+                        clean_lse, expected_lse, rtol=0.0, atol=0.05
+                    )
+                    for field in poison_fields:
+                        cache.copy_(clean_cache)
+                        poison(cache[0], field)
+                        observed = replay()
+                        finite = bool(torch.isfinite(observed).all())
+                        unchanged = bool(torch.equal(observed, clean))
+                        lse_unchanged = bool(torch.equal(captured_lse, clean_lse))
+                        print(
+                            f"{case} poison={field} finite={finite} "
+                            f"unchanged={unchanged} lse_unchanged={lse_unchanged}",
+                            flush=True,
+                        )
+                        if not finite or not unchanged or not lse_unchanged:
+                            failures.append(
+                                f"{case} poison={field}: "
+                                f"finite={finite}, unchanged={unchanged}, "
+                                f"lse_unchanged={lse_unchanged}"
+                            )
+
+            cache.copy_(clean_cache)
+            live_id = int(physical_ids[0].item())
+            selected.fill_(-1)
+            selected[0, 0] = live_id
+            active[0] = 1
+            live_record = cache.view(num_records, record_bytes)[live_id : live_id + 1]
+            live_clean = replay().clone()
+            live_clean_lse = captured_lse.clone()
+            assert torch.isfinite(live_clean).all()
+            assert torch.isfinite(live_clean_lse[0]).all()
+            assert torch.isneginf(live_clean_lse[1]).all()
+            assert torch.equal(replay(), live_clean)
+            assert torch.equal(captured_lse, live_clean_lse)
+            live_nan_by_field = {}
+            live_nan_lse_by_field = {}
+            for field in poison_fields:
+                cache.copy_(clean_cache)
+                poison(live_record, field)
+                live_output = replay()[0]
+                live_nan_by_field[field] = not bool(torch.isfinite(live_output).all())
+                live_nan_lse_by_field[field] = bool(torch.isnan(captured_lse[0]).all())
+                print(
+                    f"model_type={model_type} mode={mode} "
+                    f"record_bytes={record_bytes} heads={heads} "
+                    f"latent_scale_per_token={latent_scale_per_token} "
+                    f"lse_scale={lse_scale} "
+                    f"live_id={live_id} poison={field} "
+                    f"live_nan_visible={live_nan_by_field[field]} "
+                    f"live_nan_lse_visible={live_nan_lse_by_field[field]} "
+                    f"unchanged={torch.equal(live_output, live_clean[0])} "
+                    f"all_zero={bool(torch.count_nonzero(live_output) == 0)} "
+                    f"output_sample={live_output[0, :8].tolist()}",
+                    flush=True,
+                )
+            live_field = "payload"
+            if is_nvfp4:
+                live_field = (
+                    "latent_scale" if latent_scale_per_token else "group_scales"
+                )
+            live_nan_visible = live_nan_by_field[live_field]
+            assert live_nan_visible, "attention sanitized a selected non-finite record"
+            for field, visible in live_nan_lse_by_field.items():
+                if is_nvfp4 and field == "payload":
+                    continue
+                assert visible, f"attention sanitized selected non-finite QK: {field}"
+        finally:
+            graph.reset()
+
+        assert not failures, "\n".join(failures)
 
 
 @torch.inference_mode()
@@ -1377,7 +1825,9 @@ def test_glm_next_hybrid_manager_page_replays_across_page_boundary() -> None:
 
 
 @torch.inference_mode()
-def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
+def test_glm_next_production_prefill_2051_replays_without_allocation(
+    glm_next_preparation,
+) -> None:
     device = require_sm120()
     generator = torch.Generator(device=device).manual_seed(20260828)
     rows, heads = 1, 8
@@ -1402,7 +1852,7 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
         device=device,
     )
     slots = torch.arange(num_records, dtype=torch.int64, device=device)
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    writer = _prepare_glm_next_cache_writer(glm_next_preparation, latent, cache, slots)
 
     q = (
         torch.randn(
@@ -1427,7 +1877,9 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
         cache_seqlens=cache_seqlens,
         mode="extend",
         return_lse=True,
+        preparation=glm_next_preparation,
     )
+    glm_next_preparation.freeze()
 
     actual, actual_lse = sparse_mla.run(binding)
     expected, expected_lse = sparse_mla_reference(
@@ -1448,8 +1900,8 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
     assert actual_lse.data_ptr() == binding.runtime.scratch.final_lse.data_ptr()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    with glm_next_preparation.capture(), torch.cuda.graph(graph):
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer)
         captured_output, captured_lse = sparse_mla.run(binding)
     assert captured_output.data_ptr() == actual.data_ptr()
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
@@ -1480,10 +1932,13 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
     assert _allocator_counters(device) == allocator_before
     _assert_glm_next_attention_close(captured_output, replay_expected)
     torch.testing.assert_close(captured_lse, replay_expected_lse, rtol=0.0, atol=0.05)
+    graph.reset()
 
 
 @torch.inference_mode()
-def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None:
+def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle(
+    glm_next_preparation,
+) -> None:
     device = require_sm120()
     generator = torch.Generator(device=device).manual_seed(20260831)
     rows, heads = 1, 8
@@ -1508,7 +1963,7 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
         device=device,
     )
     slots = torch.arange(num_records, dtype=torch.int64, device=device)
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    writer = _prepare_glm_next_cache_writer(glm_next_preparation, latent, cache, slots)
 
     q = (
         torch.randn(
@@ -1533,7 +1988,9 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
         cache_seqlens=cache_seqlens,
         mode="extend",
         return_lse=True,
+        preparation=glm_next_preparation,
     )
+    glm_next_preparation.freeze()
 
     actual, actual_lse = sparse_mla.run(binding)
     dequantized, _ = dequantize_nvfp4_mla_nope(
@@ -1555,8 +2012,8 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
     torch.testing.assert_close(actual_lse, expected_lse, rtol=0.0, atol=0.05)
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    with glm_next_preparation.capture(), torch.cuda.graph(graph):
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer)
         captured_output, captured_lse = sparse_mla.run(binding)
     assert captured_output.data_ptr() == actual.data_ptr()
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
@@ -1571,7 +2028,7 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
             torch.bfloat16
         )
     )
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer)
     replay_dequantized, _ = dequantize_nvfp4_mla_nope(
         cache.view(num_records, _GLM_NEXT_NVFP4_RECORD_BYTES),
         latent_scale_offset=292,
@@ -1592,6 +2049,7 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
     assert _allocator_counters(device) == allocator_before
     _assert_glm_next_attention_close(captured_output, replay_expected)
     torch.testing.assert_close(captured_lse, replay_expected_lse, rtol=0.0, atol=0.05)
+    graph.reset()
 
 
 @torch.inference_mode()

@@ -406,14 +406,14 @@ def _merge_split_partials(
         d = Float32(0.0)
         for j in cutlass.range_constexpr(_MERGE_LSE_PER_LANE):
             w_j = Float32(0.0)
-            if lane_w[j] > Float32(_NEG_INF):
+            if lane_w[j] != Float32(_NEG_INF):
                 w_j = _exp2_approx_ftz_f32(lane_w[j] - m)
             lane_w[j] = w_j
             d = d + w_j
         for off in (16, 8, 4, 2, 1):
             d = d + cute.arch.shuffle_sync_bfly(d, offset=off)
         scale = Float32(0.0)
-        if d > Float32(0.0):
+        if d != Float32(0.0):
             if cutlass.const_expr(has_sink):
                 sink_m = Float32(attn_sink[head_idx] * attention_ops.LOG2_E)
                 new_m = attention_ops.fmax(m, sink_m)

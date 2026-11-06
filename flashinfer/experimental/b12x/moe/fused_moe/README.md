@@ -11,11 +11,17 @@ NVFP4 activation GEMMs during prefill. Activation quantization changes model
 outputs and requires model quality validation before deployment. The default
 remains W4A16.
 
-Set `B12X_W4A16_A4_PREFILL=1` before preparing weights and execution plans to
-enable this capability. Preparation requires finite,
-positive input and intermediate calibration scales; absent scales and a pair
-of all-one placeholder scales retain W4A16. The shared input global scale is
-the minimum across experts. Intermediate scales remain per expert. Ordinary
+Use `ActivationSpec(mode="a16", a4_prefill=True)` to retain calibrated A4
+prefill on the same packed weight owner. Explicit enablement requires finite,
+positive input and intermediate calibration scales and compatible geometry;
+invalid preparation or an unavailable requested A4 binding raises an error.
+It uses one activation plane and eight warps independently of the A4 environment
+controls. `a4_prefill=False` disables the capability.
+
+The default `a4_prefill=None` preserves environment-based preparation:
+`B12X_W4A16_A4_PREFILL=1` enables the capability, while absent calibration or a
+pair of all-one placeholder scales retains W4A16. The shared input global scale
+is the minimum across experts. Intermediate scales remain per expert. Ordinary
 A4 weight preparation retains its per-expert scales.
 
 Supported weights use packed ModelOpt NVFP4 with ordinary or compressed
@@ -26,7 +32,7 @@ native packed scale storage. A positive `swiglu_limit` uses
 the W4A16 activation contract: clamp the BF16 GEMM gate above the limit and the
 up input to the symmetric interval, round SiLU and up to BF16, multiply, then
 round the intermediate to BF16 before quantization. Expert maps, input router
-weighting, activation-amax collection, and unsupported layouts retain W4A16.
+weighting, activation-amax collection, and unsupported layouts cannot use A4.
 
 The execution binding accepts `a4_prefill`:
 
@@ -169,7 +175,8 @@ route_ids_dtype=..., scales_expanded=...)` reports whether a prepared call has
 an expansion consumer. It returns `False` for an inline plan, allowing callers
 to skip scale prefetch. The query performs no GPU work.
 
-`B12X_W4A16_A4_PREFILL_TERMS=1` uses one NVFP4 activation plane. A value of `2`
+With `ActivationSpec.a4_prefill=None`, `B12X_W4A16_A4_PREFILL_TERMS=1`
+uses one NVFP4 activation plane. A value of `2`
 adds an independently quantized residual plane. `B12X_W4A16_A4_PREFILL_WARPS`
 accepts `8` (default) or `16`. These controls and the capability flag are immutable
 execution-plan inputs and are part of the tuning query. Changing the

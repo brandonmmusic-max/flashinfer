@@ -25,6 +25,7 @@ def prepared_execution(
     weight,
     *,
     activation_mode,
+    source_activation="identity",
     activation_global_scale=None,
     out=None,
     workspace=None,
@@ -36,6 +37,7 @@ def prepared_execution(
         source,
         weight,
         activation_mode=activation_mode,
+        source_activation=source_activation,
         activation_global_scale=activation_global_scale,
         out=out,
         workspace=workspace,
@@ -69,6 +71,7 @@ def make_workspace(
     weight,
     *,
     activation_mode,
+    source_activation="identity",
     out=None,
     config=None,
     activation_global_scale=None,
@@ -78,6 +81,7 @@ def make_workspace(
         source,
         weight,
         activation_mode=activation_mode,
+        source_activation=source_activation,
         out=out,
         activation_global_scale=activation_global_scale,
         expected_m=expected_m,
@@ -1009,13 +1013,15 @@ def test_native_weight_pairs_exhaustive(fp4):
     torch.testing.assert_close(out, expected, atol=0, rtol=0, equal_nan=True)
 
 
-@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "recipe,tile_k", [("nvfp4", 128), ("mxfp8", 128), ("mxfp8", 256)]
+)
 @pytest.mark.parametrize("k", [32, 96, 160])
-def test_a16_short_scale_tile_tail(recipe, k):
+def test_a16_short_scale_tile_tail(recipe, tile_k, k):
     require_b12x()
     weight, decoded, _ = make_weight(recipe, 40, k)
     source = torch.randn(3, k, device="cuda", dtype=torch.bfloat16)
-    config = BlockscaledConfig(mode="a16", tile_n=128, tile_k=128, split_k=4)
+    config = BlockscaledConfig(mode="a16", tile_n=128, tile_k=tile_k, split_k=4)
     with prepared_execution(
         source,
         weight,
@@ -1026,19 +1032,41 @@ def test_a16_short_scale_tile_tail(recipe, k):
     assert_close(actual, source.float() @ decoded.T)
 
 
-@pytest.mark.parametrize("tile_m", [16, 32, 64])
-@pytest.mark.parametrize("tile_n", [64, 128])
+@pytest.mark.parametrize(
+    "recipe,tile_m,mma_warps,tile_n,tile_k",
+    [
+        (recipe, tile_m, warps, tile_n, 256)
+        for recipe, tile_m, warps in (
+            ("nvfp4", 16, None),
+            ("nvfp4", 32, None),
+            ("nvfp4", 64, None),
+            ("mxfp8", 16, 2),
+            ("mxfp8", 16, 4),
+        )
+        for tile_n in (64, 128)
+    ]
+    + [
+        ("mxfp8", 16, warps, 32, tile_k)
+        for warps in (2, 4)
+        for tile_k in (64, 128, 256)
+    ],
+)
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("k", [768, 800])
-def test_nvfp4_k256_dynamic_graph_replay(tile_m, tile_n, split, k):
+def test_a16_dynamic_graph_replay(recipe, tile_m, mma_warps, tile_n, tile_k, split, k):
     require_b12x()
     from b12x.preparation import require_prepared
 
-    weight, decoded, _ = make_weight("nvfp4", 136, k)
+    weight, decoded, _ = make_weight(recipe, 136, k)
     source = torch.randn(65, k, device="cuda", dtype=torch.bfloat16)
     output = torch.empty(65, 136, device="cuda", dtype=torch.bfloat16)
     config = BlockscaledConfig(
-        mode="a16", tile_m=tile_m, tile_n=tile_n, tile_k=256, split_k=split
+        mode="a16",
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        split_k=split,
+        mma_warps=mma_warps,
     )
     workspace = make_workspace(
         source, weight, activation_mode="a16", out=output, config=config
@@ -1054,7 +1082,7 @@ def test_nvfp4_k256_dynamic_graph_replay(tile_m, tile_n, split, k):
         state = require_prepared(plan, "gemm.blockscaled_precision", source.device)
         program = state.programs["gemm"]
         pointers = (source.data_ptr(), output.data_ptr(), workspace.data_ptr())
-        with kernel_resolution_guard("NVFP4 K256 capacity replay"):
+        with kernel_resolution_guard("A16 capacity replay"):
             for m in (1, 3, 8, 17, 65):
                 x, y = source[:m], output[:m]
                 expected = x.float() @ decoded.T
@@ -1125,3 +1153,123 @@ def test_nvfp4_split_partials_exceed_int32_elements():
         source.fill_(0.5)
         graph.replay()
         torch.testing.assert_close(out, torch.full_like(out, k / 2), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16, 32, 64])
+@pytest.mark.parametrize("width", [128, 136])
+@pytest.mark.parametrize(
+    "mode,fuse", [("a16", False), ("quantized", False), ("quantized", True)]
+)
+def test_rounded_swiglu_projection_replay(rows, width, mode, fuse):
+    require_b12x()
+    weight, _, _ = make_weight("nvfp4", 128, 256)
+    weight = replace(
+        weight,
+        in_features=width,
+        activation_global_scale=torch.tensor([0.03125], device="cuda"),
+    )
+    source = torch.randn(rows, 2 * width, device="cuda", dtype=torch.bfloat16)
+    intermediate = torch.empty(rows, width, device="cuda", dtype=torch.bfloat16)
+    out, reference = (
+        torch.empty(rows, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2)
+    )
+    config = (
+        BlockscaledConfig(mode=mode, tile_m=16, tile_n=64, tile_k=64, split_k=2)
+        if mode == "a16"
+        else BlockscaledConfig(mode=mode, fuse_swiglu=fuse)
+    )
+    plain_config = replace(config, fuse_swiglu=False)
+    workspace = make_workspace(
+        source,
+        weight,
+        activation_mode=mode,
+        source_activation="swiglu_bf16",
+        out=out,
+        config=config,
+    )
+    plain_workspace = make_workspace(
+        intermediate, weight, activation_mode=mode, out=reference, config=plain_config
+    )
+    with prepared_execution(
+        source,
+        weight,
+        activation_mode=mode,
+        source_activation="swiglu_bf16",
+        out=out,
+        workspace=workspace,
+        config=config,
+        activation_global_scale=weight.activation_global_scale,
+    ) as (_, plan):
+        with prepared_execution(
+            intermediate,
+            weight,
+            activation_mode=mode,
+            out=reference,
+            workspace=plain_workspace,
+            config=plain_config,
+            activation_global_scale=weight.activation_global_scale,
+        ) as (_, plain):
+
+            def run():
+                return blockscaled.mm(
+                    source, weight, plan=plan, out=out, workspace=workspace
+                )
+
+            compiled = torch.compile(run, fullgraph=True)
+            compiled()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                compiled()
+            values = torch.tensor(
+                [-80.0, -8.0, -1.0, -0.0, 0.0, 0.5, 1.0, 8.0, 80.0],
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            for factor in (0.0, 0.125, 1.0, -2.0):
+                source.copy_(
+                    values[
+                        torch.arange(source.numel(), device="cuda") % values.numel()
+                    ].view_as(source)
+                    * factor
+                )
+                gate, up = source.chunk(2, dim=-1)
+                intermediate.copy_(torch.nn.functional.silu(gate) * up)
+                blockscaled.mm(
+                    intermediate,
+                    weight,
+                    plan=plain,
+                    out=reference,
+                    workspace=plain_workspace,
+                )
+                allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                )
+                assert_close(out, reference)
+            graph.reset()
+    torch._dynamo.reset()
+
+
+def test_rounded_swiglu_rejects_incompatible_sources():
+    require_b12x()
+    weight, _, _ = make_weight("nvfp4", 128, 256)
+    source = torch.zeros(16, 512, device="cuda", dtype=torch.bfloat16)
+    for invalid in (source.float(), source[:, :256]):
+        with pytest.raises(ValueError):
+            blockscaled.query_from_call(
+                invalid, weight, source_activation="swiglu_bf16"
+            )
+    strided = torch.zeros(16, 1024, device="cuda", dtype=torch.bfloat16)[:, ::2]
+    query = blockscaled.query_from_call(
+        strided, weight, source_activation="swiglu_bf16"
+    )
+    with pytest.raises(ValueError, match="contiguous"):
+        _preparation.TUNING.validate_query(query, detect_device(source.device).identity)
+    other_weight, _, _ = make_weight("mxfp8", 128, 256)
+    query = blockscaled.query_from_call(
+        source, other_weight, source_activation="swiglu_bf16"
+    )
+    with pytest.raises(ValueError, match="NVFP4"):
+        _preparation.TUNING.validate_query(query, detect_device(source.device).identity)
