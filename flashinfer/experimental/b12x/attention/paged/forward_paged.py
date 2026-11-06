@@ -1885,6 +1885,7 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
     num_mma_d_qk,
     upcast_stride_q,
     upcast_stride_k,
+    k_plane1_base_addr=None,
 ):
     unit_scale = Uint32(0x7F7F7F7F)
     shift16 = Uint32(16)
@@ -1930,10 +1931,19 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
             a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
                 _smem_addr_from_b128_offset(q_base_addr, q_offset_cur)
             )
-            q_regs[mma_q, 0] = cvt_bf16x2x2_to_e4m3x4(a_regs_k0[mma_q, 0], a0)
-            q_regs[mma_q, 1] = cvt_bf16x2x2_to_e4m3x4(a_regs_k0[mma_q, 1], a1)
-            q_regs[mma_q, 2] = cvt_bf16x2x2_to_e4m3x4(a_regs_k0[mma_q, 2], a2)
-            q_regs[mma_q, 3] = cvt_bf16x2x2_to_e4m3x4(a_regs_k0[mma_q, 3], a3)
+            # The A fragment for a 32-wide reduction has two 16-wide halves,
+            # and each half occupies the registers of one ldmatrix result.
+            # Pack the two registers of one half into one E4M3 word; pairing a
+            # register with the same index of the other result mixes the
+            # halves.
+            q_regs[mma_q, 0] = cvt_bf16x2x2_to_e4m3x4(
+                a_regs_k0[mma_q, 0], a_regs_k0[mma_q, 2]
+            )
+            q_regs[mma_q, 1] = cvt_bf16x2x2_to_e4m3x4(
+                a_regs_k0[mma_q, 1], a_regs_k0[mma_q, 3]
+            )
+            q_regs[mma_q, 2] = cvt_bf16x2x2_to_e4m3x4(a0, a2)
+            q_regs[mma_q, 3] = cvt_bf16x2x2_to_e4m3x4(a1, a3)
             q_offset_cur = _advance_offset_by_row_128b(
                 q_offset_cur, 16, upcast_stride_q
             )
@@ -1943,9 +1953,20 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
 
         k_offset_cur = k_offset
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
-            b0_k0, b0_k1, b1_k0, b1_k1 = ldmatrix_m8n8x4_b16(
-                _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
-            )
+            if const_expr(k_plane1_base_addr is None):
+                k_addr = _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
+            else:
+                # The TMA producer stages one plane per 128 FP8 columns, so the
+                # second half of a logical row lives in the next plane at the
+                # same row.  Split-plane addressing maps (row, column) to that
+                # plane; the raw cp.async layout keeps both halves contiguous.
+                k_addr = _smem_addr_from_split_planes_128b(
+                    k_base_addr,
+                    k_plane1_base_addr,
+                    k_offset_cur,
+                    Int32(upcast_stride_k),
+                )
+            b0_k0, b0_k1, b1_k0, b1_k1 = ldmatrix_m8n8x4_b16(k_addr)
             b0_k0 = frag_layout_swizzle_16b_to_8b(b0_k0)
             b1_k0 = frag_layout_swizzle_16b_to_8b(b1_k0)
             b0_k1 = frag_layout_swizzle_16b_to_8b(b0_k1)
@@ -6027,6 +6048,14 @@ class PagedForwardKernel:
                         if const_expr(self.k_tma_plane_count > 1)
                         else 0
                     )
+                    # Without a second plane the native QK reads the staged K
+                    # through one raw region.  The TMA producer splits a head
+                    # wider than 128 FP8 columns into planes, so the native
+                    # helper needs the second plane base to address each
+                    # logical row where it was written.
+                    k_plane1_base_addr = None
+                    if const_expr(self.k_tma_plane_count > 1):
+                        k_plane1_base_addr = k_smem_base_addr + k_plane1_total_offset
                     if const_expr(
                         self.use_native_fp8_qk_mma
                         and not self.decode_native_fp8_runtime_chunk_guard
@@ -6046,6 +6075,7 @@ class PagedForwardKernel:
                             self.traits.num_mma_d_qk,
                             tc_upcast_stride_qk,
                             self.traits.upcast_stride_k,
+                            k_plane1_base_addr=k_plane1_base_addr,
                         )
                     elif const_expr(
                         self.use_native_fp8_qk_mma
@@ -6069,6 +6099,7 @@ class PagedForwardKernel:
                                 self.traits.num_mma_d_qk,
                                 tc_upcast_stride_qk,
                                 self.traits.upcast_stride_k,
+                                k_plane1_base_addr=k_plane1_base_addr,
                             )
                         else:
                             if const_expr(decode_fp8_row0_metadata_fastpath):

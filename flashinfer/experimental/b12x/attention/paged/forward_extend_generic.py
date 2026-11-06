@@ -1987,6 +1987,7 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
     num_mma_d_qk,
     upcast_stride_q,
     upcast_stride_k,
+    k_plane1_base_addr=None,
 ):
     unit_scale = Uint32(0x7F7F7F7F)
     mask16 = Uint32(0xFFFF)
@@ -2046,12 +2047,21 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
 
         k_offset_cur = k_offset
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
-            b0_k0, b1_k0 = ldmatrix_m8n8x4_left_half_b16(
-                _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
-            )
-            b0_k1, b1_k1 = ldmatrix_m8n8x4_right_half_b16(
-                _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
-            )
+            if const_expr(k_plane1_base_addr is None):
+                k_addr = _smem_addr_from_b128_offset(k_base_addr, k_offset_cur)
+            else:
+                # The TMA producer stages one plane per 128 FP8 columns, so the
+                # second half of a logical row lives in the next plane at the
+                # same row.  Split-plane addressing maps (row, column) to that
+                # plane; the raw cp.async layout keeps both halves contiguous.
+                k_addr = _smem_addr_from_split_planes_128b(
+                    k_base_addr,
+                    k_plane1_base_addr,
+                    k_offset_cur,
+                    Int32(upcast_stride_k),
+                )
+            b0_k0, b1_k0 = ldmatrix_m8n8x4_left_half_b16(k_addr)
+            b0_k1, b1_k1 = ldmatrix_m8n8x4_right_half_b16(k_addr)
             b0_k0 = frag_layout_swizzle_16b_to_8b(b0_k0)
             b1_k0 = frag_layout_swizzle_16b_to_8b(b1_k0)
             b0_k1 = frag_layout_swizzle_16b_to_8b(b0_k1)
@@ -2061,16 +2071,21 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
             )
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
+                # The A fragment for a 32-wide reduction has two 16-wide
+                # halves, and each half occupies the registers of one ldmatrix
+                # result.  Pack the two registers of one half into one E4M3
+                # word; pairing a register with the same index of the other
+                # result mixes the halves.
                 qa0 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 0]) & mask16) | (
-                    (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 0]) & mask16) << shift16
+                    (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 2]) & mask16) << shift16
                 )
                 qa1 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 1]) & mask16) | (
-                    (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 1]) & mask16) << shift16
+                    (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 3]) & mask16) << shift16
                 )
-                qa2 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 2]) & mask16) | (
+                qa2 = (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 0]) & mask16) | (
                     (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 2]) & mask16) << shift16
                 )
-                qa3 = (cvt_bf16x2_to_e4m3x2(a_regs_k0[mma_q, 3]) & mask16) | (
+                qa3 = (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 1]) & mask16) | (
                     (cvt_bf16x2_to_e4m3x2(a_regs_k1[mma_q, 3]) & mask16) << shift16
                 )
 
@@ -5926,6 +5941,16 @@ class PagedForwardKernel:
                     k_smem_base_addr = shared_ptr_to_u32(
                         sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes)
                     )
+                    # Without a second plane the native QK reads the staged K
+                    # through one raw region.  The TMA producer splits a head
+                    # wider than 128 FP8 columns into planes, so the native
+                    # helper needs the second plane base to address each
+                    # logical row where it was written.
+                    k_plane1_base_addr = None
+                    if const_expr(self.kv_tma_plane_count > 1):
+                        k_plane1_base_addr = k_smem_base_addr + Int32(
+                            kv_plane_total_bytes
+                        )
                     frag_S = cute.make_rmem_tensor(
                         cute.make_layout(
                             (num_mma_q, num_mma_kv, 8),
@@ -5949,6 +5974,7 @@ class PagedForwardKernel:
                         self.traits.num_mma_d_qk,
                         tc_upcast_stride_qk,
                         self.traits.upcast_stride_k,
+                        k_plane1_base_addr=k_plane1_base_addr,
                     )
                     # Native-FP8 score policy.
                     if const_expr(self.use_kv_repack_fp16):
