@@ -3386,6 +3386,18 @@ class PagedForwardKernel:
             and traits.num_mma_kv == 1
             and self.page_size == 64
         )
+        # MSA block-sparse attention requires head_dim_qk=head_dim_vo=128
+        # (paged/planner.py), while this staging path requires 256/256, so no
+        # plan the public API produces can reach both.  The helpers that issue
+        # the TMA loads derive the page index from the packed token base and
+        # never consult a block id, so a rotated (non-contiguous) MSA block
+        # list would read the wrong page.  Raise a ValueError: it stays active
+        # under PYTHONOPTIMIZE and for direct callers of
+        # build_extend_forward_kernel.
+        if base_use_paged_kv_tma_extend and self.msa_block_sparse:
+            raise ValueError(
+                "MSA block-sparse extend cannot use the paged KV TMA staging path"
+            )
         self.use_paged_kv_tma_exact_plane_bf16_layout = base_use_paged_kv_tma_extend
         self.use_paged_kv_tma_fp8_raw_issue = False
         self.use_paged_k_tma = self.use_paged_kv_tma_exact_plane_bf16_layout
@@ -3966,7 +3978,10 @@ class PagedForwardKernel:
                     if const_expr(self.msa_block_sparse)
                     else token_idx - page_iter * page_size
                 )
-            if const_expr(self.msa_block_sparse and self.entries_per_block > 1):
+            if const_expr(
+                self.msa_block_sparse
+                and (self.entries_per_block > 1 or not self.msa_union_tile)
+            ):
                 row_valid = row_idx < valid_rows
                 page_id = Int32(0)
                 if row_valid:
@@ -5589,7 +5604,10 @@ class PagedForwardKernel:
                                 page_size,
                             )
                 if const_expr(not self.use_paged_k_tma):
-                    if const_expr(self.msa_block_sparse and self.entries_per_block > 1):
+                    if const_expr(
+                        self.msa_block_sparse
+                        and (self.entries_per_block > 1 or not self.msa_union_tile)
+                    ):
                         k_valid_rows = self._msa_v_stage_valid_rows(
                             mQ2KIndices,
                             mMSAUnionBlocks,
@@ -5677,7 +5695,10 @@ class PagedForwardKernel:
                     prefetch_base,
                     page_size,
                 )
-                if const_expr(self.msa_block_sparse and self.entries_per_block > 1):
+                if const_expr(
+                    self.msa_block_sparse
+                    and (self.entries_per_block > 1 or not self.msa_union_tile)
+                ):
                     k_valid_rows = self._msa_v_stage_valid_rows(
                         mQ2KIndices,
                         mMSAUnionBlocks,
@@ -6658,7 +6679,11 @@ class PagedForwardKernel:
                                 page_size,
                             )
                             if const_expr(
-                                self.msa_block_sparse and self.entries_per_block > 1
+                                self.msa_block_sparse
+                                and (
+                                    self.entries_per_block > 1
+                                    or not self.msa_union_tile
+                                )
                             ):
                                 k_valid_rows = self._msa_v_stage_valid_rows(
                                     mQ2KIndices,
@@ -6722,7 +6747,11 @@ class PagedForwardKernel:
                                 page_size,
                             )
                             if const_expr(
-                                self.msa_block_sparse and self.entries_per_block > 1
+                                self.msa_block_sparse
+                                and (
+                                    self.entries_per_block > 1
+                                    or not self.msa_union_tile
+                                )
                             ):
                                 k_valid_rows = self._msa_v_stage_valid_rows(
                                     mQ2KIndices,
@@ -7239,7 +7268,11 @@ class PagedForwardKernel:
                                     )
                         if const_expr(not self.use_paged_k_tma):
                             if const_expr(
-                                self.msa_block_sparse and self.entries_per_block > 1
+                                self.msa_block_sparse
+                                and (
+                                    self.entries_per_block > 1
+                                    or not self.msa_union_tile
+                                )
                             ):
                                 k_valid_rows = self._msa_v_stage_valid_rows(
                                     mQ2KIndices,
