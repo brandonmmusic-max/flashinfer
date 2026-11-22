@@ -111,8 +111,6 @@ def test_audit_restores_small_projection_backends_and_preserves_pins():
         ("tc", {"max_rows": 8, "in_features": 65}),
         ("tc", {"max_rows": 8, "source_dtype": "float32"}),
         ("tc", {"max_rows": 8, "weight_dtype": "float32"}),
-        ("tc", {"max_rows": 8, "bias_dtype": "bfloat16"}),
-        ("tc", {"max_rows": 8, "bias_dtype": "float32"}),
         *[
             ("tc", {"max_rows": 8, name: False})
             for name in (

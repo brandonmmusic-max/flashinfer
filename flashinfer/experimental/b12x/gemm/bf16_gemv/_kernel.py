@@ -656,7 +656,7 @@ def compile_projection(
     elif backend == "tc":
         from ._tensor_core import compile_tc_projection
 
-        return compile_tc_projection(ordinal, 8, 1, n, k, output_dtype)
+        return compile_tc_projection(ordinal, 8, 1, n, k, output_dtype, bias_dtype)
     else:
         kernel = Bf16GemmKernel(n, k, bias_dtype is not None)
     types = (

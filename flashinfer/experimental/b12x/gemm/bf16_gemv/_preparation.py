@@ -77,6 +77,7 @@ def compile_gemv(query_payload, config_payload, ordinal):
             query.out_features,
             query.in_features,
             query.output_dtype,
+            query.bias_dtype,
         )
     else:
         from ._kernel import compile_projection

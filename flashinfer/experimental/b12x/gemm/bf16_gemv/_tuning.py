@@ -80,19 +80,36 @@ def _mma_preferred(query):
 
 
 def _tc_eligible(query):
-    from ._tensor_core import TC_K_MULTIPLE, TC_MAX_ROWS
+    from ._tensor_core import (
+        TC_K_MULTIPLE,
+        TC_MAX_ROWS,
+        TC_SMALL_K,
+        TC_SMALL_K_MAX_ROWS,
+        TC_SMALL_K_N_MULTIPLE,
+    )
 
-    return (
+    if not (
         query.source_dtype == query.weight_dtype == "bfloat16"
-        and query.output_dtype in ("bfloat16", "float32")
-        and query.bias_dtype is None
-        and query.max_rows <= TC_MAX_ROWS
-        and query.in_features % TC_K_MULTIPLE == 0
         and query.source_contiguous
         and query.source_aligned
         and query.weight_contiguous
         and query.weight_aligned
         and query.output_contiguous
+    ):
+        return False
+    if (
+        query.in_features == TC_SMALL_K
+        and query.out_features % TC_SMALL_K_N_MULTIPLE == 0
+        and query.max_rows <= TC_SMALL_K_MAX_ROWS
+        and query.output_dtype == "bfloat16"
+        and query.bias_dtype is None
+    ):
+        return True
+    return (
+        query.output_dtype in ("bfloat16", "float32")
+        and query.bias_dtype in (None, "bfloat16", "float32")
+        and query.max_rows <= TC_MAX_ROWS
+        and query.in_features % TC_K_MULTIPLE == 0
     )
 
 
@@ -151,8 +168,10 @@ def default_config(query, device):
 
 
 def _tc_split_k_candidates(query):
-    from ._tensor_core import TC_SPLIT_K_VALUES, tc_chunk_k
+    from ._tensor_core import TC_SMALL_K, TC_SPLIT_K_VALUES, tc_chunk_k
 
+    if query.in_features == TC_SMALL_K:
+        return (1,)
     n_blocks = (query.out_features + 15) // 16
     chunks = query.in_features // tc_chunk_k(query.in_features)
     cands = []
@@ -174,7 +193,7 @@ def _validate_query(query, device):
 
 
 def validate_config(query, config, device):
-    from ._tensor_core import TC_SPLIT_K_VALUES, tc_chunk_k
+    from ._tensor_core import TC_SMALL_K, TC_SPLIT_K_VALUES, tc_chunk_k
 
     if not isinstance(config, GemvConfig):
         raise TypeError("projection config must be GemvConfig")
@@ -207,6 +226,10 @@ def validate_config(query, config, device):
     if config.backend == "tc":
         if not _tc_eligible(query):
             raise ValueError("projection backend 'tc' is ineligible for this query")
+        if query.in_features == TC_SMALL_K:
+            if config.split_k != 1:
+                raise ValueError("invalid split_k for small-K16 tensor-core projection")
+            return
         chunks = query.in_features // tc_chunk_k(query.in_features)
         if (
             type(config.split_k) is not int
@@ -309,7 +332,7 @@ TUNING = TuningContract(
             binding=ParameterBinding.COMPILE,
         ),
     ),
-    candidate_contract_version=16,
+    candidate_contract_version=17,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

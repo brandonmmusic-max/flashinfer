@@ -32,6 +32,9 @@ from b12x._lib.utils.pointers import make_ptr
 TC_MAX_ROWS = 32
 TC_MAX_WARPS = 8
 TC_K_MULTIPLE = 32
+TC_SMALL_K = 16
+TC_SMALL_K_MAX_ROWS = 256
+TC_SMALL_K_N_MULTIPLE = 64
 TC_SPLIT_K_VALUES = (1, 2, 3, 4, 6, 7, 8, 12, 14, 16, 28, 56)
 _LANES = 32
 
@@ -158,15 +161,40 @@ def _st_global_release_u32(addr: Int64, val: Uint32, *, loc=None, ip=None) -> No
     )
 
 
+@dsl_user_op
+def _ld_nc_u32_pure(addr: Int64, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [addr.ir_value(loc=loc, ip=ip)],
+            "ld.global.nc.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 @cute.jit
 def _flat(pointer: cute.Pointer):
     return cute.make_tensor(pointer, cute.make_layout((Int64(1) << Int64(50),)))
 
 
 class TensorCoreGemvKernel:
-    """``out[m, n] = sum_k x[m, k] * w[n, k]`` for up to 32 live rows."""
+    """``out[m, n] = sum_k x[m, k] * w[n, k] (+ bias[n])`` for up to 32 live rows."""
 
-    def __init__(self, n: int, k: int, max_rows: int = 8, split_k: int = 1):
+    def __init__(
+        self,
+        n: int,
+        k: int,
+        max_rows: int = 8,
+        split_k: int = 1,
+        *,
+        has_bias: bool = False,
+    ):
         if k <= 0 or k % TC_K_MULTIPLE:
             raise ValueError(
                 f"tensor-core GEMV requires K to be a positive multiple of {TC_K_MULTIPLE}"
@@ -178,6 +206,7 @@ class TensorCoreGemvKernel:
         if split_k <= 0 or chunks % int(split_k):
             raise ValueError(f"split_k={split_k} must divide K/{self.chunk_k}={chunks}")
         self.n, self.k = int(n), int(k)
+        self.has_bias = bool(has_bias)
         self.max_m_tiles = (int(max_rows) + 7) // 8
         self.split_k = int(split_k)
         self.chunks_per_split = chunks // self.split_k
@@ -206,6 +235,7 @@ class TensorCoreGemvKernel:
         self,
         x: cute.Pointer,
         weight: cute.Pointer,
+        bias: cute.Pointer,
         output: cute.Pointer,
         scratch: cute.Pointer,
         flags: cute.Pointer,
@@ -218,6 +248,7 @@ class TensorCoreGemvKernel:
         self.kernel(
             _flat(x),
             _flat(weight),
+            _flat(bias),
             _flat(output),
             scratch,
             flags,
@@ -236,6 +267,7 @@ class TensorCoreGemvKernel:
         self,
         x: cute.Tensor,
         weight: cute.Tensor,
+        bias: cute.Tensor,
         output: cute.Tensor,
         scratch: cute.Pointer,
         flags: cute.Pointer,
@@ -356,6 +388,8 @@ class TensorCoreGemvKernel:
                         feature = first + group + (8 if e >= 2 else 0)
                         row = Int32(mt * 8) + quad * 2 + (e % 2)
                         if feature < self.n and row < rows:
+                            if cutlass.const_expr(self.has_bias):
+                                total = total + Float32(bias[Int64(feature)])
                             output[Int64(row) * output_stride + Int64(feature)] = (
                                 total.to(result_dtype)
                             )
@@ -411,11 +445,19 @@ class TensorCoreGemvKernel:
                         r0 = Int32(mt * 8) + quad * 2
                         r1 = r0 + 1
                         if f_lo < self.n:
+                            if cutlass.const_expr(self.has_bias):
+                                b_lo = Float32(bias[Int64(f_lo)])
+                                s0 = s0 + b_lo
+                                s1 = s1 + b_lo
                             if r0 < rows:
                                 output[Int64(r0) * output_stride + Int64(f_lo)] = s0.to(result_dtype)
                             if r1 < rows:
                                 output[Int64(r1) * output_stride + Int64(f_lo)] = s1.to(result_dtype)
                         if f_hi < self.n:
+                            if cutlass.const_expr(self.has_bias):
+                                b_hi = Float32(bias[Int64(f_hi)])
+                                s2 = s2 + b_hi
+                                s3 = s3 + b_hi
                             if r0 < rows:
                                 output[Int64(r0) * output_stride + Int64(f_hi)] = s2.to(result_dtype)
                             if r1 < rows:
@@ -423,6 +465,150 @@ class TensorCoreGemvKernel:
                 cute.arch.sync_threads()
                 if Int32(thread) == 0:
                     _st_global_release_u32(flag_addr, Uint32(0))
+
+
+class SmallK16GemmKernel:
+    """Single-step ``m16n8k16`` BF16 GEMM for ``K == 16``, ``N % 64 == 0``."""
+
+    def __init__(self, n: int):
+        if n <= 0 or n % TC_SMALL_K_N_MULTIPLE:
+            raise ValueError(
+                f"small-K16 GEMM requires N to be a positive multiple of {TC_SMALL_K_N_MULTIPLE}"
+            )
+        self.n = int(n)
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Pointer,
+        weight: cute.Pointer,
+        output: cute.Pointer,
+        rows: Int32,
+        x_stride: Int64,
+        weight_stride: Int64,
+        output_stride: Int64,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            _flat(x),
+            _flat(weight),
+            _flat(output),
+            rows,
+            x_stride,
+            weight_stride,
+            output_stride,
+        ).launch(
+            grid=((rows + Int32(15)) // Int32(16), self.n // 64, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        rows: Int32,
+        x_stride: Int64,
+        weight_stride: Int64,
+        output_stride: Int64,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        bm, bn, _ = cute.arch.block_idx()
+        warp = Int32(tid) // Int32(32)
+        lane = Int32(tid) % Int32(32)
+        group = lane // Int32(4)
+        quad = lane % Int32(4)
+
+        m0 = Int32(bm) * Int32(16)
+        n0 = Int32(bn) * Int32(64) + warp * Int32(16)
+
+        x_base = get_ptr_as_int64(x, Int64(0))
+        w_base = get_ptr_as_int64(weight, Int64(0))
+
+        rm_a = cutlass.min(m0 + group, rows - Int32(1))
+        rm_b = cutlass.min(m0 + group + Int32(8), rows - Int32(1))
+        x_row_bytes = x_stride * Int64(2)
+        w_row_bytes = weight_stride * Int64(2)
+        q_off = Int64(quad * Int32(4))
+
+        a0 = _ld_nc_u32_pure(x_base + Int64(rm_a) * x_row_bytes + q_off)
+        a2 = _ld_nc_u32_pure(x_base + Int64(rm_a) * x_row_bytes + q_off + Int64(16))
+        a1 = _ld_nc_u32_pure(x_base + Int64(rm_b) * x_row_bytes + q_off)
+        a3 = _ld_nc_u32_pure(x_base + Int64(rm_b) * x_row_bytes + q_off + Int64(16))
+
+        rn0 = n0 + group
+        b00 = _ld_nc_u32_pure(w_base + Int64(rn0) * w_row_bytes + q_off)
+        b01 = _ld_nc_u32_pure(w_base + Int64(rn0) * w_row_bytes + q_off + Int64(16))
+        rn1 = n0 + Int32(8) + group
+        b10 = _ld_nc_u32_pure(w_base + Int64(rn1) * w_row_bytes + q_off)
+        b11 = _ld_nc_u32_pure(w_base + Int64(rn1) * w_row_bytes + q_off + Int64(16))
+
+        z = Float32(0.0)
+        c00, c01, c02, c03 = bf16_mma_m16n8k16_f32(z, z, z, z, a0, a1, a2, a3, b00, b01)
+        c10, c11, c12, c13 = bf16_mma_m16n8k16_f32(z, z, z, z, a0, a1, a2, a3, b10, b11)
+
+        r0 = m0 + group
+        r1 = m0 + group + Int32(8)
+        col0 = n0 + quad * Int32(2)
+        col1 = n0 + Int32(8) + quad * Int32(2)
+        if r0 < rows:
+            base0 = Int64(r0) * output_stride
+            output[base0 + Int64(col0)] = c00.to(BFloat16)
+            output[base0 + Int64(col0 + Int32(1))] = c01.to(BFloat16)
+            output[base0 + Int64(col1)] = c10.to(BFloat16)
+            output[base0 + Int64(col1 + Int32(1))] = c11.to(BFloat16)
+        if r1 < rows:
+            base1 = Int64(r1) * output_stride
+            output[base1 + Int64(col0)] = c02.to(BFloat16)
+            output[base1 + Int64(col0 + Int32(1))] = c03.to(BFloat16)
+            output[base1 + Int64(col1)] = c12.to(BFloat16)
+            output[base1 + Int64(col1 + Int32(1))] = c13.to(BFloat16)
+
+
+@program_cache
+def compile_small_k16_projection(ordinal: int, n: int):
+    """Compile one SmallK16GemmKernel for BF16 K=16 projections."""
+    kernel = SmallK16GemmKernel(n)
+    key = (int(n),)
+    fake_x = make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
+    fake_w = make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
+    fake_y = make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=2)
+    with torch.cuda.device(ordinal):
+        raw = b12x_compile(
+            kernel,
+            fake_x,
+            fake_w,
+            fake_y,
+            Int32(1),
+            Int64(TC_SMALL_K),
+            Int64(TC_SMALL_K),
+            Int64(n),
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key(
+                "gemm.bf16_projection.small_k16", 1, key
+            ),
+        )
+
+    def run(x, weight, out, bias=None, *, scratch=None, flags=None):
+        del bias, scratch, flags
+        with torch.cuda.device(ordinal):
+            run_compiled(
+                raw,
+                (
+                    make_ptr(BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+                    make_ptr(BFloat16, weight.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+                    make_ptr(BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=2),
+                    Int32(x.shape[0]),
+                    Int64(x.stride(0)),
+                    Int64(weight.stride(0)),
+                    Int64(out.stride(0)),
+                    current_cuda_stream(),
+                ),
+            )
+
+    return attach_programs(run, raw)
 
 
 @program_cache
@@ -433,15 +619,29 @@ def compile_tc_projection(
     n: int,
     k: int,
     output_dtype: str,
+    bias_dtype: str | None = None,
 ):
-    """Compile one TensorCoreGemvKernel for up to 32 rows and optional split-K."""
+    """Compile one TensorCoreGemvKernel (or SmallK16GemmKernel for K=16)."""
+    if int(k) == TC_SMALL_K:
+        if output_dtype != "bfloat16" or bias_dtype is not None or int(split_k) != 1:
+            raise ValueError("small-K16 GEMM requires BF16 output without bias or split_k")
+        return compile_small_k16_projection(ordinal, n)
     y_type = getattr(torch, output_dtype)
     ct_y = Float32 if y_type == torch.float32 else BFloat16
+    b_type = torch.bfloat16 if bias_dtype is None else getattr(torch, bias_dtype)
+    ct_b = Float32 if b_type == torch.float32 else BFloat16
     max_m_tiles = (int(max_rows) + 7) // 8
-    kernel = TensorCoreGemvKernel(n, k, max_rows=max_m_tiles * 8, split_k=split_k)
-    key = (max_m_tiles, int(split_k), int(n), int(k), output_dtype)
+    kernel = TensorCoreGemvKernel(
+        n,
+        k,
+        max_rows=max_m_tiles * 8,
+        split_k=split_k,
+        has_bias=(bias_dtype is not None),
+    )
+    key = (max_m_tiles, int(split_k), int(n), int(k), output_dtype, bias_dtype)
     fake_x = make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
     fake_w = make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
+    fake_b = make_ptr(ct_b, 16, cute.AddressSpace.gmem, assumed_align=b_type.itemsize)
     fake_y = make_ptr(ct_y, 16, cute.AddressSpace.gmem, assumed_align=y_type.itemsize)
     fake_sc = make_ptr(Float32, 16, cute.AddressSpace.gmem, assumed_align=16)
     fake_fl = make_ptr(Uint32, 16, cute.AddressSpace.gmem, assumed_align=4)
@@ -450,6 +650,7 @@ def compile_tc_projection(
             kernel,
             fake_x,
             fake_w,
+            fake_b,
             fake_y,
             fake_sc,
             fake_fl,
@@ -459,12 +660,12 @@ def compile_tc_projection(
             Int64(n),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.bf16_projection.tc_multirow", 2, key
+                "gemm.bf16_projection.tc_multirow", 3, key
             ),
         )
 
     def run(x, weight, out, bias=None, *, scratch=None, flags=None):
-        del bias
+        b_tensor = x if bias is None else bias
         sc_ptr = (
             make_ptr(Float32, scratch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
             if scratch is not None
@@ -481,6 +682,7 @@ def compile_tc_projection(
                 (
                     make_ptr(BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
                     make_ptr(BFloat16, weight.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+                    make_ptr(ct_b, b_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=b_type.itemsize),
                     make_ptr(ct_y, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=y_type.itemsize),
                     sc_ptr,
                     fl_ptr,
