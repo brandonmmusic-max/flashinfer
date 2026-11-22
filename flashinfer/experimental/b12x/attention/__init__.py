@@ -32,6 +32,8 @@ _OP_MODULES = (
     "dsa_indexer",
     "row_topk",
     "qsa",
+    "relative_decode",
+    "relative_prefill",
     "varlen",
     "mla_compress",
 )
