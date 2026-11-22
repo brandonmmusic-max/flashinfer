@@ -145,7 +145,9 @@ def _checkpoint(experts: int, k: int, i: int, device):
     )
 
 
-def _prepare_experts(fused_moe, experts: int, k: int, i: int, device):
+def _prepare_experts(
+    fused_moe, experts: int, k: int, i: int, device, *, activation: str = "silu"
+):
     """Plan and prepare synthetic MXFP8 experts through the public API."""
     w13, w13_scale, w2, w2_scale = _checkpoint(experts, k, i, device)
     plan = fused_moe.plan_weights(
@@ -155,7 +157,7 @@ def _prepare_experts(fused_moe, experts: int, k: int, i: int, device):
         ),
         activation=fused_moe.ActivationSpec(
             mode=fused_moe.ActivationMode.A8,
-            nonlinearity="silu",
+            nonlinearity=activation,
             io_dtype=torch.bfloat16,
         ),
         geometry=fused_moe.MoEGeometry(
@@ -245,6 +247,69 @@ def test_plan_weights_mxfp8_a8_selects_the_w8a8_contract() -> None:
     assert spec.weight_encoding.value == "mxfp8_e4m3"
     assert spec.activation_encoding.value == "mxfp8_e4m3"
     assert spec.weight_scale.value == "e8m0_k32"
+
+
+@pytest.mark.parametrize("nonlinearity", ["silu", "situ"])
+def test_plan_weights_mxfp8_a8_accepts_gated_activations(nonlinearity: str) -> None:
+    """Both gated nonlinearities the kernel supports plan the w8a8_mx recipe."""
+    from b12x.moe import fused_moe
+
+    plan = fused_moe.plan_weights(
+        source=fused_moe.PackedSource(
+            format=fused_moe.PackedSourceFormat.MXFP8_E8M0_K32,
+            w13_layout=fused_moe.W13Layout.W13,
+        ),
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A8,
+            nonlinearity=nonlinearity,
+            io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=NUM_EXPERTS,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+        ),
+    )
+    assert plan._impl.quant_modes == frozenset({"w8a8_mx"})
+    assert plan._impl.activation == nonlinearity
+
+
+def test_prepare_w8a8_absent_globals_gives_unit_alphas() -> None:
+    """A checkpoint with no *_weight_scale_2 globals runs with unit alphas."""
+    from b12x.moe._shared.kernels.w8a8 import prepare_w8a8_mxfp8_weights
+
+    experts, k, i = 3, 256, 128
+    prepared = prepare_w8a8_mxfp8_weights(
+        w13_values=torch.zeros(experts, 2 * i, k, dtype=torch.uint8),
+        w13_scale=torch.full((experts, 2 * i, k // _SF_BLOCK), 127, dtype=torch.uint8),
+        w2_values=torch.zeros(experts, k, i, dtype=torch.uint8),
+        w2_scale=torch.full((experts, k, i // _SF_BLOCK), 127, dtype=torch.uint8),
+        num_experts=experts,
+        hidden_size=k,
+        intermediate_size=i,
+    )
+    torch.testing.assert_close(prepared.w13_alpha, torch.ones(experts), rtol=0, atol=0)
+    torch.testing.assert_close(prepared.w2_alpha, torch.ones(experts), rtol=0, atol=0)
+
+
+def test_prepare_w8a8_absent_globals_with_unit_activation_scales() -> None:
+    """Explicit unit activation scales keep the alphas at one."""
+    from b12x.moe._shared.kernels.w8a8 import prepare_w8a8_mxfp8_weights
+
+    experts, k, i = 2, 128, 128
+    prepared = prepare_w8a8_mxfp8_weights(
+        w13_values=torch.zeros(experts, 2 * i, k, dtype=torch.uint8),
+        w13_scale=torch.full((experts, 2 * i, k // _SF_BLOCK), 127, dtype=torch.uint8),
+        w2_values=torch.zeros(experts, k, i, dtype=torch.uint8),
+        w2_scale=torch.full((experts, k, i // _SF_BLOCK), 127, dtype=torch.uint8),
+        a1_gscale=torch.ones(experts),
+        a2_gscale=torch.ones(experts),
+        num_experts=experts,
+        hidden_size=k,
+        intermediate_size=i,
+    )
+    torch.testing.assert_close(prepared.w13_alpha, torch.ones(experts), rtol=0, atol=0)
+    torch.testing.assert_close(prepared.w2_alpha, torch.ones(experts), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("mode", ["A16", "A4"])
@@ -741,6 +806,62 @@ def test_w8a8_matches_oracle_on_model_geometry(tokens: int, i: int) -> None:
         i,
         a1_gscale=native["a1_gscale"],
         a2_gscale=native["a2_gscale"],
+    )
+    assert bool(torch.isfinite(actual.float()).all().item())
+    metrics = compare_to_reference(actual.float(), reference)
+    assert metrics.cos >= _MIN_COS, metrics
+    rms = float(reference.square().mean().sqrt().item())
+    assert rms > 0.0, "the fixture must produce signal"
+    assert metrics.rmse / rms <= _MAX_NORMALIZED_RMSE, metrics
+
+
+@pytest.mark.parametrize("tokens", [1, 5, 16])
+def test_w8a8_situ_matches_oracle(tokens: int) -> None:
+    """The situ epilogue reproduces the capped-SwiGLU oracle."""
+    require_b12x()
+    from b12x.moe import fused_moe
+    from b12x.moe._shared.kernels.reference import (
+        compare_to_reference,
+        moe_reference_w8a8_mx,
+    )
+
+    from b12x.testing.reference.helpers import make_tp_moe_fp4_binding
+
+    device = torch.device("cuda")
+    experts, k, i = NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE
+    prepared, native = _prepare_experts(
+        fused_moe, experts, k, i, device, activation="situ"
+    )
+    a = (torch.randn(tokens, k, device=device) * 0.25).to(torch.bfloat16)
+    topk_ids, topk_weights = _routes(experts, tokens, TOP_K, device)
+    output = torch.empty(tokens, k, dtype=torch.bfloat16, device=device)
+
+    with make_tp_moe_fp4_binding(
+        a=a,
+        experts=prepared,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output=output,
+        quant_mode="w8a8_mx",
+    ) as binding:
+        actual = fused_moe.run(binding=binding)
+
+    reference = moe_reference_w8a8_mx(
+        a.float(),
+        native["w13"],
+        native["w13_scale"],
+        native["w1_alpha"],
+        native["w2"],
+        native["w2_scale"],
+        native["w2_alpha"],
+        topk_ids,
+        topk_weights,
+        experts,
+        k,
+        i,
+        a1_gscale=native["a1_gscale"],
+        a2_gscale=native["a2_gscale"],
+        activation="situ",
     )
     assert bool(torch.isfinite(actual.float()).all().item())
     metrics = compare_to_reference(actual.float(), reference)

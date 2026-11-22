@@ -943,8 +943,8 @@ def plan_moe_weight_preparation(
             )
             continue
         if spec.quant_mode == "w8a8_mx":
-            if spec.activation != "silu":
-                raise ValueError("W8A8-MXFP8 preparation requires silu")
+            if spec.activation not in {"silu", "situ"}:
+                raise ValueError("W8A8-MXFP8 preparation requires silu or situ")
             # FC1 streams 128-wide K tiles over hidden (one E4M3 byte per
             # element), so hidden must be 128-aligned.  The intermediate is
             # the FC2 K extent and the FC1 N extent: FC2 needs whole UE8M0
@@ -957,7 +957,8 @@ def plan_moe_weight_preparation(
                 )
             # Weight bytes are preserved losslessly (no FP4/FP6 requantization);
             # UE8M0 scales are swizzled into the MMA layout and per-expert
-            # alphas are derived from the checkpoint's *_weight_scale_2 globals.
+            # alphas are derived from the checkpoint's *_weight_scale_2 globals
+            # when present, otherwise the expert runs with unit alphas.
             transforms.add(WeightPreparationTransform.W8A8_MXFP8)
             weight_layouts.add(PreparedWeightLayout.SOURCE_NATIVE)
             scale_layouts.update(

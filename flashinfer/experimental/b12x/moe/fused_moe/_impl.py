@@ -6689,12 +6689,12 @@ def _prepare_w8a8_from_mxfp8_source(
     *,
     w1_fp8: torch.Tensor,
     w1_blockscale: torch.Tensor,
-    w1_global_scale: torch.Tensor,
+    w1_global_scale: torch.Tensor | None,
     w2_fp8: torch.Tensor,
     w2_blockscale: torch.Tensor,
-    w2_global_scale: torch.Tensor,
-    a1_gscale: torch.Tensor,
-    a2_gscale: torch.Tensor,
+    w2_global_scale: torch.Tensor | None,
+    a1_gscale: torch.Tensor | None,
+    a2_gscale: torch.Tensor | None,
     activation: str,
     source_format: str,
     w13_layout: str,
@@ -6708,9 +6708,12 @@ def _prepare_w8a8_from_mxfp8_source(
     requantization and no re-packing); UE8M0 grids are validated and swizzled
     to the MMA layout by the canonical helpers, and per-expert alphas come
     from the ``*_weight_scale_2`` globals divided by the reciprocal activation
-    global scales.  A gate-first ("w31") FC1 is rotated to kernel order here,
-    while the payload and its scale grid are still both unswizzled, so the
-    row flip and the MMA swizzle cannot disagree about which row is which.
+    global scales.  Checkpoints without those globals (e.g. the MXFP8 layers of
+    TML-d24-varloop-research) pass ``None`` and run with unit alphas, which is
+    the same arithmetic as an E4M3 x UE8M0 dequantization with no extra
+    per-expert factor.  A gate-first ("w31") FC1 is rotated to kernel order
+    here, while the payload and its scale grid are still both unswizzled, so
+    the row flip and the MMA swizzle cannot disagree about which row is which.
     Returns a
     :class:`b12x.moe._shared.kernels.w8a8.PreparedW8A8MXFP8Weights` whose
     ``launch_views`` carry the validated kernel operand views and pointers.
@@ -6724,8 +6727,10 @@ def _prepare_w8a8_from_mxfp8_source(
             f"got {source_format!r}"
         )
     activation = normalize_moe_activation(activation)
-    if activation != "silu":
-        raise ValueError(f"W8A8 MXFP8 preparation requires silu, got {activation!r}")
+    if activation not in {"silu", "situ"}:
+        raise ValueError(
+            f"W8A8 MXFP8 preparation requires silu or situ, got {activation!r}"
+        )
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     if w13_layout == "w31":
         _ensure_w13_kernel_order_inplace(
@@ -7003,14 +7008,29 @@ def prepare_b12x_fp4_moe_weights(
         "a1_gscale": a1_gscale,
         "a2_gscale": a2_gscale,
     }
+    unit_alpha_recipe = WeightPreparationTransform.W8A8_MXFP8 in plan.transforms
+    if unit_alpha_recipe:
+        # Raw MXFP8 checkpoints (e.g. TML-d24-varloop-research layers 20-23)
+        # carry no *_weight_scale_2 globals and no calibrated activation
+        # scales.  The expert then runs with unit per-expert alphas, which is
+        # exactly an E4M3 x UE8M0 dequantization with no extra factor; the
+        # activation global scales default to unit as well.
+        for name in ("w1_global_scale", "w2_global_scale", "a1_gscale", "a2_gscale"):
+            required_tensors.pop(name)
     missing = sorted(name for name, value in required_tensors.items() if value is None)
     if missing:
         raise ValueError(
             "non-Trellis weight preparation is missing: " + ", ".join(missing)
         )
-    assert w1_global_scale is not None and w2_global_scale is not None
+    if unit_alpha_recipe and a1_gscale is None:
+        a1_gscale = torch.ones(
+            plan.num_experts, dtype=torch.float32, device=w1_fp4.device
+        )
+    if unit_alpha_recipe and a2_gscale is None:
+        a2_gscale = torch.ones(
+            plan.num_experts, dtype=torch.float32, device=w1_fp4.device
+        )
     assert w1_blockscale is not None and w2_blockscale is not None
-    assert a1_gscale is not None and a2_gscale is not None
 
     if int(w1_fp4.shape[0]) != plan.num_experts:
         raise ValueError(
@@ -7018,17 +7038,24 @@ def prepare_b12x_fp4_moe_weights(
             f"plan expert count {plan.num_experts}"
         )
 
-    w1_runtime_alphas = _prepare_fc1_scale_vector(
-        w1_global_scale,
-        plan.num_experts,
-        name="w1_global_scale",
-    )
-    w2_runtime_alphas = _prepare_expert_scale_vector(
-        w2_global_scale,
-        plan.num_experts,
-        name="w2_global_scale",
-    )
+    if w1_global_scale is not None and w2_global_scale is not None:
+        w1_runtime_alphas = _prepare_fc1_scale_vector(
+            w1_global_scale,
+            plan.num_experts,
+            name="w1_global_scale",
+        )
+        w2_runtime_alphas = _prepare_expert_scale_vector(
+            w2_global_scale,
+            plan.num_experts,
+            name="w2_global_scale",
+        )
+    else:
+        # w8a8_mx only: the prepared representation owns the (unit) alphas.
+        w1_runtime_alphas = None
+        w2_runtime_alphas = None
     if plan.prepares_runtime_alphas:
+        assert w1_global_scale is not None and w2_global_scale is not None
+        assert a1_gscale is not None and a2_gscale is not None
         w1_runtime_alphas, w2_runtime_alphas = _prepare_modelopt_nvfp4_runtime_alphas(
             w1_global_scale,
             a1_gscale,
@@ -7197,7 +7224,7 @@ def prepare_b12x_fp4_moe_weights(
     canonical_w1 = w1_fp4
     canonical_s1 = w1_blockscale
     canonical_a1 = w1_runtime_alphas
-    if canonical_a1.ndim == 2:
+    if canonical_a1 is not None and canonical_a1.ndim == 2:
         if plan.quant_modes != frozenset({"nvfp4"}) or not is_gated_moe_activation(
             plan.activation
         ):

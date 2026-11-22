@@ -162,6 +162,8 @@ class PackedWeights:
     NVFP4 A4 dynamic execution and remain distinct through FC1 activation.
     Activation scales are optional source metadata. A16 preparation uses unit
     scales; ModelOpt NVFP4 A4/A8 preparation requires both scale tensors.
+    Raw MXFP8 sources may omit ``w13_global_scales``/``w2_global_scales``; the
+    W8A8-MX expert then runs with unit per-expert alphas.
     ``immutable_input_scales`` promises that input scale values remain unchanged
     throughout prepared bindings and graph replay; reprepare after mutation.
     """
@@ -170,8 +172,8 @@ class PackedWeights:
     w2: torch.Tensor
     w13_block_scales: torch.Tensor
     w2_block_scales: torch.Tensor
-    w13_global_scales: torch.Tensor
-    w2_global_scales: torch.Tensor
+    w13_global_scales: torch.Tensor | None = None
+    w2_global_scales: torch.Tensor | None = None
     input_scale: torch.Tensor | None = None
     intermediate_scale: torch.Tensor | None = None
     immutable_input_scales: bool = False
@@ -184,12 +186,15 @@ class PackedWeights:
             "w2",
             "w13_block_scales",
             "w2_block_scales",
-            "w13_global_scales",
-            "w2_global_scales",
         ):
             if not isinstance(getattr(self, name), torch.Tensor):
                 raise TypeError(f"PackedWeights.{name} must be a torch.Tensor")
-        for name in ("input_scale", "intermediate_scale"):
+        for name in (
+            "w13_global_scales",
+            "w2_global_scales",
+            "input_scale",
+            "intermediate_scale",
+        ):
             value = getattr(self, name)
             if value is not None and not isinstance(value, torch.Tensor):
                 raise TypeError(f"PackedWeights.{name} must be a tensor or None")

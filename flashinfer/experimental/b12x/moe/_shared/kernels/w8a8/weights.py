@@ -16,7 +16,9 @@ Host-side, one-time preparation for the ``w8a8_mx`` quant recipe
   recipe uses, so there is exactly one scale layout in the tree.
 * Per-expert f32 ``*_weight_scale_2`` globals combine with the reciprocal
   activation global scales into runtime alphas
-  (``alpha = weight_scale_2 / a_gscale``).
+  (``alpha = weight_scale_2 / a_gscale``).  A checkpoint that carries no such
+  globals passes ``None`` and runs with unit alphas, which is the plain
+  E4M3 x UE8M0 dequantization with no extra per-expert factor.
 
 Activations are quantized at runtime to FP8 E4M3 with UE8M0 K/32 block scales,
 so both operands are genuine E4M3 and feed the ``MmaMXF8Op`` block-scaled
@@ -157,9 +159,15 @@ def _validate_e8m0_scale_grid(
 
 
 def _validate_expert_scalars(
-    scale: torch.Tensor, *, name: str, num_experts: int
-) -> torch.Tensor:
-    """Return a contiguous ``[E]`` f32 view of a scalar or per-expert scale."""
+    scale: torch.Tensor | None, *, name: str, num_experts: int
+) -> torch.Tensor | None:
+    """Return a contiguous ``[E]`` f32 view of a scalar or per-expert scale.
+
+    ``None`` passes through so callers can substitute unit alphas for a
+    checkpoint that carries no such global.
+    """
+    if scale is None:
+        return None
     if not isinstance(scale, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
     if scale.numel() == 1:
@@ -175,10 +183,10 @@ def prepare_w8a8_mxfp8_weights(
     *,
     w13_values: torch.Tensor,
     w13_scale: torch.Tensor,
-    w13_scale_2: torch.Tensor,
+    w13_scale_2: torch.Tensor | None = None,
     w2_values: torch.Tensor,
     w2_scale: torch.Tensor,
-    w2_scale_2: torch.Tensor,
+    w2_scale_2: torch.Tensor | None = None,
     a1_gscale: torch.Tensor | None = None,
     a2_gscale: torch.Tensor | None = None,
     num_experts: int,
@@ -192,12 +200,15 @@ def prepare_w8a8_mxfp8_weights(
             ``[E, 2*intermediate, hidden]`` uint8 or float8_e4m3fn.
         w13_scale: FC1 UE8M0 K/32 grid, ``[E, 2*intermediate, hidden//32]``.
         w13_scale_2: per-expert f32 FC1 global weight scales (``[E]`` or scalar).
+            ``None`` means the checkpoint carries no such global; the expert
+            then runs with unit alphas.
         w2_values: FC2 (down) E4M3 codes, ``[E, hidden, intermediate]``.
         w2_scale: FC2 UE8M0 K/32 grid, ``[E, hidden, intermediate//32]``.
-        w2_scale_2: per-expert f32 FC2 global weight scales.
+        w2_scale_2: per-expert f32 FC2 global weight scales (``None``: unit).
         a1_gscale / a2_gscale: reciprocal activation global scales for the
             FC1/FC2 inputs; default is unit scale.  Runtime alphas follow the
-            established preparation math ``alpha = weight_scale_2 / a_gscale``.
+            established preparation math ``alpha = weight_scale_2 / a_gscale``,
+            so absent weight globals and unit activation scales give alpha 1.
     """
     num_experts = int(num_experts)
     hidden_size = int(hidden_size)
@@ -257,6 +268,16 @@ def prepare_w8a8_mxfp8_weights(
     w2_scale_2 = _validate_expert_scalars(
         w2_scale_2, name="w2_scale_2", num_experts=num_experts
     )
+    if w13_scale_2 is None:
+        # No per-expert FC1 weight global in the checkpoint: unit alpha.
+        w13_scale_2 = torch.ones(
+            num_experts, dtype=torch.float32, device=w13_values.device
+        )
+    if w2_scale_2 is None:
+        # No per-expert FC2 weight global in the checkpoint: unit alpha.
+        w2_scale_2 = torch.ones(
+            num_experts, dtype=torch.float32, device=w2_values.device
+        )
     if a1_gscale is None:
         w13_alpha = w13_scale_2.clone()
     else:
